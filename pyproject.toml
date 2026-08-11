@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bigfix-remote-client-relevance"
+description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "James Stewart" }]
+requires-python = ">=3.10"
+dynamic = ["version"]
+keywords = ["bigfix", "qna", "client-relevance", "ssh", "docker"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "asyncssh>=2.14",
+  "docker>=7.0",
+  "typer>=0.12",
+  "tomli>=2.0 ; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[project.scripts]
+bigfix-remote-client-relevance = "bigfix_remote_client_relevance.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jgstew/bigfix_remote_client_relevance"
+Issues   = "https://github.com/jgstew/bigfix_remote_client_relevance/issues"
+Source   = "https://github.com/jgstew/bigfix_remote_client_relevance"
+
+# --- Build backend ---------------------------------------------------------
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bigfix_remote_client_relevance"]
+
+# --- uv --------------------------------------------------------------------
+
+[tool.uv]
+# Prefer uv-managed CPython so `uv sync` / `uv run` transparently fetch the
+# right interpreter (see .python-version) rather than depending on the
+# system's Python being present.
+python-preference = "managed"
+
+# --- Tooling ---------------------------------------------------------------
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true

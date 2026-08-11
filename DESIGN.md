@@ -1,10 +1,10 @@
-# evaluate_remote_client_relevance — remote qna client-relevance eval over SSH + Docker
+# bigfix_remote_client_relevance — remote qna client-relevance eval over SSH + Docker
 
-## Deliverable
-**This markdown file itself.** The goal of this task is a self-contained
-design document that can be dropped into the new `jgstew/evaluate_remote_client_relevance`
-repo as `DESIGN.md` (or the seed of its `README.md`) — no code changes in
-this task. Implementation is a follow-on.
+## Status
+Design phase. This document is the seed for the package's implementation:
+naming rules, package layout, transport contracts, CLI surface, packaging
+choices, and MCP-readiness. Implementation lands incrementally against the
+todos in the design (see § Todos).
 
 ## Naming convention (project-wide rule)
 BigFix has two distinct dialects that share a family name:
@@ -17,7 +17,9 @@ BigFix has two distinct dialects that share a family name:
 Because the two are easy to confuse for both humans and AI agents, this
 project uses the phrase **"client relevance"** — never bare "relevance" —
 everywhere it can control the wording:
-- Repo name, package name, CLI name: `evaluate_remote_client_relevance`.
+- Repo name and Python package: `bigfix_remote_client_relevance`.
+  Distribution name on PyPI and CLI entry point: `bigfix-remote-client-relevance`
+  (hyphenated per PyPA convention).
 - Public functions, dataclasses, fields, CLI flags, docs, log messages,
   error strings, MCP tool name (future), README headings.
 - Examples: `evaluate_client_relevance()`, `ClientRelevanceResult`,
@@ -53,14 +55,48 @@ against *different qna versions* on the same host, not just an installed
 one.
 
 ## Project home
-New repo: **`jgstew/evaluate_remote_client_relevance`**.
-- Clean dependency surface (`asyncssh`, packaging) not forced on
-  `jgstew/tools` consumers.
-- Publishable as a standalone pip package; future MCP server imports it.
+Repo: **`jgstew/bigfix_remote_client_relevance`**.
+- Clean dependency surface (`asyncssh`, `docker` SDK, packaging) not forced
+  on `jgstew/tools` consumers.
+- Publishable as a standalone pip/uv package on PyPI; future MCP server
+  imports it.
 - Bootstrap scripts stay canonical in `jgstew/tools/bash` and
   `jgstew/tools/CMD` — this repo *ports* them into Python (renaming
   variables to `client_relevance` on the way in) and references the
   originals from the README.
+
+## Packaging & Python versions
+Files in the repo are the source of truth; this section explains *why*.
+
+- **Build backend:** `hatchling` + `hatch-vcs`. Pure-Python, PEP 517/518/621
+  native, git-tag-driven versioning. See `pyproject.toml`.
+- **Primary dev tool:** [`uv`](https://docs.astral.sh/uv/). One tool for
+  venvs, Python versions, install, lock, build, publish, and `uvx`
+  no-install runs. Consumers can still `pip install
+  bigfix-remote-client-relevance` from PyPI — `uv` writes standard
+  artifacts.
+- **Interpreter support floor:** Python `>=3.10` (declared in
+  `pyproject.toml` `[project] requires-python`). Enough for `str | None`,
+  `match`, PEP 604; `tomli` covers 3.10's lack of `tomllib`.
+- **Primary dev/test target:** Python `3.12` (declared in
+  `.python-version`, single line, no patch pin). `uv sync` / `uv run`
+  auto-fetch it via `[tool.uv] python-preference = "managed"` in
+  `pyproject.toml` — no external Python setup required.
+- **CI matrix:** 3.10–3.13 on Ubuntu, plus 3.12 on macOS and Windows.
+  Uses `astral-sh/setup-uv@v3` + `uv sync --frozen --python
+  ${{ matrix.python-version }}` + `uv run pytest`. No
+  `actions/setup-python` needed.
+
+Quick start (README-worthy):
+```bash
+# ephemeral, no install
+uvx bigfix-remote-client-relevance --container ubuntu:22.04 "name of operating system"
+
+# or install it
+uv tool install bigfix-remote-client-relevance
+# or, pip world
+pip install bigfix-remote-client-relevance
+```
 
 ## Existing pieces in `jgstew/tools` we build on
 - `bash/bigfix_run_qna_*.sh` and `CMD/bigfix_run_qna_win.bat` — per-OS
@@ -117,9 +153,11 @@ New repo: **`jgstew/evaluate_remote_client_relevance`**.
 
 ## Proposed shape
 
-### Library layout (`evaluate_remote_client_relevance/`)
+### Library layout (`src/bigfix_remote_client_relevance/`)
+Uses the src-layout (matches `pyproject.toml` `[tool.hatch.build.targets.wheel]`).
+
 ```
-evaluate_remote_client_relevance/
+src/bigfix_remote_client_relevance/
   __init__.py                # re-exports evaluate_client_relevance,
                              # ClientRelevanceResult, TransportLocal,
                              # TransportSSH, TransportContainer,
@@ -139,9 +177,9 @@ evaluate_remote_client_relevance/
     windows.py               # port of CMD/bigfix_run_qna_win.bat
     linux.py                 # port of debian/ubuntu variant to start
     container_images.py      # thin catalog of images used by TransportContainer
-  cli.py                     # `evaluate_remote_client_relevance` entry
+  cli.py                     # `bigfix-remote-client-relevance` entry
   inventory.py               # optional hosts.toml loader
-  tests/
+tests/                       # sibling of src/, not inside the package
 ```
 
 ### Core types
@@ -238,15 +276,19 @@ Four concrete transports, all class-named `Transport<Kind>`:
   rootless-podman quirks, image publication. Note them as follow-ups.
 
 ### CLI surface
+The entry point is `bigfix-remote-client-relevance` (hyphenated —
+matches `[project.scripts]` in `pyproject.toml`; the Python package it
+resolves to is `bigfix_remote_client_relevance.cli:main`).
+
 ```
-evaluate_remote_client_relevance HOST "name of operating system"
-evaluate_remote_client_relevance HOST --client-relevance-file probe.rel
-evaluate_remote_client_relevance --all hosts.toml \
+bigfix-remote-client-relevance HOST "name of operating system"
+bigfix-remote-client-relevance HOST --client-relevance-file probe.rel
+bigfix-remote-client-relevance --all hosts.toml \
     --client-relevance-file probe.rel --json
-evaluate_remote_client_relevance HOST --qna-version 11.0.4.60 "..."
-evaluate_remote_client_relevance --local "..."
-evaluate_remote_client_relevance --container ubuntu:22.04 "..."
-evaluate_remote_client_relevance --container bigfix_centos --qna-version 11.0.4.60 -f probe.rel
+bigfix-remote-client-relevance HOST --qna-version 11.0.4.60 "..."
+bigfix-remote-client-relevance --local "..."
+bigfix-remote-client-relevance --container ubuntu:22.04 "..."
+bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60 -f probe.rel
 ```
 
 - Short alias `-f` is fine for `--client-relevance-file`.
@@ -302,7 +344,7 @@ Discovery order matches the ported `find_qna_path()` plus `$PATH`.
   (Windows OpenSSH treats admins specially — miss this and admin logins
   silently ignore per-user keys).
 - Named entries in `~/.ssh/config` so the CLI can just say
-  `evaluate_remote_client_relevance mac-test ...`.
+  `bigfix-remote-client-relevance mac-test ...`.
 
 ### 4. Permissions & gotchas
 - On macOS, `qna` needs root for some inspectors —
