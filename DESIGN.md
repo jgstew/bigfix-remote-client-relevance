@@ -98,6 +98,14 @@ uv tool install bigfix-remote-client-relevance
 pip install bigfix-remote-client-relevance
 ```
 
+## Release flow (planned, not wired yet)
+Cut a release in three steps:
+1. **Edit the draft** — [Release Drafter](https://github.com/release-drafter/release-drafter) keeps a draft GitHub Release open, auto-populated from merged PR titles/labels with a proposed next version. Bump the version if needed and tidy the notes.
+2. **Publish** the draft. GitHub creates the `v*` tag.
+3. **CI does the rest** — a `push: tags: ['v*']` workflow runs `uv build` + `uv publish` (via PyPI Trusted Publishing / OIDC, no long-lived token) and attaches the wheel to the release. `hatch-vcs` bakes the tag into the version automatically.
+
+Not implemented yet — added when the project is closer to a first release.
+
 ## Existing pieces in `jgstew/tools` we build on
 - `bash/bigfix_run_qna_*.sh` and `CMD/bigfix_run_qna_win.bat` — per-OS
   bootstrap scripts that download a pinned qna/BESAgent version to
