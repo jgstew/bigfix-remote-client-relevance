@@ -181,6 +181,11 @@ src/bigfix_remote_client_relevance/
     fastquery.py             # TransportFastQuery(BigFix Fast Query) — stub
   bootstrap/
     __init__.py              # "provision qna without installing BigFix"
+    release_site.py          # resolve version specs ("11.0" -> "11.0.6.137")
+                             # against support.bigfix.com/bes/release/
+    cache.py                 # controller-side artifact cache + checksum
+                             # verify + push-to-target (see § qna binary
+                             # cache & distribution)
     macos.py                 # port of bash/bigfix_run_qna_macos.sh
     windows.py               # port of CMD/bigfix_run_qna_win.bat
     linux.py                 # port of debian/ubuntu variant to start
@@ -216,7 +221,10 @@ class Transport(Protocol):
         *,
         qna_path: str | None = None,     # None => discover on target
         qna_version: str | None = None,  # None => use whatever is present;
-                                         # else bootstrap that version
+                                         # else a *version spec* ("11.0" or
+                                         # "11.0.6.137") resolved and
+                                         # bootstrapped via the controller
+                                         # cache (see § qna binary cache)
         timeout_s: float = 30.0,
     ) -> ClientRelevanceResult: ...
 ```
@@ -230,8 +238,9 @@ Four concrete transports, all class-named `Transport<Kind>`:
 - `TransportSSH(host, user=..., key=..., become=False)` — asyncssh-based.
   Pipes the client-relevance string to `qna -t -showtypes` on the remote.
   When `qna_version` is set and that version isn't cached on the remote,
-  runs the matching bootstrap module to fetch/extract it into
-  `/tmp/bigfix_qna/<version>/` or `\Windows\Temp\bigfix_qna\<version>\`.
+  pushes the artifact from the controller cache and extracts it into
+  `/tmp/bigfix_qna/<version>/` or `\Windows\Temp\bigfix_qna\<version>\`
+  (see § qna binary cache & distribution — the target never downloads).
   Primary transport for real Mac / Windows / Linux endpoints.
 - `TransportContainer(image, engine="docker", qna_version=None,
   keep_alive=False)` — **on-demand eval via Docker (or another OCI engine)
@@ -266,9 +275,10 @@ Four concrete transports, all class-named `Transport<Kind>`:
 - **Lifecycle:**
   1. Ensure the image exists locally (pull if missing).
   2. If `qna_version` is set and the image doesn't already have that
-     version baked in, run the ported bootstrap steps inside the container
-     to fetch/extract that qna version into `/tmp/bigfix_qna/<version>/`
-     (same convention as SSH, so caching semantics match).
+     version baked in, push the artifact from the controller cache
+     (mount or `docker cp`) and extract it into
+     `/tmp/bigfix_qna/<version>/` (same convention as SSH, so caching
+     semantics match; see § qna binary cache & distribution).
   3. `docker run --rm -i <image> qna -t -showtypes` with the
      client-relevance string on stdin. Capture stdout/stderr + exit code.
   4. `keep_alive=True` reuses a long-lived container (via `docker exec`)
@@ -283,6 +293,113 @@ Four concrete transports, all class-named `Transport<Kind>`:
 - **Not-goals for the first cut:** Windows containers (host-OS coupled),
   rootless-podman quirks, image publication. Note them as follow-ups.
 
+### qna binary cache & distribution (controller-side)
+The machine running `bigfix-remote-client-relevance` (the **controller**)
+owns downloading qna/BESAgent artifacts and distributing them to targets.
+Targets never fetch from the internet themselves.
+
+**Why:** targeting 10 Windows devices with the same version and query must
+cost **one** download on the controller, not 10 independent downloads on
+the targets (slow, redundant, and assumes every target has outbound
+internet — often false for lab/isolated endpoints). The existing
+`bigfix_run_qna_*.sh` scripts download *on the target*; the port inverts
+that into fetch-on-controller + push.
+
+**Source of truth:** `https://support.bigfix.com/bes/release/`.
+- The index lists version streams (11, 10, 9.5, 9.2, …) with patches in
+  descending order; each patch links to `{major.minor}/patch{N}/` (e.g.
+  `11.0/patch6/`).
+- A patch page lists per-OS/arch agent installers named
+  `BESAgent-<full-version>-<platform>.<rpm|deb|pkg|exe>` (e.g.
+  `BESAgent-11.0.6.137-rhe7.x86_64.rpm`), plus `QNA<full-version>.zip`
+  (standalone QnA, Windows) and published checksums.
+- `bootstrap/release_site.py` scrapes this: resolve a version spec to a
+  full version, then map (full version, target platform/arch) to a
+  download URL. Layout changes on the site are a known external
+  dependency — the scraper is fixture-tested against captured HTML and
+  fails loudly with the URL it tried.
+
+**Version specs** (accepted anywhere a `qna_version` appears — API, CLI,
+`hosts.toml`):
+| Spec | Meaning |
+|---|---|
+| *(unset)* | Newest patch of the newest stream (top of the release index). |
+| `11.0`, `10.0`, `9.5`, `9.2` | Newest patch of that stream (e.g. `11.0` → `11.0.6.137` today). |
+| `11.0.6.137` | Exactly that version. |
+
+Resolution happens once per run on the controller and the resolved **full
+version** is what flows everywhere downstream: cache paths, target paths,
+`ClientRelevanceResult.qna_version`. Two runs with spec `11.0` on
+different days may resolve differently — that's the point — so results
+always record the resolved version, never the spec. Stream→newest lookups
+are cached on disk with a short TTL (default ~1 day, `--refresh-versions`
+to force) so repeated runs don't re-scrape; exact-version specs skip
+resolution entirely and work offline once the artifact is cached.
+
+**Controller cache** (`bootstrap/cache.py`):
+- Location: platform user-cache dir (via `platformdirs`), e.g.
+  `~/Library/Caches/bigfix_remote_client_relevance/qna/` on macOS. Layout:
+  `qna/<full-version>/<platform-arch>/<artifact>` + a `.sha256` sidecar.
+- Download once, verify against the release page's published checksums,
+  then reuse forever (artifacts are immutable per full version).
+- Concurrent evals dedupe in-process via an asyncio lock keyed by
+  artifact, so a 10-host fan-out triggers at most one download per
+  (version, platform-arch) pair.
+
+**Push to targets:**
+- **SSH:** before eval, check the target for
+  `/tmp/bigfix_qna/<full-version>/` (or
+  `\Windows\Temp\bigfix_qna\<full-version>\`) with a working `qna`
+  binary. If present, skip. If absent, SFTP the cached artifact and run
+  the ported *extract* step remotely (unzip / rpm2cpio / tar / pkgutil —
+  extraction stays on the target because it needs the target's tooling
+  and filesystem). The existing bootstrap modules are therefore split
+  into `resolve → fetch (controller) → push → extract (target) → run`
+  phases instead of one download-and-run script.
+- **Container:** same convention — mount or `docker cp` the cached
+  artifact into the container and extract there, so caching semantics and
+  paths match SSH exactly. Images with qna baked in (e.g.
+  `bigfix_centos`) skip the push when the baked version satisfies the
+  spec.
+- **Extraction-prereq check (one-time per target):** before the first
+  push to a target, verify the tools its extraction path needs are
+  actually present, and fail *before* transferring the artifact with a
+  message naming the missing tool and the install command
+  (`dnf install cpio`, `apt install binutils`, …). Per-platform needs:
+  - Windows: PowerShell `Expand-Archive` (built in since PS5 — part of
+    why the default shell is switched to PowerShell in setup step 2).
+  - macOS: `pkgutil` + `tar` (always present).
+  - Linux rpm-family: `rpm2cpio` + `cpio` — **frequently missing** on
+    minimal/container images.
+  - Linux deb-family: `dpkg-deb` (or `ar` + `tar` as fallback).
+
+  The check result is cached per (host, platform) in a small
+  controller-side state file so it runs once per target, not once per
+  eval; `--recheck-prereqs` forces it (e.g. after installing the missing
+  tool). This project only *reports* missing prereqs — it does not
+  install packages on targets. Exception: `TransportContainer` may
+  install them in a `keep_alive` container on request, since containers
+  are disposable; the seed images should just bake them in.
+- The presence check is `<dir exists>` + version marker file written
+  after successful extraction (not just the binary — a half-extracted
+  tree must not count as cached). Pushes are idempotent and safe to race
+  from concurrent runs: extract into a temp dir, rename into place.
+- Escape hatch: `--fetch-on-target` restores the old
+  download-on-the-target behavior for cases where the target has better
+  internet than its link to the controller.
+
+**Multi-version eval on the same target:** `qna_version` fans out — the
+API takes `str | Sequence[str]` at the orchestration layer and the CLI
+flag is repeatable (`--qna-version 11.0 --qna-version 10.0`). Each
+resolved version lives in its own `bigfix_qna/<full-version>/` directory
+on the target, so versions coexist without conflict, and the run produces
+one `ClientRelevanceResult` **per (target × version)** — the
+`qna_version` field disambiguates. Individual `Transport` implementations
+stay single-version; the fan-out (targets × versions, shared cache,
+concurrency) is the orchestration layer's job. This makes "does this
+client relevance answer the same on 11.0 and 9.5 on this exact box?" a
+one-liner.
+
 ### CLI surface
 The entry point is `bigfix-remote-client-relevance` (hyphenated —
 matches `[project.scripts]` in `pyproject.toml`; the Python package it
@@ -294,6 +411,9 @@ bigfix-remote-client-relevance HOST --client-relevance-file probe.rel
 bigfix-remote-client-relevance --all hosts.toml \
     --client-relevance-file probe.rel --json
 bigfix-remote-client-relevance HOST --qna-version 11.0.4.60 "..."
+bigfix-remote-client-relevance HOST --qna-version 11.0 "..."   # newest 11.0.x patch
+bigfix-remote-client-relevance HOST --qna-version 11.0 --qna-version 9.5 "..."
+                                       # same query, both versions, same host
 bigfix-remote-client-relevance --local "..."
 bigfix-remote-client-relevance --container ubuntu:22.04 "..."
 bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60 -f probe.rel
@@ -304,8 +424,11 @@ bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60
   `TransportSSH`; `--local` picks `TransportLocal`. Exactly one of the
   three is required per invocation (or `--all` for a mixed grid from
   `hosts.toml`).
-- `--json` emits one `ClientRelevanceResult` per target — same shape the
-  future MCP tool will return.
+- `--qna-version` accepts a version spec (`11.0` or `11.0.6.137`) and is
+  repeatable for multi-version fan-out; `--refresh-versions` and
+  `--fetch-on-target` are described in § qna binary cache & distribution.
+- `--json` emits one `ClientRelevanceResult` per (target × version) —
+  same shape the future MCP tool will return.
 - Exit code: 0 iff every target produced ≥1 answer and no `E:` line.
   Useful as a CI syntax gate for content authoring.
 
@@ -326,8 +449,10 @@ bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60
    - macOS: `/Library/BESAgent/BESAgent.app/Contents/MacOS/QnA`
    - Windows: `C:\Program Files (x86)\BigFix Enterprise\BES Client\QnA.exe`
    - Linux: `/opt/BESClient/bin/qna`
-2. Bootstrapped standalone via the ported `bootstrap/` modules — pinned
-   qna version, no BES install. Works over SSH **and** inside containers.
+2. Bootstrapped standalone via the ported `bootstrap/` modules — any
+   version spec, no BES install, artifact downloaded once on the
+   controller and pushed (§ qna binary cache & distribution). Works over
+   SSH **and** inside containers.
 3. Pre-staged — drop a `qna` binary anywhere and pass `--qna-path`.
    Includes container images that bake qna in at build time (see
    `tools/docker/Dockerfiles/bigfix_centos` and `bigfix_ubuntu`).
