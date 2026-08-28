@@ -39,6 +39,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import (
 from bigfix_remote_client_relevance.qna_paths import default_candidates
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
+    ERROR_KIND_QNA,
     ERROR_KIND_TRANSPORT,
     ClientRelevanceResult,
     ResolvedQna,
@@ -48,6 +49,7 @@ from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
     normalize_stdin_payload,
+    sudo_privilege_problem,
 )
 
 logger = logging.getLogger(__name__)
@@ -328,6 +330,15 @@ class TransportSSH:
 
         parsed = parse_qna_output(stdout)
         error, error_kind = classify_qna_outcome(parsed, exit_code, stderr)
+
+        # Both gates are structural, matching TransportLocal: ERROR_KIND_QNA
+        # means a relevance `E:` line -- proof elevation worked -- is never
+        # overridden, and `self._become` means qna's own stderr can never be
+        # mistaken for sudo's.
+        if self._become and error_kind == ERROR_KIND_QNA:
+            privilege = sudo_privilege_problem(stderr)
+            if privilege is not None:
+                error, error_kind = privilege, ERROR_KIND_BOOTSTRAP
 
         return _result(
             answers=parsed.answers,

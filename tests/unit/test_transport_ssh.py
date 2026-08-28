@@ -246,6 +246,68 @@ async def test_without_become_no_sudo():
     assert not runner.ran(r"^sudo")
 
 
+async def test_sudo_password_refusal_is_a_bootstrap_error_not_a_qna_error():
+    """A privilege problem is not the relevance engine failing."""
+    runner = FakeSSHRunner(
+        responses=[(r"^sudo -n", ("", "sudo: a password is required\n", 1))]
+    )
+
+    result = await make_transport(runner, become=True).evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "sudo" in (result.error or "").lower()
+    assert "nopasswd" in (result.error or "").lower()
+
+
+async def test_sudo_refusal_keeps_the_original_sudo_line():
+    runner = FakeSSHRunner(
+        responses=[
+            (r"^sudo -n", ("", "sudo: user is not in the sudoers file.\n", 1))
+        ]
+    )
+
+    result = await make_transport(runner, become=True).evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert "not in the sudoers file" in (result.error or "")
+
+
+async def test_qna_failure_under_become_is_still_a_qna_error():
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", ("", "qna: bad expression\n", 3))])
+
+    result = await make_transport(runner, become=True).evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert result.error_kind == ERROR_KIND_QNA
+
+
+async def test_relevance_error_under_become_stays_a_relevance_error(qna_output):
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", (qna_output("relevance_error"), "", 0))])
+
+    result = await make_transport(runner, become=True).evaluate_client_relevance(
+        "namez of it", qna_path="/opt/qna"
+    )
+
+    assert result.error_kind == ERROR_KIND_RELEVANCE
+
+
+async def test_sudo_stderr_is_ignored_without_become():
+    """Only a become run may be reclassified; qna stderr must never trigger it."""
+    runner = FakeSSHRunner(
+        responses=[(r"-showtypes", ("", "sudo: a password is required\n", 1))]
+    )
+
+    result = await make_transport(runner).evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert result.error_kind == ERROR_KIND_QNA
+
+
 # --- provisioning a pinned version ----------------------------------------
 
 
