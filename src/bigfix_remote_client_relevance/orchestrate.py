@@ -17,6 +17,7 @@ with ``error_kind`` set while every other pair still evaluates.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections.abc import Callable, Coroutine, Sequence
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError
+from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_QNA,
@@ -116,7 +118,7 @@ def default_transport_factory(target: Target) -> Transport:
             target.image or target.name,
             arch=target.arch,
             keep_alive=target.keep_alive,
-            target=target.platform or "ubuntu",
+            target=target.platform,
         )
     if target.kind == "fastquery":
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
@@ -134,6 +136,8 @@ async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
     )
     from bigfix_remote_client_relevance.bootstrap.targets import spec_for
 
+    # Containers always arrive here with platform set (probed in _one); the
+    # "ubuntu" fallback remains for SSH, which keeps its guessing behavior.
     platform_key = target.platform or ("macos" if target.kind == "local" else "ubuntu")
     release_platform = spec_for(platform_key).release_platform
 
@@ -202,6 +206,12 @@ async def evaluate_client_relevance(
         started = time.monotonic()
         resolved: ResolvedQna | None = None
 
+        try:
+            transport = transport_factory(target)
+        except Exception as exc:  # noqa: BLE001 - one bad target never fails the run
+            logger.debug("transport construction failed for %s: %s", target.label, exc)
+            return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+
         if spec is not None:
             if target.kind == "fastquery":
                 # Endpoints evaluate with their installed agent; refuse before
@@ -212,6 +222,20 @@ async def evaluate_client_relevance(
                     f"cannot pin qna version {spec!r} for the fastquery transport: "
                     "endpoints evaluate with their installed BES agent",
                 )
+            # The resolver picks the artifact (deb vs rpm) from the platform,
+            # so an unset one must be probed BEFORE resolution. The probe is a
+            # single short exec, so it runs outside the evaluation semaphore.
+            probe = getattr(transport, "resolve_platform", None)
+            if target.platform is None and probe is not None:
+                try:
+                    target = dataclasses.replace(
+                        target, platform=await probe(timeout_s=timeout_s)
+                    )
+                except UnknownTargetError as exc:
+                    return _failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
+                except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
+                    logger.debug("platform probe failed for %s: %s", target.label, exc)
+                    return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
             try:
                 resolved = await _resolve(target, spec)
             except ResolveError as exc:
@@ -222,7 +246,6 @@ async def evaluate_client_relevance(
 
         async with semaphore:
             try:
-                transport = transport_factory(target)
                 result = await transport.evaluate_client_relevance(
                     client_relevance, qna=resolved, timeout_s=timeout_s
                 )

@@ -248,9 +248,6 @@ async def test_one_version_failing_does_not_block_the_other():
 # so a container with no declared platform must be probed BEFORE resolution —
 # probing in the transport alone would still download the wrong agent.
 
-_M9 = pytest.mark.xfail(strict=True, reason="M9: orchestrator does not probe before resolving")
-
-
 class FakeProbingTransport(FakeTransport):
     """A container-style transport whose probe answers with a canned platform."""
 
@@ -274,7 +271,6 @@ def platform_recording_resolver(seen: list[str | None]):
     return resolve
 
 
-@_M9
 async def test_container_platform_is_probed_before_resolution():
     seen: list[str | None] = []
 
@@ -289,7 +285,6 @@ async def test_container_platform_is_probed_before_resolution():
     assert seen == ["rhel"], "the resolver must see the probed platform, not None"
 
 
-@_M9
 async def test_probed_platforms_split_the_resolution_dedupe():
     seen: list[str | None] = []
     platforms = {"almalinux:9": "rhel", "ubuntu:22.04": "ubuntu"}
@@ -308,7 +303,6 @@ async def test_probed_platforms_split_the_resolution_dedupe():
     assert sorted(seen, key=str) == ["rhel", "ubuntu"], "different platforms need distinct artifacts"
 
 
-@_M9
 async def test_matching_probed_platforms_share_one_resolution():
     seen: list[str | None] = []
 
@@ -326,7 +320,6 @@ async def test_matching_probed_platforms_share_one_resolution():
     assert seen == ["rhel"], "same probed platform must share one download"
 
 
-@_M9
 async def test_probe_failure_becomes_a_bootstrap_result():
     from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
 
@@ -345,7 +338,6 @@ async def test_probe_failure_becomes_a_bootstrap_result():
     assert "platform" in (results[0].error or "").lower()
 
 
-@_M9
 async def test_probe_engine_failure_becomes_a_transport_result():
     from bigfix_remote_client_relevance.transports.container import ContainerEngineError
 
@@ -363,7 +355,6 @@ async def test_probe_engine_failure_becomes_a_transport_result():
     assert results[0].error_kind == ERROR_KIND_TRANSPORT
 
 
-@_M9
 def test_default_factory_no_longer_defaults_containers_to_ubuntu():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 
