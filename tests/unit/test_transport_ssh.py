@@ -438,6 +438,33 @@ async def test_aclose_closes_the_connection():
     assert runner.closed
 
 
+def test_connect_kwargs_omit_unset_values_rather_than_passing_none():
+    """asyncssh rejects an explicit username=None with a bare TypeError.
+
+    Passing None is not the same as omitting the option: option construction
+    fails before the connection is even attempted, so a simple typo'd hostname
+    surfaces as "'NoneType' object is not iterable" instead of a DNS error.
+    """
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user=None, key=None, port=22)
+
+    assert None not in kwargs.values() or "known_hosts" in kwargs
+    assert "username" not in kwargs
+    assert "client_keys" not in kwargs
+    assert kwargs["port"] == 22
+
+
+def test_connect_kwargs_include_values_that_were_given():
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user="labadmin", key="/keys/id_ed25519", port=2222)
+
+    assert kwargs["username"] == "labadmin"
+    assert kwargs["client_keys"] == ["/keys/id_ed25519"]
+    assert kwargs["port"] == 2222
+
+
 async def test_writes_nothing_to_stdout(capsys):
     runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
 

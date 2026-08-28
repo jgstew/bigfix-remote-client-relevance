@@ -94,17 +94,28 @@ class _AsyncsshRunner:
         await self._connection.wait_closed()  # type: ignore[attr-defined]
 
 
+def connect_kwargs(user: str | None, key: str | None, port: int) -> dict[str, object]:
+    """Build asyncssh.connect options, omitting anything not set.
+
+    Passing ``username=None`` is not equivalent to omitting it: asyncssh's
+    option construction raises a bare ``TypeError`` before it ever tries to
+    connect, which turns a mistyped hostname into an opaque internal error
+    instead of a DNS failure. Unset options are left out entirely so asyncssh
+    applies its own defaults (~/.ssh/config, the agent, the usual key names).
+    """
+    kwargs: dict[str, object] = {"port": port, "known_hosts": None}
+    if user:
+        kwargs["username"] = user
+    if key:
+        kwargs["client_keys"] = [key]
+    return kwargs
+
+
 async def _connect(host: str, user: str | None, key: str | None, port: int) -> SSHRunner:
     import asyncssh
 
     try:
-        connection = await asyncssh.connect(
-            host,
-            port=port,
-            username=user,
-            client_keys=[key] if key else None,
-            known_hosts=None,
-        )
+        connection = await asyncssh.connect(host, **connect_kwargs(user, key, port))
     except (OSError, asyncssh.Error) as exc:
         raise SSHConnectionError(f"could not connect to {host}: {exc}") from exc
     return _AsyncsshRunner(connection)

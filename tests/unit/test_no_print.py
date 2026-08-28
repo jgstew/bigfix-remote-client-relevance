@@ -45,12 +45,32 @@ def test_package_root_logger_has_null_handler():
     assert any(isinstance(h, logging.NullHandler) for h in logger.handlers)
 
 
-def test_library_does_not_configure_logging():
-    """A library must leave handlers, levels, and formats to the application."""
-    logger = logging.getLogger("bigfix_remote_client_relevance")
+# cli.py is the application: configuring handlers and levels is its job.
+LOGGING_CONFIG_EXEMPT = {"cli.py"}
 
-    assert logger.level == logging.NOTSET
-    assert all(isinstance(h, logging.NullHandler) for h in logger.handlers)
+_CONFIGURES_LOGGING = re.compile(r"\b(basicConfig|setLevel|addHandler|StreamHandler)\s*\(")
+
+
+@pytest.mark.parametrize(
+    "module",
+    [p for p in _library_modules() if p.name not in LOGGING_CONFIG_EXEMPT],
+    ids=lambda p: p.name,
+)
+def test_library_module_does_not_configure_logging(module):
+    """Handlers, levels, and formats belong to the embedding application.
+
+    Checked against the source rather than the live logger so the result does
+    not depend on whether a CLI test configured logging earlier in the session.
+    """
+    source = module.read_text(encoding="utf-8")
+    offenders = [
+        match.group(1)
+        for match in _CONFIGURES_LOGGING.finditer(source)
+        # The package root's NullHandler is the one sanctioned exception.
+        if not (match.group(1) == "addHandler" and "NullHandler" in source)
+    ]
+
+    assert not offenders, f"{module.name} configures logging: {offenders}"
 
 
 async def test_evaluate_writes_nothing_to_stdout(fake_qna, qna_output, capsys, allow_non_root_macos):

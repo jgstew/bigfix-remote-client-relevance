@@ -15,6 +15,11 @@ from __future__ import annotations
 
 import logging
 
+from bigfix_remote_client_relevance.orchestrate import (
+    Target,
+    evaluate_client_relevance,
+    worst_exit_code,
+)
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
 from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
@@ -23,7 +28,10 @@ from bigfix_remote_client_relevance.results import (
     parse_qna_output,
 )
 from bigfix_remote_client_relevance.transports import Transport
+from bigfix_remote_client_relevance.transports.container import TransportContainer
+from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 from bigfix_remote_client_relevance.transports.local import TransportLocal
+from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -31,8 +39,14 @@ __all__ = [
     "ClientRelevanceResult",
     "ParsedQnaOutput",
     "ResolvedQna",
+    "Target",
     "Transport",
+    "TransportContainer",
+    "TransportFastQuery",
     "TransportLocal",
+    "TransportSSH",
+    "evaluate_client_relevance",
     "find_qna_path",
     "parse_qna_output",
+    "worst_exit_code",
 ]

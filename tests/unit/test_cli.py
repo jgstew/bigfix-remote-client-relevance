@@ -215,6 +215,48 @@ def test_exit_code_reflects_worst_result(captured, monkeypatch, kind, expected):
     assert result.exit_code == expected
 
 
+# --- the packaged console script ------------------------------------------
+
+
+def test_console_script_entry_point_parses_arguments():
+    """`[project.scripts]` must reach Typer, not the bare command function.
+
+    Pointing the entry point straight at the decorated command bypasses
+    argument parsing entirely, so `--help` raises instead of printing usage.
+    CliRunner invokes `app`, so only this exercises the packaged path.
+    """
+    import shutil
+    import subprocess
+
+    script = shutil.which("bigfix-remote-client-relevance")
+    if script is None:  # pragma: no cover - depends on install layout
+        pytest.skip("console script is not on PATH")
+
+    completed = subprocess.run(
+        [script, "--help"], capture_output=True, text=True, timeout=60, check=False
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Usage" in completed.stdout
+    assert "Traceback" not in completed.stderr
+
+
+def test_console_script_reports_usage_errors_without_a_traceback():
+    import shutil
+    import subprocess
+
+    script = shutil.which("bigfix-remote-client-relevance")
+    if script is None:  # pragma: no cover
+        pytest.skip("console script is not on PATH")
+
+    completed = subprocess.run(
+        [script, "--local"], capture_output=True, text=True, timeout=60, check=False
+    )
+
+    assert completed.returncode != 0
+    assert "Traceback" not in completed.stderr
+
+
 def test_errors_are_reported_on_stderr_not_stdout(monkeypatch):
     async def fake_evaluate(client_relevance, targets, **kwargs):
         return [
