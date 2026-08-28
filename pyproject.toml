@@ -107,3 +107,9 @@ extend-select = ["T20"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+# Neither ships type stubs, and the typeshed packages for them are incomplete.
+# Calls into both are already isolated behind our own typed seams.
+[[tool.mypy.overrides]]
+module = ["docker.*", "bs4.*"]
+ignore_missing_imports = true

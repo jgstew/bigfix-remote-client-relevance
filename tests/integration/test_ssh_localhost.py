@@ -71,7 +71,7 @@ async def test_sftp_push_and_extract_cycle(tmp_path, fake_qna, qna_output):
     import shutil
     import zipfile
 
-    import bigfix_remote_client_relevance.bootstrap.targets as targets
+    from bigfix_remote_client_relevance.bootstrap import targets
     from bigfix_remote_client_relevance.results import ResolvedQna
 
     stub = fake_qna(stdout=qna_output("single_answer"))

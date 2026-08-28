@@ -161,13 +161,14 @@ def _live_qna_status() -> tuple[bool, str]:
 
 @functools.lru_cache(maxsize=1)
 def _docker_available() -> bool:
+    # Uses the package's own socket discovery rather than docker.from_env(), so
+    # the probe agrees with what DockerEngine will actually connect to.
     try:
-        import docker
-    except ImportError:  # pragma: no cover
+        from bigfix_remote_client_relevance.transports.container import DockerEngine
+    except ImportError:  # pragma: no cover - only before the package exists
         return False
     try:
-        client = docker.from_env()
-        client.ping()
+        DockerEngine()._get_client()
         return True
     except Exception:  # noqa: BLE001 - any failure at all means no usable daemon
         return False

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import pytest
 
@@ -355,6 +354,41 @@ async def test_platform_flag_passed_through_for_arch_emulation():
     await transport.evaluate_client_relevance("true")
 
     assert engine.started[0]["platform"] == "linux/arm64"
+
+
+# --- DockerEngine client discovery ----------------------------------------
+
+
+def test_candidate_sockets_cover_engines_the_sdk_would_miss():
+    """The SDK assumes /var/run/docker.sock and ignores Docker contexts, so
+    Colima and Rancher Desktop need their own paths tried."""
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    candidates = candidate_docker_sockets()
+
+    assert any("/var/run/docker.sock" in c for c in candidates)
+    assert any(".docker/run/docker.sock" in c for c in candidates)
+    assert any(".colima" in c for c in candidates)
+    assert all(c.startswith("unix://") for c in candidates)
+
+
+def test_docker_host_env_takes_precedence(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    monkeypatch.setenv("DOCKER_HOST", "unix:///custom/docker.sock")
+
+    assert candidate_docker_sockets()[0] == "unix:///custom/docker.sock"
+
+
+async def test_engine_error_names_the_sockets_it_tried():
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    engine = DockerEngine(socket_candidates=["unix:///definitely/not/here.sock"])
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        await engine.ensure_image("ubuntu:22.04")
+
+    assert "not/here.sock" in str(excinfo.value)
 
 
 async def test_writes_nothing_to_stdout(capsys):
