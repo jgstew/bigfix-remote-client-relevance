@@ -203,7 +203,9 @@ def _extract_rpm(artifact: Path, destination: Path) -> None:
             # equivalents -- none of which rpmfile explicitly closes either;
             # `archive.__exit__` closes the underlying raw fileobj instead.
             archive._data_file = lzma.LZMAFile(  # noqa: SIM115
-                rpmfile._SubFile(archive._fileobj, archive.data_offset)
+                rpmfile._SubFile(  # pyright: ignore[reportArgumentType]
+                    archive._fileobj, archive.data_offset
+                )
             )
         for member in archive.getmembers():
             # rpmfile reports permission bits only, with the file type split

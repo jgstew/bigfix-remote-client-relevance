@@ -255,7 +255,7 @@ async def test_one_version_failing_does_not_block_the_other():
 class FakeProbingTransport(FakeTransport):
     """A container-style transport whose probe answers with a canned platform."""
 
-    def __init__(self, host: str, platform_key="rhel", **kwargs) -> None:
+    def __init__(self, host: str, platform_key: str | Exception = "rhel", **kwargs) -> None:
         super().__init__(host, **kwargs)
         self.platform_key = platform_key
         self.probed = 0

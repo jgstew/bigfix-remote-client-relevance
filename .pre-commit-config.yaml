@@ -198,6 +198,13 @@ repos:
         stages: [pre-push, manual]
         # built into a temp dir so the repo's own dist/ is not created or stale-filled
         entry: sh -c 'out="$(mktemp -d)"; trap "rm -rf \"$out\"" EXIT; uv build --wheel --out-dir "$out"'
+      - id: pyright
+        name: pyright (see config in pyrightconfig.json)
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push, manual]
+        entry: uv run --frozen pyright
       - id: pytest
         name: pytest (see config in pyproject.toml)
         language: system

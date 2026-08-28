@@ -213,8 +213,10 @@ async def evaluate_client_relevance(
 
         coordinator = ImageCoordinator()
 
-        def transport_factory(target: Target) -> Transport:
+        def _default_transport_factory(target: Target) -> Transport:
             return default_transport_factory(target, coordinator=coordinator)
+
+        transport_factory = _default_transport_factory
 
     resolver = resolver or default_resolver
     semaphore = asyncio.Semaphore(max_parallel)

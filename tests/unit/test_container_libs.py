@@ -136,6 +136,7 @@ def test_the_provides_name_is_shell_quoted():
     )
 
     package = package_for_soname("libfoo.so.9", family="rpm", manager="dnf")
+    assert package is not None
     command = install_command("dnf", package)
 
     assert "'libfoo.so.9()(64bit)'" in command

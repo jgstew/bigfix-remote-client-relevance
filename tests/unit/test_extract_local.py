@@ -39,7 +39,7 @@ def _data_tar(compression: str, members: dict[str, bytes] | None = None) -> byte
     """A deb payload tarball holding an executable qna."""
     members = members if members is not None else {QNA_MEMBER: QNA_BODY}
     buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode=f"w:{compression}") as tar:
+    with tarfile.open(fileobj=buffer, mode=f"w:{compression}") as tar:  # type: ignore[call-overload]
         for name, body in members.items():
             info = tarfile.TarInfo(f"./{name}" if not name.startswith("./") else name)
             info.size = len(body)

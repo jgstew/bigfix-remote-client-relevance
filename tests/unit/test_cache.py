@@ -66,6 +66,7 @@ async def test_cache_layout_is_version_platform_artifact(tmp_path):
         "11.0.6.137", make_ref(), fetch_bytes=CountingFetcher(), cache_dir=tmp_path
     )
 
+    assert resolved.artifact_path is not None
     relative = resolved.artifact_path.relative_to(tmp_path)
 
     assert relative.parts[0] == "qna"
@@ -79,6 +80,7 @@ async def test_writes_sha256_sidecar(tmp_path):
         "11.0.6.137", make_ref(), fetch_bytes=CountingFetcher(), cache_dir=tmp_path
     )
 
+    assert resolved.artifact_path is not None
     sidecar = resolved.artifact_path.with_suffix(resolved.artifact_path.suffix + ".sha256")
 
     assert sidecar.read_text(encoding="utf-8").strip().startswith(DIGEST)

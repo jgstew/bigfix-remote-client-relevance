@@ -1276,7 +1276,9 @@ async def test_auto_setup_off_starts_nothing():
 
     setup = FakeSetup(starter=starter())
     engine = DockerEngine(
-        socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False, setup=setup
+        socket_candidates=["unix:///definitely/not/here.sock"],
+        auto_setup=False,
+        setup=setup,  # type: ignore[arg-type]
     )
 
     with pytest.raises(ContainerEngineError) as excinfo:
@@ -1301,7 +1303,11 @@ async def test_nothing_installed_names_the_install_command():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
     setup = FakeSetup(starter=None)
-    engine = DockerEngine(socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup)
+    engine = DockerEngine(
+        socket_candidates=["unix:///nope.sock"],
+        auto_setup=True,
+        setup=setup,  # type: ignore[arg-type]
+    )
 
     with pytest.raises(ContainerEngineError) as excinfo:
         engine._get_client()
@@ -1316,7 +1322,11 @@ async def test_an_engine_we_must_not_start_reports_its_command():
     setup = FakeSetup(
         starter=starter(name="Docker", argv=None, note="start it with: sudo systemctl start docker")
     )
-    engine = DockerEngine(socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup)
+    engine = DockerEngine(
+        socket_candidates=["unix:///nope.sock"],
+        auto_setup=True,
+        setup=setup,  # type: ignore[arg-type]
+    )
 
     with pytest.raises(ContainerEngineError) as excinfo:
         engine._get_client()
@@ -1330,7 +1340,11 @@ async def test_an_injected_client_never_triggers_setup():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
     setup = FakeSetup(starter=starter())
-    engine = DockerEngine(client=FakeDockerClient(), auto_setup=True, setup=setup)
+    engine = DockerEngine(
+        client=FakeDockerClient(),
+        auto_setup=True,
+        setup=setup,  # type: ignore[arg-type]
+    )
 
     engine._get_client()
 

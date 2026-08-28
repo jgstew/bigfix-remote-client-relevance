@@ -21,6 +21,7 @@ import tomllib
 from pathlib import Path
 
 import tomlkit
+from tomlkit.exceptions import ParseError
 
 from bigfix_remote_client_relevance.orchestrate import Target
 
@@ -120,7 +121,7 @@ def update_inventory_platform(path: str | Path, host: str, platform: str) -> Non
 
     try:
         document = tomlkit.parse(raw.decode("utf-8"))
-    except tomlkit.exceptions.ParseError as exc:
+    except ParseError as exc:
         raise InventoryError(f"could not parse inventory {path}: {exc}") from exc
 
     hosts = document.get("hosts", {})
