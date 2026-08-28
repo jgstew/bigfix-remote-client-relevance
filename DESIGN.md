@@ -1,4 +1,4 @@
-# bigfix_remote_client_relevance — remote qna client-relevance eval over SSH + Docker
+# bigfix-remote-client-relevance — remote qna client-relevance eval over SSH + Docker
 
 ## Status
 **Milestones M1–M5 are implemented** (parser + local eval, version
@@ -70,9 +70,10 @@ BigFix has two distinct dialects that share a family name:
 Because the two are easy to confuse for both humans and AI agents, this
 project uses the phrase **"client relevance"** — never bare "relevance" —
 everywhere it can control the wording:
-- Repo name and Python package: `bigfix_remote_client_relevance`.
-  Distribution name on PyPI and CLI entry point: `bigfix-remote-client-relevance`
-  (hyphenated per PyPA convention).
+- Python package (import name): `bigfix_remote_client_relevance` (underscored;
+  Python identifiers can't contain hyphens). Repo name, PyPI distribution
+  name, and CLI entry point: `bigfix-remote-client-relevance` (hyphenated per
+  PyPA convention).
 - Public functions, dataclasses, fields, CLI flags, docs, log messages,
   error strings, MCP tool name (future), README headings.
 - Examples: `evaluate_client_relevance()`, `ClientRelevanceResult`,
@@ -167,7 +168,7 @@ against *different qna versions* on the same host, not just an installed
 one.
 
 ## Project home
-Repo: **`jgstew/bigfix_remote_client_relevance`**.
+Repo: **`jgstew/bigfix-remote-client-relevance`**.
 - Clean dependency surface (`asyncssh`, `docker` SDK, packaging) not forced
   on `jgstew/tools` consumers.
 - Publishable as a standalone pip/uv package on PyPI; future MCP server

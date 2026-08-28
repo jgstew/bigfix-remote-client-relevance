@@ -1,4 +1,4 @@
-# bigfix_remote_client_relevance
+# bigfix-remote-client-relevance
 
 Evaluate BigFix **client relevance** on remote endpoints and inside containers
 via `qna`, without a full BES install — over SSH, in Docker, or locally.

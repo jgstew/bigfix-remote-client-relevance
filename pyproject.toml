@@ -53,9 +53,9 @@ dev = [
 bigfix-remote-client-relevance = "bigfix_remote_client_relevance.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/jgstew/bigfix_remote_client_relevance"
-Issues   = "https://github.com/jgstew/bigfix_remote_client_relevance/issues"
-Source   = "https://github.com/jgstew/bigfix_remote_client_relevance"
+Homepage = "https://github.com/jgstew/bigfix-remote-client-relevance"
+Issues   = "https://github.com/jgstew/bigfix-remote-client-relevance/issues"
+Source   = "https://github.com/jgstew/bigfix-remote-client-relevance"
 
 # --- Build backend ---------------------------------------------------------
 

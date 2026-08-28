@@ -34,7 +34,7 @@ jobs:
     name: Check for an untagged version
     runs-on: ubuntu-latest
     # fork guard: a fork that pushes to its own main should not try to release
-    if: github.repository == 'jgstew/bigfix_remote_client_relevance'
+    if: github.repository == 'jgstew/bigfix-remote-client-relevance'
     outputs:
       version: ${{ steps.getversion.outputs.version }}
       release_needed: ${{ steps.tagged.outputs.release_needed }}
