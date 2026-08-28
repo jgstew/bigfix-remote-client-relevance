@@ -17,10 +17,12 @@ with ``error_kind`` set while every other pair still evaluates.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import time
 from collections.abc import Callable, Coroutine, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,6 +58,11 @@ _EXIT_BY_KIND: dict[str | None, int] = {
 }
 
 DEFAULT_MAX_PARALLEL = 8
+
+# Pulling images and evaluating relevance cost wildly different things: eight
+# simultaneous multi-hundred-MB pulls will saturate a laptop's link while eight
+# evaluations barely register. So they get separate budgets.
+DEFAULT_PULL_PARALLEL = 2
 
 
 @dataclass
@@ -101,8 +108,13 @@ TransportFactory = Callable[[Target], Transport]
 Resolver = Callable[[str | None, Target], Coroutine[Any, Any, ResolvedQna]]
 
 
-def default_transport_factory(target: Target) -> Transport:
-    """Build the transport a target calls for."""
+def default_transport_factory(target: Target, *, coordinator: object | None = None) -> Transport:
+    """Build the transport a target calls for.
+
+    ``coordinator`` is how a fan-out shares image work between the transports
+    it builds; it is keyword-only and optional so the one-argument
+    :data:`TransportFactory` signature still holds.
+    """
     if target.kind == "local":
         from bigfix_remote_client_relevance.transports.local import TransportLocal
 
@@ -127,6 +139,7 @@ def default_transport_factory(target: Target) -> Transport:
             target=target.platform,
             rebuild_image=target.rebuild_image,
             auto_setup=target.auto_setup,
+            coordinator=coordinator,  # type: ignore[arg-type]
         )
     if target.kind == "fastquery":
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
@@ -174,6 +187,7 @@ async def evaluate_client_relevance(
     *,
     qna_version: str | Sequence[str] | None = None,
     max_parallel: int = DEFAULT_MAX_PARALLEL,
+    pull_parallel: int = DEFAULT_PULL_PARALLEL,
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
@@ -183,9 +197,19 @@ async def evaluate_client_relevance(
     Returns one result per (target, version) pair. Every failure mode is
     reported inside a result rather than raised.
     """
-    transport_factory = transport_factory or default_transport_factory
+    if transport_factory is None:
+        # One coordinator per run, so the transports built below share image
+        # work with each other and with nothing else.
+        from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
+
+        coordinator = ImageCoordinator()
+
+        def transport_factory(target: Target) -> Transport:
+            return default_transport_factory(target, coordinator=coordinator)
+
     resolver = resolver or default_resolver
     semaphore = asyncio.Semaphore(max_parallel)
+    image_semaphore = asyncio.Semaphore(pull_parallel)
 
     # Resolve each distinct spec once per run and share the outcome, so a
     # 10-host run does not scrape the release site 10 times.
@@ -220,6 +244,13 @@ async def evaluate_client_relevance(
             logger.debug("transport construction failed for %s: %s", target.label, exc)
             return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
 
+        prepare = getattr(transport, "prepare", None)
+        # Only image-backed transports have an image phase to budget; an SSH
+        # sweep must not be serialized by a container-pull limit.
+        image_budget: AbstractAsyncContextManager[Any] = (
+            image_semaphore if prepare is not None else contextlib.nullcontext()
+        )
+
         if spec is not None:
             if target.kind == "fastquery":
                 # Endpoints evaluate with their installed agent; refuse before
@@ -230,15 +261,15 @@ async def evaluate_client_relevance(
                     f"cannot pin qna version {spec!r} for the fastquery transport: "
                     "endpoints evaluate with their installed BES agent",
                 )
-            # The resolver picks the artifact (deb vs rpm) from the platform,
-            # so an unset one must be probed BEFORE resolution. The probe is a
-            # single short exec, so it runs outside the evaluation semaphore.
+            # The resolver picks the artifact (deb vs rpm) from the platform, so
+            # an unset one must be probed BEFORE resolution. For a container the
+            # probe can trigger the image pull, so it shares the image budget.
             probe = getattr(transport, "resolve_platform", None)
             if target.platform is None and probe is not None:
                 try:
-                    target = dataclasses.replace(
-                        target, platform=await probe(timeout_s=timeout_s)
-                    )
+                    async with image_budget:
+                        probed = await probe(timeout_s=timeout_s)
+                    target = dataclasses.replace(target, platform=probed)
                 except UnknownTargetError as exc:
                     return _failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
                 except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
@@ -251,6 +282,16 @@ async def evaluate_client_relevance(
             except Exception as exc:  # noqa: BLE001 - resolution never kills a run
                 logger.debug("resolution failed for %s: %s", spec, exc)
                 return _failure(target, ERROR_KIND_RESOLVE, f"could not resolve {spec!r}: {exc}")
+
+        if prepare is not None:
+            # Pulling and building under their own budget. Failures are not
+            # fatal: this is an optimization, and the evaluation below hits the
+            # same code path and reports the failure in its own vocabulary.
+            try:
+                async with image_budget:
+                    await prepare(qna=resolved, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001 - the evaluation will report it
+                logger.debug("image preparation failed for %s: %s", target.label, exc)
 
         async with semaphore:
             try:
@@ -293,6 +334,7 @@ def worst_exit_code(results: Sequence[ClientRelevanceResult]) -> int:
 
 __all__ = [
     "DEFAULT_MAX_PARALLEL",
+    "DEFAULT_PULL_PARALLEL",
     "EXIT_OK",
     "EXIT_QNA",
     "EXIT_RELEVANCE",

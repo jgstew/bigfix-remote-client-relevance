@@ -60,6 +60,7 @@ from bigfix_remote_client_relevance.transports.container_setup import (
     EngineSetup,
     docker_context_endpoint,
 )
+from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
 from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
@@ -498,6 +499,7 @@ class TransportContainer:
         extractor: Extractor | None = None,
         rebuild_image: bool = False,
         auto_setup: bool = True,
+        coordinator: ImageCoordinator | None = None,
     ) -> None:
         self.image = image
         self.arch = arch
@@ -510,6 +512,10 @@ class TransportContainer:
         self._auto_setup = auto_setup
         self._container_id: str | None = None
         self._warned_about_emulation = False
+        # A private coordinator still works — it just shares nothing, which is
+        # right for a transport used on its own rather than through a fan-out.
+        self._coordinator = coordinator or ImageCoordinator()
+        self._prepared: tuple[str, tuple[str, dict[str, str]]] | None = None
 
     @property
     def host(self) -> str:
@@ -549,6 +555,28 @@ class TransportContainer:
             await self._engine.stop(self._container_id)
             self._container_id = None
 
+    async def _ensure_image_once(self) -> None:
+        """Pull the base image, at most once per image across a whole run."""
+        await self._coordinator.once(
+            f"pull:{self.image}@{self.platform}",
+            lambda: self._engine.ensure_image(self.image, platform=self.platform),
+        )
+
+    async def prepare(self, *, qna: ResolvedQna | None = None, timeout_s: float = 30.0) -> None:
+        """Do the image work up front, so a fan-out can budget it separately.
+
+        Purely an optimization: :meth:`evaluate_client_relevance` does the same
+        work itself when this was not called, or was called for a different
+        version. That keeps the transport correct when used on its own, which
+        is how it is normally driven outside the orchestrator.
+        """
+        self._note_emulation()
+        await self._ensure_image_once()
+        if qna is None:
+            return
+        spec = spec_for(await self.resolve_platform(timeout_s=timeout_s))
+        self._prepared = (qna.version, await self._prepare_qna_image(qna, spec, timeout_s=timeout_s))
+
     async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
         """The :data:`KNOWN_TARGETS` key for this image.
 
@@ -560,7 +588,7 @@ class TransportContainer:
         if self._target is not None:
             return self._target
         if self._probed is None:
-            await self._engine.ensure_image(self.image, platform=self.platform)
+            await self._ensure_image_once()
             if self._container_id is not None:
                 stdout, _stderr, _code = await self._engine.exec_in(
                     self._container_id, PLATFORM_PROBE_COMMAND, timeout=timeout_s
@@ -600,7 +628,7 @@ class TransportContainer:
         transient_container: str | None = None
         try:
             self._note_emulation()
-            await self._engine.ensure_image(self.image, platform=self.platform)
+            await self._ensure_image_once()
 
             # Provisioning needs the real platform (deb vs rpm agent); without
             # provisioning the spec is cosmetic, so the cheap path never probes.
@@ -610,9 +638,13 @@ class TransportContainer:
                 spec = spec_for(self._target or "ubuntu")
 
             if qna is not None:
-                image_to_run, mounts = await self._prepare_qna_image(
-                    qna, spec, timeout_s=timeout_s
-                )
+                if self._prepared is not None and self._prepared[0] == qna.version:
+                    image_to_run, mounts = self._prepared[1]
+                    mounts = dict(mounts)
+                else:
+                    image_to_run, mounts = await self._prepare_qna_image(
+                        qna, spec, timeout_s=timeout_s
+                    )
                 qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
 
             # A probed platform came from the image itself; only a
@@ -724,16 +756,23 @@ class TransportContainer:
         back to mounting the extracted tree, same as before this cache
         existed.
         """
-        digest = await self._engine.image_digest(self.image)
-        tag = prepared_image_tag(digest, qna.version, self.arch)
-        if self._rebuild_image or not await self._engine.image_exists(tag):
-            # Only pay for extraction when a build (or its fallback) needs the
-            # tree; a cache hit skips both.
-            tree = await self._extractor(qna)
-            if await self._build_prepared_image(tree, tag, spec, timeout_s=timeout_s):
-                return tag, {}
-            return self.image, {str(tree): f"{QNA_MOUNT}:ro"}
-        return tag, {}
+        key = f"prepared:{self.image}@{self.arch}:{qna.version}:{self._rebuild_image}"
+
+        async def build() -> tuple[str, dict[str, str]]:
+            digest = await self._engine.image_digest(self.image)
+            tag = prepared_image_tag(digest, qna.version, self.arch)
+            if self._rebuild_image or not await self._engine.image_exists(tag):
+                # Only pay for extraction when a build (or its fallback) needs
+                # the tree; a cache hit skips both.
+                tree = await self._extractor(qna)
+                if await self._build_prepared_image(tree, tag, spec, timeout_s=timeout_s):
+                    return tag, {}
+                return self.image, {str(tree): f"{QNA_MOUNT}:ro"}
+            return tag, {}
+
+        image, mounts = await self._coordinator.once(key, build)
+        # The mounts dict is shared between everyone waiting on this key.
+        return image, dict(mounts)
 
     async def _build_prepared_image(
         self, tree: Path, tag: str, spec: TargetSpec, *, timeout_s: float

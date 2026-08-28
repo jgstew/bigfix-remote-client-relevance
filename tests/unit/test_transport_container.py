@@ -958,16 +958,12 @@ async def test_x86_64_still_selects_the_amd64_docker_platform():
 # A transport is built per (target, version) pair, so two versions of one image
 # would otherwise pull it twice and build the same prepared image twice.
 
-_M20 = pytest.mark.xfail(strict=True, reason="M20: image work is not shared between transports")
-
-
 def coordinator():
     from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
 
     return ImageCoordinator()
 
 
-@_M20
 async def test_two_transports_sharing_a_coordinator_pull_once(extracted):
     import asyncio
 
@@ -987,7 +983,6 @@ async def test_two_transports_sharing_a_coordinator_pull_once(extracted):
     assert engine.pulled == ["ubuntu:22.04"], "one image, one pull"
 
 
-@_M20
 async def test_a_warm_prepared_image_still_dedupes_the_pull(resolved, extracted):
     """The pull happens on every path, cache hit or not."""
     import asyncio
@@ -1011,7 +1006,6 @@ async def test_a_warm_prepared_image_still_dedupes_the_pull(resolved, extracted)
     assert engine.pulled == ["ubuntu:22.04"]
 
 
-@_M20
 async def test_two_transports_build_one_prepared_image(resolved, extracted):
     import asyncio
 
@@ -1032,7 +1026,6 @@ async def test_two_transports_build_one_prepared_image(resolved, extracted):
     assert len(extracted.calls) == 1, "and one extraction"
 
 
-@_M20
 async def test_different_versions_are_not_shared(resolved, extracted, tmp_path):
     """Different versions are genuinely different images."""
     import asyncio
@@ -1058,7 +1051,6 @@ async def test_different_versions_are_not_shared(resolved, extracted, tmp_path):
     assert len({tag for _cid, tag in engine.committed}) == 2
 
 
-@_M20
 async def test_the_prepare_hook_carries_into_the_evaluation(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, extractor=extracted)
@@ -1070,7 +1062,6 @@ async def test_the_prepare_hook_carries_into_the_evaluation(resolved, extracted)
     assert str(engine.one_shots[-1]["image"]).startswith("bfrcr/prepared:")
 
 
-@_M20
 async def test_preparing_one_version_is_not_reused_for_another(resolved, extracted, tmp_path):
     other_artifact = tmp_path / "cache" / "BESAgent-9.5.22.10-ubuntu18.amd64.deb"
     other_artifact.parent.mkdir(parents=True, exist_ok=True)

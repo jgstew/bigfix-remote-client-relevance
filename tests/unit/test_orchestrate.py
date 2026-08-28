@@ -421,9 +421,6 @@ def test_rebuild_image_reaches_the_transport_factory():
 # different cost profiles: eight simultaneous multi-hundred-MB pulls will
 # saturate a laptop while eight evaluations barely register.
 
-_M20 = pytest.mark.xfail(strict=True, reason="M20: image work has no budget of its own")
-
-
 class FakePreparingTransport(FakeProbingTransport):
     """A container-style transport whose image phase is separately observable."""
 
@@ -463,7 +460,6 @@ def container_targets(count: int) -> list[Target]:
     ]
 
 
-@_M20
 async def test_the_image_phase_runs_before_the_evaluation():
     made: list[FakePreparingTransport] = []
 
@@ -477,7 +473,6 @@ async def test_the_image_phase_runs_before_the_evaluation():
     assert made[0].order == ["prepare", "evaluate"]
 
 
-@_M20
 async def test_pull_parallel_bounds_the_image_phase():
     tracker = {"live": 0, "peak": 0, "calls": 0}
 
@@ -495,9 +490,13 @@ async def test_pull_parallel_bounds_the_image_phase():
     assert tracker["peak"] <= 2, f"peak image concurrency was {tracker['peak']}"
 
 
-@_M20
 async def test_the_two_budgets_are_independent():
-    """A low pull limit must not throttle evaluation, or vice versa."""
+    """A low pull limit must not throttle evaluation, or vice versa.
+
+    The image phase is deliberately much faster than the evaluation here, so
+    targets finish preparing and pile up in the evaluation phase — which is
+    where they must be allowed to overlap.
+    """
     images = {"live": 0, "peak": 0, "calls": 0}
     evals = {"live": 0, "peak": 0}
 
@@ -507,7 +506,7 @@ async def test_the_two_budgets_are_independent():
         max_parallel=6,
         pull_parallel=1,
         transport_factory=lambda t: FakePreparingTransport(
-            t.name, image_tracker=images, tracker=evals, prepare_delay=0.01, delay=0.01
+            t.name, image_tracker=images, tracker=evals, prepare_delay=0.005, delay=0.08
         ),
     )
 
@@ -516,7 +515,6 @@ async def test_the_two_budgets_are_independent():
     assert evals["peak"] > 1, "but evaluation is not"
 
 
-@_M20
 async def test_a_failed_image_phase_does_not_fail_the_pair():
     """The evaluation reports it in its own vocabulary; prepare is an optimization."""
     made: list[FakePreparingTransport] = []
@@ -533,7 +531,6 @@ async def test_a_failed_image_phase_does_not_fail_the_pair():
     assert results[0].error_kind is None
 
 
-@_M20
 async def test_transports_without_the_hook_are_not_throttled_by_the_pull_limit():
     """A 20-host SSH sweep must not be serialized by a container-pull budget."""
     tracker = {"live": 0, "peak": 0}
@@ -549,7 +546,6 @@ async def test_transports_without_the_hook_are_not_throttled_by_the_pull_limit()
     assert tracker["peak"] > 1
 
 
-@_M20
 def test_the_default_factory_accepts_a_coordinator():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
     from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator

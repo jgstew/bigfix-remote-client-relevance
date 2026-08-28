@@ -13,8 +13,6 @@ import pytest
 
 from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
 
-pytestmark = pytest.mark.xfail(strict=True, reason="M20: image work is not shared")
-
 
 def counting_factory(calls: list[str], key: str, *, result: str = "done", delay: float = 0.0):
     async def work() -> str:

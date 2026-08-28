@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
 
@@ -35,7 +35,10 @@ class ImageCoordinator:
         a key share its outcome, and a doomed pull is not retried once per
         target.
         """
-        raise NotImplementedError
+        if key not in self._tasks:
+            # Synchronous, before any await, so two callers cannot both start it.
+            self._tasks[key] = asyncio.create_task(factory())
+        return cast(T, await self._tasks[key])
 
 
 __all__ = ["ImageCoordinator"]

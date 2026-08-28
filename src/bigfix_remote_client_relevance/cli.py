@@ -30,6 +30,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
 from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
 from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
+    DEFAULT_PULL_PARALLEL,
     EXIT_QNA,
     Target,
     evaluate_client_relevance,
@@ -188,6 +189,14 @@ def evaluate(
     max_parallel: Annotated[
         int, typer.Option("--max-parallel", help="Cap on concurrent evaluations.")
     ] = DEFAULT_MAX_PARALLEL,
+    pull_parallel: Annotated[
+        int,
+        typer.Option(
+            "--pull-parallel",
+            help="Cap on concurrent image pulls and builds. Lower than "
+            "--max-parallel because pulls are far more expensive.",
+        ),
+    ] = DEFAULT_PULL_PARALLEL,
     timeout: Annotated[
         float, typer.Option("--timeout", help="Per-evaluation timeout in seconds.")
     ] = 30.0,
@@ -274,6 +283,7 @@ def evaluate(
             targets,
             qna_version=qna_version or None,
             max_parallel=max_parallel,
+            pull_parallel=pull_parallel,
             timeout_s=timeout,
         )
     )
