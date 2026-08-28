@@ -421,6 +421,82 @@ async def test_one_shot_eval_without_qna_does_not_probe():
     assert len(engine.one_shots) == 1
 
 
+# --- family sanity check -----------------------------------------------------
+#
+# A probed platform is authoritative, but an explicit --platform can be wrong,
+# and a wrong one used to run to completion with the wrong agent (issue #1).
+# Before provisioning, an explicit deb/rpm platform is checked against which
+# package manager the image actually carries.
+
+_M8 = pytest.mark.xfail(strict=True, reason="M8: family sanity check not implemented")
+
+SANITY_RPM_ONLY = (r"command -v dpkg", ("rpm", "", 0))
+SANITY_DEB_ONLY = (r"command -v dpkg", ("dpkg", "", 0))
+SANITY_NEITHER = (r"command -v dpkg", ("", "", 0))
+
+
+@_M8
+async def test_explicit_deb_platform_on_an_rpm_image_fails_loudly(resolved):
+    engine = FakeEngine(responses=[SANITY_RPM_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    result = await TransportContainer(
+        "almalinux:9", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "rpm" in (result.error or "")
+    assert "platform" in (result.error or "").lower()
+
+
+@_M8
+async def test_explicit_rpm_platform_on_a_deb_image_fails_loudly(resolved):
+    engine = FakeEngine(responses=[SANITY_DEB_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="rhel"
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "dpkg" in (result.error or "") or "deb" in (result.error or "")
+
+
+@_M8
+async def test_matching_explicit_platform_passes_the_sanity_check(resolved):
+    engine = FakeEngine(responses=[SANITY_DEB_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind is None
+    assert any("command -v rpm" in c for c in engine.commands()), "check must actually run"
+
+
+@_M8
+async def test_inconclusive_sanity_output_does_not_block(resolved):
+    """No package manager found (busybox-ish): proceed, the prereq probe governs."""
+    engine = FakeEngine(responses=[SANITY_NEITHER, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind is None
+    assert any("command -v rpm" in c for c in engine.commands()), "check must actually run"
+
+
+async def test_probed_platform_skips_the_sanity_check(resolved):
+    """A probed platform came from the image itself; re-checking wastes an exec."""
+    engine = FakeEngine(responses=[PROBE_ALMA, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    result = await TransportContainer("almalinux:9", engine=engine).evaluate_client_relevance(
+        "true", qna=resolved
+    )
+
+    assert result.error_kind is None
+    assert not any("command -v dpkg" in c for c in engine.commands())
+
+
 # --- keep-alive ------------------------------------------------------------
 
 
