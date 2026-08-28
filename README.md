@@ -87,7 +87,10 @@ qna_version = "11.0"        # version spec; overridable per host
 
 [hosts.mac-test]            # table name is the ~/.ssh/config alias
 transport = "ssh"
-become = true               # sudo for root-only inspectors (ssh and local)
+become = true               # sudo for root-only inspectors
+
+[hosts.this-controller]
+transport = "local"          # no `become` line needed: implied on a macOS controller
 
 [hosts.ubuntu-22]
 transport = "container"

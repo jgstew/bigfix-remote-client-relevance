@@ -22,6 +22,9 @@ user = "labadmin"
 transport = "container"
 image = "ubuntu:22.04"
 qna_version = "10.0"
+
+[hosts.this-machine]
+transport = "local"
 """
 
 
@@ -35,7 +38,7 @@ def inventory_file(tmp_path):
 def test_loads_every_host(inventory_file):
     targets = load_inventory(inventory_file)
 
-    assert {t.name for t in targets} == {"mac-test", "win11-lab", "ubuntu-22"}
+    assert {t.name for t in targets} == {"mac-test", "win11-lab", "ubuntu-22", "this-machine"}
 
 
 def test_table_name_is_the_ssh_alias(inventory_file):
@@ -49,7 +52,30 @@ def test_user_is_carried_through(inventory_file):
     targets = {t.name: t for t in load_inventory(inventory_file)}
 
     assert targets["win11-lab"].user == "labadmin"
-    assert targets["win11-lab"].become is False
+
+
+def test_unset_become_is_left_unspecified_not_forced_false(inventory_file):
+    """None, not False, so default_transport_factory can still imply --become
+    for a `local` host on a macOS controller."""
+    targets = {t.name: t for t in load_inventory(inventory_file)}
+
+    assert targets["win11-lab"].become is None
+
+
+def test_inventory_local_host_implies_become_on_macos(inventory_file, monkeypatch):
+    """The feature this was all for: a local host in hosts.toml with no
+    `become` line still gets sudo on a macOS controller, same as --local."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    targets = {t.name: t for t in load_inventory(inventory_file)}
+    assert targets["this-machine"].become is None  # unresolved at load time
+
+    transport = default_transport_factory(targets["this-machine"])
+
+    assert transport._become is True
 
 
 def test_container_host_carries_its_image(inventory_file):

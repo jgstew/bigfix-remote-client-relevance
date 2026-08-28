@@ -424,6 +424,60 @@ def test_become_reaches_the_local_transport():
     assert transport._become is True
 
 
+def test_unspecified_local_become_implies_true_on_macos(monkeypatch):
+    """qna needs root on macOS unconditionally -- an inventory host or a CLI
+    invocation that never mentions `become` should still get it there."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    transport = default_transport_factory(Target(kind="local", name="local", become=None))
+
+    assert transport._become is True
+
+
+def test_unspecified_local_become_is_false_off_macos(monkeypatch):
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    transport = default_transport_factory(Target(kind="local", name="local", become=None))
+
+    assert transport._become is False
+
+
+def test_explicit_false_overrides_the_macos_default(monkeypatch):
+    """The implied default must still be escapable, e.g. from an inventory file."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    transport = default_transport_factory(Target(kind="local", name="local", become=False))
+
+    assert transport._become is False
+
+
+def test_unspecified_ssh_become_is_false_even_on_macos(monkeypatch):
+    """SSH gets no platform-aware default: the remote OS isn't known up front."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    transport = default_transport_factory(
+        Target(kind="ssh", name="test-host", become=None, platform="ubuntu")
+    )
+
+    assert transport._become is False
+
+
 # --- two budgets: image work and evaluation ------------------------------------
 #
 # One semaphore throttled everything, but pulls and evaluations have very

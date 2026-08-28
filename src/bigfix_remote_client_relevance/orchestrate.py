@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import sys
 import time
 from collections.abc import Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -76,7 +77,10 @@ class Target:
     """SSH alias, image name, or ``"local"``."""
 
     user: str | None = None
-    become: bool = False
+    become: bool | None = None
+    """None means unspecified: `default_transport_factory` decides -- True for
+    `local` on a macOS controller (qna needs root there unconditionally),
+    False otherwise. An explicit True/False always wins."""
     image: str | None = None
     arch: str = "x86_64"
     platform: str | None = None
@@ -118,14 +122,18 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
     if target.kind == "local":
         from bigfix_remote_client_relevance.transports.local import TransportLocal
 
-        return TransportLocal(target=target.platform, become=target.become)
+        # qna requires root on macOS unconditionally, so an unspecified
+        # `become` defaults on there; SSH can't make the same call below --
+        # the remote platform isn't known without a round trip.
+        become = target.become if target.become is not None else sys.platform == "darwin"
+        return TransportLocal(target=target.platform, become=become)
     if target.kind == "ssh":
         from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 
         return TransportSSH(
             target.name,
             user=target.user,
-            become=target.become,
+            become=bool(target.become),
             target=target.platform,
             verify_host_key=target.verify_host_key,
         )

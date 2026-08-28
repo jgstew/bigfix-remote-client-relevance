@@ -81,12 +81,16 @@ def _target_from_entry(
     user = setting("user")
     version = setting("qna_version")
     platform = setting("platform")
+    become_raw = setting("become")
 
     return Target(
         kind=kind,
         name=name,
         user=str(user) if user is not None else None,
-        become=bool(setting("become", False)),
+        # Left as None when unset (rather than coerced to False) so
+        # default_transport_factory can imply --become for a `local` host on
+        # a macOS controller -- the same default the CLI's --local gets.
+        become=bool(become_raw) if become_raw is not None else None,
         image=str(image) if image is not None else None,
         arch=str(setting("arch", "x86_64")),
         platform=str(platform) if platform is not None else None,

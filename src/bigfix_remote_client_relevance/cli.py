@@ -340,19 +340,18 @@ def evaluate(
         for image in container
     )
     if local:
-        # qna requires root on macOS specifically (see TransportLocal), so
-        # --local implies --become there unless the caller said otherwise.
-        # SSH can't make the same call: the remote platform isn't known
-        # without a round trip, so it stays opt-in.
-        local_become = become if become is not None else sys.platform == "darwin"
-        targets = [Target(kind="local", name="local", platform=platform, become=local_become)]
+        # `become` stays whatever the caller passed (True/False/unspecified);
+        # default_transport_factory is where an unspecified value resolves,
+        # since inventory-loaded local targets need the same macOS-aware
+        # default and shouldn't need that logic duplicated here.
+        targets = [Target(kind="local", name="local", platform=platform, become=become)]
     elif host is not None:
         targets = [
             Target(
                 kind="ssh",
                 name=host,
                 user=user,
-                become=bool(become),
+                become=become,
                 platform=platform,
                 verify_host_key=not insecure_skip_host_key_check,
             )

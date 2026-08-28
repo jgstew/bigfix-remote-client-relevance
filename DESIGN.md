@@ -690,7 +690,10 @@ qna_version = "11.0"        # version spec; overridable per host
 
 [hosts.mac-test]            # table name = ~/.ssh/config alias by default
 transport = "ssh"
-become = true               # sudo for root-only inspectors (ssh and local)
+become = true               # sudo for root-only inspectors
+
+[hosts.this-controller]
+transport = "local"          # no `become` line needed: implied on a macOS controller
 
 [hosts.win11-lab]
 transport = "ssh"
@@ -776,13 +779,21 @@ answers cross an untrusted network.
   `FileIOError` before answering anything, even `TRUE`, so there is no
   partial-answer mode worth preserving. Pass
   `TransportLocal(require_root_on_macos=False)` to attempt it anyway.
-- The CLI's `--local` implies `--become` when the controller itself is macOS
-  (`sys.platform == "darwin"`), since qna needs root there unconditionally —
-  `--no-become` opts back out to the plain refusal. `--become`/`--no-become`
-  stays opt-in over SSH (the remote platform isn't known without a round
-  trip) and at the `TransportLocal` constructor level (`become=False` by
-  default; the CLI is what computes the macOS-aware default before
-  constructing the `Target`).
+- `Target.become` is `bool | None`, not a plain bool: `None` means
+  unspecified, and `default_transport_factory` is the single place that
+  resolves it — `True` for a `local` target when the controller itself is
+  macOS (`sys.platform == "darwin"`, since qna needs root there
+  unconditionally), `False` otherwise. An explicit `True`/`False` always
+  wins. Both the CLI's `--local`/`--no-become` and an inventory host with
+  `transport = "local"` and no `become` line resolve through this one path,
+  so a macOS box picks up the default whether reached by a flag or by
+  `hosts.toml` — the CLI itself does no platform-aware defaulting, it just
+  forwards whatever `--become`/`--no-become`/neither produced. SSH always
+  coerces `None` to `False` (`bool(target.become)`) with no platform
+  awareness, since the remote OS isn't known without a round trip.
+  `TransportLocal`'s and `TransportSSH`'s own constructor defaults are
+  untouched (`become=False`) — this is resolved one layer up, in
+  orchestration, not in the transports themselves.
 - `TransportLocal(become=True)` runs qna under
   `sudo -n` and skips the refusal above — the qna process will be root
   whatever this process's euid is, so the pre-flight check would be a false
