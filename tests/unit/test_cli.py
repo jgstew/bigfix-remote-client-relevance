@@ -205,6 +205,84 @@ def test_platform_does_not_override_inventory_targets(captured, tmp_path):
     assert by_name["ubuntu:22.04"] == "ubuntu"
 
 
+# --- writing a probed/corrected platform back to hosts.toml ---------------
+#
+# update_inventory_platform itself is tested at the inventory-module level;
+# here only the CLI's decision of *when* to call it -- which host, which
+# file, and the opt-out -- since the orchestrator (and so result.platform)
+# is stubbed throughout this module.
+
+
+def _spy_on_update_inventory_platform(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cli_module,
+        "update_inventory_platform",
+        lambda path, host, platform: calls.append((path, host, platform)),
+    )
+    return calls
+
+
+def test_update_inventory_writes_the_probed_platform(captured, tmp_path, monkeypatch):
+    calls = _spy_on_update_inventory_platform(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="win-box", transport="ssh", client_relevance="true", platform="windows"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(inventory, "win-box", "windows")]
+
+
+def test_no_update_inventory_flag_skips_the_write(captured, tmp_path, monkeypatch):
+    calls = _spy_on_update_inventory_platform(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="win-box", transport="ssh", client_relevance="true", platform="windows"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "--no-update-inventory", "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_update_inventory_skips_a_host_whose_platform_already_matches(
+    captured, tmp_path, monkeypatch
+):
+    calls = _spy_on_update_inventory_platform(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.deb-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="deb-box", transport="ssh", client_relevance="true", platform="ubuntu"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_update_inventory_is_never_attempted_without_inventory(captured, monkeypatch):
+    """No file means nothing to update -- must not even try, e.g. for --local."""
+    calls = _spy_on_update_inventory_platform(monkeypatch)
+
+    result = invoke("--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
 def test_local_still_excludes_container_and_inventory(captured, tmp_path):
     assert invoke("--local", "--container", "ubuntu:22.04", "true").exit_code != 0
 

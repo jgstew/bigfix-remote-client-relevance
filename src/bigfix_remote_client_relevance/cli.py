@@ -27,7 +27,11 @@ from typing import Annotated
 import typer
 
 from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
-from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
+from bigfix_remote_client_relevance.inventory import (
+    InventoryError,
+    load_inventory,
+    update_inventory_platform,
+)
 from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
     DEFAULT_PULL_PARALLEL,
@@ -164,6 +168,36 @@ def _summarize_failures(results: list[ClientRelevanceResult]) -> None:
             logger.error("%s: %s (%s)", result.host, result.error, result.error_kind)
 
 
+def _update_inventory_platforms(
+    inventory: Path,
+    inventory_targets: list[Target],
+    results: list[ClientRelevanceResult],
+) -> None:
+    """Write a probed or corrected `platform` back for each inventory host.
+
+    Compares each result's (possibly probed, possibly corrected) platform
+    against what that host's *original* Target carried before the run, so an
+    already-correct entry is never rewritten and a --qna-version fan-out over
+    multiple versions never writes the same host twice. Best-effort: a write
+    failure (e.g. the file became read-only mid-run) is logged, not raised --
+    one host's config problem must not turn a successful evaluation into a
+    failed command.
+    """
+    configured = {target.name: target.platform for target in inventory_targets}
+    written: set[str] = set()
+    for result in results:
+        if result.host not in configured or result.host in written:
+            continue
+        if result.platform is None or result.platform == configured[result.host]:
+            continue
+        try:
+            update_inventory_platform(inventory, result.host, result.platform)
+        except InventoryError as exc:
+            logger.warning("could not update platform for %s in %s: %s", result.host, inventory, exc)
+        else:
+            written.add(result.host)
+
+
 @app.command()
 def evaluate(
     args: Annotated[
@@ -198,6 +232,15 @@ def evaluate(
         Path | None,
         typer.Option("--inventory", help="Evaluate across the hosts in a hosts.toml file."),
     ] = None,
+    update_inventory: Annotated[
+        bool,
+        typer.Option(
+            "--update-inventory/--no-update-inventory",
+            help="Write a probed or corrected `platform` back into --inventory's "
+            "hosts.toml, so future runs skip the probe and a wrong entry stops "
+            "failing silently forever.",
+        ),
+    ] = True,
     rebuild_image: Annotated[
         bool,
         typer.Option(
@@ -321,12 +364,17 @@ def evaluate(
 
     # Inventory hosts carry their own platform; a global --platform would
     # silently override it, which is the guessing this tool just stopped doing.
+    # Kept separate from `targets` (which also gathers --container images) so
+    # the write-back below only ever touches hosts that actually came from
+    # this file, by the original, pre-run platform each one had.
+    inventory_targets: list[Target] = []
     targets: list[Target] = []
     if inventory is not None:
         try:
-            targets.extend(load_inventory(inventory))
+            inventory_targets = load_inventory(inventory)
         except InventoryError as exc:
             _fail(str(exc))
+        targets.extend(inventory_targets)
     targets.extend(
         Target(
             kind="container",
@@ -369,6 +417,9 @@ def evaluate(
     )
 
     _summarize_failures(results)
+
+    if inventory is not None and update_inventory and inventory_targets:
+        _update_inventory_platforms(inventory, inventory_targets, results)
 
     if as_json:
         payload = json.dumps([dataclasses.asdict(r) for r in results], indent=2)

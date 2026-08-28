@@ -355,6 +355,167 @@ async def test_probe_engine_failure_becomes_a_transport_result():
     assert results[0].error_kind == ERROR_KIND_TRANSPORT
 
 
+# --- result.platform and corrective reprobing --------------------------------
+#
+# An explicit platform is trusted outright (never probed), which is exactly
+# the problem when it's wrong: the resolver picks the wrong artifact, it
+# fails to extract, and nothing else ever re-checks -- it fails identically
+# forever. A bootstrap failure with an explicit platform set is cheap to
+# double-check via a corrective reprobe, so hosts.toml can be told what's
+# actually wrong instead of just failing the same way on every future run.
+
+
+class FakeReprobingTransport(FakeTransport):
+    """Fails with a bootstrap error; exposes a corrective reprobe."""
+
+    def __init__(self, host: str, *, reprobe_to="windows", reprobe_error=None, **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._reprobe_to = reprobe_to
+        self._reprobe_error = reprobe_error
+        self.reprobed = 0
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        return ClientRelevanceResult(
+            host=self.host,
+            transport="fake",
+            client_relevance=client_relevance,
+            error="could not extract qna",
+            error_kind=ERROR_KIND_BOOTSTRAP,
+        )
+
+    async def reprobe_platform(self, *, timeout_s: float = 30.0) -> str:
+        self.reprobed += 1
+        if self._reprobe_error is not None:
+            raise self._reprobe_error
+        return self._reprobe_to
+
+
+async def test_successful_probe_populates_result_platform():
+    """The fill-in half: a freshly probed platform reaches the result too."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="almalinux:9", image="almalinux:9")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(t.name, "rhel"),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].platform == "rhel"
+
+
+async def test_explicit_platform_populates_result_platform_on_success():
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host", platform="ubuntu")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].platform == "ubuntu"
+
+
+async def test_wrong_explicit_platform_is_corrected_after_bootstrap_failure():
+    made: list[FakeReprobingTransport] = []
+
+    def factory(t):
+        transport = FakeReprobingTransport(t.name, reprobe_to="windows")
+        made.append(transport)
+        return transport
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="win-box", platform="ubuntu")],
+        qna_version="11.0",
+        transport_factory=factory,
+        resolver=make_resolver(),
+    )
+
+    assert results[0].platform == "windows"
+    assert made[0].reprobed == 1
+
+
+async def test_correctly_configured_platform_is_left_alone_after_failure():
+    """A bootstrap failure for an unrelated reason must not report a false mismatch."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="deb-box", platform="ubuntu")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeReprobingTransport(t.name, reprobe_to="ubuntu"),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].platform == "ubuntu"
+
+
+async def test_reprobe_is_never_attempted_when_platform_was_not_explicit():
+    """A freshly probed platform is already trusted; nothing to double-check."""
+    made: list[FakeReprobingTransport] = []
+
+    def factory(t):
+        transport = FakeReprobingTransport(t.name, reprobe_to="windows")
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="unknown-box")],  # platform left unset
+        qna_version="11.0",
+        transport_factory=factory,
+        resolver=make_resolver(),
+    )
+
+    assert made[0].reprobed == 0
+
+
+async def test_reprobe_is_skipped_for_a_non_bootstrap_failure():
+    class FakeRelevanceFailingTransport(FakeReprobingTransport):
+        async def evaluate_client_relevance(
+            self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+        ):
+            return ClientRelevanceResult(
+                host=self.host,
+                transport="fake",
+                client_relevance=client_relevance,
+                error="bad inspector",
+                error_kind=ERROR_KIND_RELEVANCE,
+            )
+
+    made: list[FakeRelevanceFailingTransport] = []
+
+    def factory(t):
+        transport = FakeRelevanceFailingTransport(t.name)
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance(
+        "namez of it",
+        [Target(kind="ssh", name="host", platform="ubuntu")],
+        qna_version="11.0",
+        transport_factory=factory,
+        resolver=make_resolver(),
+    )
+
+    assert made[0].reprobed == 0
+
+
+async def test_a_failed_reprobe_never_masks_the_original_error():
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host", platform="ubuntu")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeReprobingTransport(
+            t.name, reprobe_error=RuntimeError("connection dropped")
+        ),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].error_kind == ERROR_KIND_BOOTSTRAP
+    assert results[0].platform == "ubuntu", "unchanged: the reprobe attempt itself failed"
+
+
 def test_default_factory_no_longer_defaults_containers_to_ubuntu():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 

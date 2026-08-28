@@ -100,6 +100,14 @@ class ClientRelevanceResult:
     elapsed_ms: int = 0
     exit_code: int = 0
 
+    platform: str | None = None
+    """The :data:`KNOWN_TARGETS` key this run actually used, when known --
+    from an explicit ``Target.platform``, from a fresh probe, or (after a
+    bootstrap failure with an explicit platform set) from a corrective
+    re-probe that ignored it. ``None`` when no platform concept applies
+    (fastquery) or none was ever resolved. This is what the CLI's
+    ``--update-inventory`` writes back to ``hosts.toml``."""
+
     @property
     def ok(self) -> bool:
         return self.error_kind is None

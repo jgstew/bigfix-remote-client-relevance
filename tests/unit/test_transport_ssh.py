@@ -185,6 +185,104 @@ async def test_nonzero_qna_exit_maps_to_qna():
     assert result.exit_code == 139
 
 
+# --- platform probing -------------------------------------------------------
+#
+# The resolver picks the artifact (deb vs rpm vs the Windows zip) from
+# target.platform. Left unresolved, orchestrate.py's default_resolver used to
+# guess "ubuntu" for any SSH target with no `platform` set -- wrong for every
+# non-Linux, non-Debian-family box, and silently so: the wrong artifact just
+# got pushed and failed to extract, well after the real (correctly probed)
+# platform was already known to _resolve_spec. Exposing that probe as a
+# public `resolve_platform()` lets orchestrate.py's existing probe-before-
+# resolve step (already used for containers) do the same for SSH.
+
+
+async def test_probe_output_feeds_resolve_platform():
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("Linux\nalmalinux rhel fedora", "", 0))])
+
+    platform = await make_transport(runner, platform=None).resolve_platform()
+
+    assert platform == "rhel"
+
+
+async def test_empty_probe_output_means_windows():
+    """No `uname` at all is exactly what a Windows box's shell reports."""
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("", "", 0))])
+
+    platform = await make_transport(runner, platform=None).resolve_platform()
+
+    assert platform == "windows"
+
+
+async def test_explicit_target_skips_the_probe_for_resolve_platform():
+    runner = FakeSSHRunner()
+
+    platform = await make_windows_transport(runner).resolve_platform()
+
+    assert platform == "windows"
+    assert not runner.calls, "an explicit target must never probe"
+
+
+async def test_resolve_platform_probes_once_per_transport():
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("Linux\nubuntu debian", "", 0))])
+    transport = make_transport(runner, platform=None)
+
+    await transport.resolve_platform()
+    await transport.resolve_platform()
+
+    probes = [c for c in runner.commands() if "uname -s" in c]
+    assert len(probes) == 1, "probe result must be cached on the transport"
+
+
+async def test_resolve_platform_shares_the_eval_connection():
+    """The probe and the eval must reuse one connection, not open two."""
+    runner = FakeSSHRunner(
+        responses=[
+            (r"uname -s", ("Linux\nubuntu debian", "", 0)),
+            (r"-x |command -v", ("/opt/BESClient/bin/qna\n", "", 0)),
+            (r"-showtypes", qna_ok()),
+        ]
+    )
+    connects = 0
+
+    async def factory() -> FakeSSHRunner:
+        nonlocal connects
+        connects += 1
+        return runner
+
+    transport = TransportSSH("test-host", connection_factory=factory)
+    await transport.resolve_platform()
+    await transport.evaluate_client_relevance("true")
+
+    assert connects == 1
+
+
+async def test_reprobe_platform_ignores_the_explicit_target():
+    """The whole point: ``resolve_platform`` trusts an explicit target, this must not."""
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("", "", 0))])  # empty output = windows
+
+    # make_transport defaults platform="ubuntu" -- exactly the wrong,
+    # explicit value this method must see past.
+    platform = await make_transport(runner).reprobe_platform()
+
+    assert platform == "windows"
+
+
+async def test_reprobe_platform_reuses_the_connection():
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("Linux\nubuntu debian", "", 0))])
+    connects = 0
+
+    async def factory() -> FakeSSHRunner:
+        nonlocal connects
+        connects += 1
+        return runner
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+    await transport.reprobe_platform()
+
+    assert connects == 1
+
+
 # --- connection failures ---------------------------------------------------
 
 

@@ -353,6 +353,36 @@ class TransportSSH:
 
     # -- platform -----------------------------------------------------------
 
+    async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
+        """The :data:`KNOWN_TARGETS` key for this host.
+
+        An explicit ``target``/``platform`` wins; otherwise the host is
+        probed once (the same ``uname``/``os-release`` probe
+        :meth:`_resolve_spec` already runs before provisioning) and the
+        answer cached on this instance. Exposing it here lets
+        ``orchestrate.py`` pick the right qna artifact *before* resolving
+        one -- the same probe-before-resolve step it already does for
+        :class:`~...transports.container.TransportContainer` -- instead of
+        guessing a platform and finding out the truth only once connected.
+        """
+        runner = await self._connection()
+        spec = await self._resolve_spec(runner, timeout_s)
+        return spec.name
+
+    async def _classify_platform(self, runner: SSHRunner, timeout_s: float) -> str:
+        """Run the ``uname``/``os-release`` probe and classify the result.
+
+        Shared by :meth:`_resolve_spec` (which trusts an explicit target) and
+        :meth:`reprobe_platform` (which deliberately does not).
+        """
+        stdout, _stderr, _code = await runner.run(
+            "uname -s; . /etc/os-release 2>/dev/null && echo \"$ID $ID_LIKE\"",
+            timeout=timeout_s,
+        )
+        target = classify_uname(stdout)
+        logger.debug("%s classified as %s", self.host, target)
+        return target
+
     async def _resolve_spec(self, runner: SSHRunner, timeout_s: float) -> TargetSpec:
         if self._spec is not None:
             return self._spec
@@ -360,14 +390,22 @@ class TransportSSH:
             self._spec = spec_for(self._target)
             return self._spec
 
-        stdout, _stderr, _code = await runner.run(
-            "uname -s; . /etc/os-release 2>/dev/null && echo \"$ID $ID_LIKE\"",
-            timeout=timeout_s,
-        )
-        target = classify_uname(stdout)
-        logger.debug("%s classified as %s", self.host, target)
-        self._spec = spec_for(target)
+        self._spec = spec_for(await self._classify_platform(runner, timeout_s))
         return self._spec
+
+    async def reprobe_platform(self, *, timeout_s: float = 30.0) -> str:
+        """Classify what this host actually is, ignoring any explicit
+        ``target``/``platform``.
+
+        For detecting and correcting a wrong ``platform`` in an inventory
+        file: an explicit value is normally trusted outright (see
+        :meth:`_resolve_spec`), which is exactly the problem when it's wrong
+        -- the artifact resolved from it never matches the real host, and
+        nothing else ever re-checks. This bypasses that trust deliberately,
+        reusing the live connection rather than opening a second one.
+        """
+        runner = await self._connection()
+        return await self._classify_platform(runner, timeout_s)
 
     # -- discovery ----------------------------------------------------------
 

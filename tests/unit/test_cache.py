@@ -162,4 +162,5 @@ def test_default_cache_dir_is_under_the_user_cache(monkeypatch):
 
     monkeypatch.setattr(platformdirs, "user_cache_dir", lambda *a, **k: "/tmp/fake-cache")
 
-    assert str(default_cache_dir()).startswith("/tmp/fake-cache")
+    # Compared as paths: str() of a Path renders with the platform separator.
+    assert default_cache_dir() == Path("/tmp/fake-cache")

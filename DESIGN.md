@@ -429,6 +429,16 @@ Four concrete transports, all class-named `Transport<Kind>`:
   since `\Windows\Temp` needs elevation; see § qna binary cache &
   distribution — the target never downloads).
   Primary transport for real Mac / Windows / Linux endpoints.
+  `resolve_platform()` exposes the same `uname`/`os-release` probe
+  `_resolve_spec` runs internally, so — same as `TransportContainer` — an
+  unset `platform` is probed *before* the resolver picks an artifact, not
+  guessed. Before this existed, an unspecified SSH `platform` resolved to a
+  hard-coded `"ubuntu"` fallback, so a real Windows or RHEL-family box got a
+  `.deb` pushed to it and failed at extraction — after the correct
+  classification had already happened, just too late to matter. The
+  `"ubuntu"` fallback in `default_resolver` is now unreachable in the
+  normal fan-out (`_one()` always probes first when a spec is set);
+  it remains only as a defensive default for a resolver called directly.
 - `TransportContainer(image, engine="docker", qna_version=None,
   keep_alive=False)` — **on-demand eval via Docker (or another OCI engine)
   without SSH creds or a persistent remote host.** Runs `qna` inside a

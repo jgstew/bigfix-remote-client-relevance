@@ -1189,11 +1189,22 @@ def test_candidate_sockets_cover_engines_the_sdk_would_miss(monkeypatch):
     from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
 
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    candidates = candidate_docker_sockets(endpoint_lookup=lambda: None)
+    # Pinned to a POSIX platform so the assertions hold wherever the suite runs.
+    candidates = candidate_docker_sockets(endpoint_lookup=lambda: None, platform="linux")
 
     assert any("/var/run/docker.sock" in c for c in candidates)
     assert any(".docker/run/docker.sock" in c for c in candidates)
     assert any(".colima" in c for c in candidates)
+
+
+def test_windows_candidates_are_the_named_pipe(monkeypatch):
+    """Unix-socket paths are meaningless on Windows; the engine listens on a pipe."""
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    candidates = candidate_docker_sockets(endpoint_lookup=lambda: None, platform="win32")
+
+    assert candidates == ["npipe:////./pipe/docker_engine"]
 
 
 def test_docker_host_env_takes_precedence(monkeypatch):
@@ -1339,7 +1350,9 @@ def test_the_context_endpoint_is_tried_before_the_hardcoded_paths(monkeypatch):
     from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
 
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    candidates = candidate_docker_sockets(endpoint_lookup=lambda: "tcp://10.0.0.5:2375")
+    candidates = candidate_docker_sockets(
+        endpoint_lookup=lambda: "tcp://10.0.0.5:2375", platform="linux"
+    )
 
     assert candidates[0] == "tcp://10.0.0.5:2375"
     assert "unix:///var/run/docker.sock" in candidates, "the fallbacks must survive"

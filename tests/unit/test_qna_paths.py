@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import shutil
+import sys
+
+import pytest
 
 from bigfix_remote_client_relevance import qna_paths
 from bigfix_remote_client_relevance.qna_paths import default_candidates, find_qna_path
@@ -41,6 +44,9 @@ def test_find_returns_first_existing_executable(tmp_path):
     assert found == str(present)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="os.access(X_OK) is true for any file on Windows"
+)
 def test_find_skips_non_executable_files(tmp_path):
     not_executable = tmp_path / "qna"
     not_executable.write_text("data")

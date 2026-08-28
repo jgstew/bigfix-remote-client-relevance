@@ -29,6 +29,12 @@ from bigfix_remote_client_relevance.transports.local import (
 
 pytestmark = pytest.mark.usefixtures("allow_non_root_macos")
 
+# Windows has no sudo at all, and `fake_sudo` is a PATH shim that re-execs
+# its argument -- neither has a Windows equivalent worth inventing. The
+# Windows side of `become` is covered by
+# test_become_is_ignored_on_windows_with_a_warning, which runs everywhere.
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="sudo/become is POSIX-only")
+
 
 async def test_evaluate_success(fake_qna, qna_output):
     stub = fake_qna(stdout=qna_output("single_answer"))
@@ -143,7 +149,11 @@ async def test_timeout_maps_to_transport_and_kills_process(fake_qna):
 
     assert result.error_kind == ERROR_KIND_TRANSPORT
     assert "timed out" in (result.error or "").lower()
-    assert not stub.ran_to_completion, "process outlived the timeout"
+    if sys.platform != "win32":
+        # Only asserted off Windows: there the stub runs behind a cmd.exe shim,
+        # and killing the shim leaves its child sleeping -- an artifact of the
+        # stub, not of the transport, which spawns a real qna.exe directly.
+        assert not stub.ran_to_completion, "process outlived the timeout"
 
 
 async def test_missing_binary_maps_to_bootstrap(monkeypatch):
@@ -213,6 +223,9 @@ async def test_resolved_qna_provisions_into_a_versioned_directory(tmp_path, monk
     assert result.qna_version == "11.0.6.137"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="lays down a Linux target tree and execs it locally"
+)
 async def test_resolved_qna_reuses_an_already_provisioned_tree(tmp_path, monkeypatch, fake_qna):
     """A version already extracted locally is reused without re-extracting."""
     from bigfix_remote_client_relevance.bootstrap import targets
@@ -311,6 +324,7 @@ async def test_root_check_does_not_apply_off_macos(fake_qna, monkeypatch):
 # --- privilege escalation --------------------------------------------------
 
 
+@posix_only
 def test_become_prefixes_the_argv_with_sudo_n(monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
 
@@ -323,6 +337,7 @@ def test_without_become_the_argv_has_no_sudo():
     assert TransportLocal()._eval_argv("/opt/qna") == ["/opt/qna", "-t", "-showtypes"]
 
 
+@posix_only
 def test_eval_argv_skips_sudo_when_already_root():
     """Already root: sudo would be a redundant extra exec."""
     assert TransportLocal(become=True)._eval_argv("/opt/qna") == ["/opt/qna", "-t", "-showtypes"]
@@ -347,6 +362,7 @@ def test_become_applies_on_linux_not_just_macos(monkeypatch):
     assert TransportLocal(become=True)._eval_argv("/opt/qna")[:2] == ["sudo", "-n"]
 
 
+@posix_only
 async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
@@ -362,6 +378,7 @@ async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo, monkeypatch):
     assert result.error_kind is None
 
 
+@posix_only
 async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo, monkeypatch):
     """`sudo -n` never reads stdin, so the expression survives the extra exec."""
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
@@ -373,6 +390,7 @@ async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo, mo
     assert stub.stdin_text == "true\n"
 
 
+@posix_only
 async def test_become_strips_the_q_prefix_through_sudo(fake_qna, fake_sudo, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\n")
@@ -447,6 +465,7 @@ async def test_macos_root_refusal_survives_without_become(fake_qna, monkeypatch)
     assert not stub.was_invoked
 
 
+@posix_only
 async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, monkeypatch):
     """A privilege problem is not the relevance engine failing."""
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
@@ -463,6 +482,7 @@ async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, m
     assert not stub.was_invoked
 
 
+@posix_only
 async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="")
@@ -475,6 +495,7 @@ async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo, mo
     assert "not in the sudoers file" in (result.error or "")
 
 
+@posix_only
 async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="", stderr="qna: bad expression\n", exit_code=3)
@@ -487,6 +508,7 @@ async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo
     assert result.error_kind == ERROR_KIND_QNA
 
 
+@posix_only
 async def test_relevance_error_under_become_stays_a_relevance_error(
     fake_qna, fake_sudo, qna_output, monkeypatch
 ):
@@ -501,6 +523,7 @@ async def test_relevance_error_under_become_stays_a_relevance_error(
     assert result.error_kind == ERROR_KIND_RELEVANCE
 
 
+@posix_only
 async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, tmp_path):
     """Blaming the qna path for a failed `sudo` exec sends the user the wrong way."""
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
@@ -521,6 +544,7 @@ async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, t
 # --- caching a known-broken elevation ---------------------------------------
 
 
+@posix_only
 async def test_sudo_broken_state_is_cached_after_first_failure(fake_qna, fake_sudo, monkeypatch):
     """A second call must not spawn and fail sudo all over again."""
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
@@ -538,6 +562,7 @@ async def test_sudo_broken_state_is_cached_after_first_failure(fake_qna, fake_su
     assert not stub.was_invoked
 
 
+@posix_only
 async def test_missing_sudo_binary_is_cached_too(fake_qna, monkeypatch, tmp_path):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\n")
@@ -554,6 +579,7 @@ async def test_missing_sudo_binary_is_cached_too(fake_qna, monkeypatch, tmp_path
     assert first.error == second.error
 
 
+@posix_only
 async def test_broken_elevation_cache_is_per_instance(fake_qna, fake_sudo, monkeypatch):
     """A fresh instance must retry rather than inherit another instance's verdict."""
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
