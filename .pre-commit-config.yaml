@@ -92,7 +92,7 @@ repos:
         args: [-c=.yamllint.yaml]
 
   - repo: https://github.com/asottile/pyupgrade
-    rev: ce40a160603ab0e7d9c627ae33d7ef3906e2d2b2 # v3.19.1
+    rev: 75992aaa40730136014f34227e0135f63fc951b4 # v3.21.2
     hooks:
       - id: pyupgrade
         name: Upgrade Python syntax
