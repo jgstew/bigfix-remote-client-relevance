@@ -83,6 +83,45 @@ def test_local_become_reaches_the_target(captured):
     assert captured["targets"][0].become is True
 
 
+def test_local_implies_become_on_macos(captured, monkeypatch):
+    """qna requires root on macOS, so --local shouldn't need --become spelled out."""
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+
+    result = invoke("--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].become is True
+
+
+def test_local_does_not_imply_become_off_macos(captured, monkeypatch):
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
+
+    result = invoke("--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].become is False
+
+
+def test_no_become_overrides_the_macos_default(captured, monkeypatch):
+    """The implied default must still be escapable."""
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+
+    result = invoke("--local", "--no-become", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].become is False
+
+
+def test_ssh_does_not_imply_become_on_macos(captured, monkeypatch):
+    """The implied default is --local only; SSH can't know the remote OS up front."""
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+
+    result = invoke("mac-test", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].become is False
+
+
 def test_container_flag_selects_container(captured):
     result = invoke("--container", "ubuntu:22.04", "true")
 

@@ -41,13 +41,15 @@ Compare the same expression across two qna versions on one target:
 bigfix-remote-client-relevance --container ubuntu:22.04 --qna-version 11.0 --qna-version 10.0 "version of client"
 ```
 
-Evaluate against the BigFix client on this machine. On macOS `qna` needs root,
-so `--become` runs just the qna invocation under `sudo -n` rather than making
-you run the whole CLI as root:
+Evaluate against the BigFix client on this machine:
 
 ```bash
-bigfix-remote-client-relevance --local --become "name of operating system"
+bigfix-remote-client-relevance --local "name of operating system"
 ```
+
+On macOS `qna` needs root, so `--local` implies `--become` there automatically —
+just the qna invocation runs under `sudo -n`, not the whole CLI. Pass
+`--no-become` to get the plain "needs root" refusal instead.
 
 Evaluate on a real endpoint over SSH (a `~/.ssh/config` alias works):
 
@@ -193,8 +195,9 @@ docker rmi $(docker images 'bfrcr/prepared:*' -q)
 
 - Python 3.11+
 - Docker for `--container`; SSH access for remote hosts
-- On macOS, `qna` needs root — run the CLI under `sudo`, or pass `--become`
-  (works with `--local` and over SSH). `--become` uses `sudo -n`, so it needs
+- On macOS, `qna` needs root — `--local` implies `--become` there automatically
+  (pass `--no-become` to opt out); over SSH it stays opt-in, since the remote
+  platform isn't known up front. `--become` uses `sudo -n`, so it needs
   passwordless sudo or a cached credential; it never prompts.
 
 SSH host keys are verified against `~/.ssh/known_hosts` like the `ssh` CLI,

@@ -222,13 +222,16 @@ def evaluate(
     ] = None,
     user: Annotated[str | None, typer.Option("--user", help="SSH username.")] = None,
     become: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--become",
+            "--become/--no-become",
             help="Run qna under sudo (root-only inspectors). Applies to SSH and "
-            "--local; needs passwordless sudo, and has no effect on Windows.",
+            "--local; needs passwordless sudo, and has no effect on Windows. "
+            "Defaults on for --local when this machine is macOS, since qna "
+            "requires root there; pass --no-become to get the plain refusal "
+            "instead.",
         ),
-    ] = False,
+    ] = None,
     arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
     platform: Annotated[
         str | None,
@@ -337,14 +340,19 @@ def evaluate(
         for image in container
     )
     if local:
-        targets = [Target(kind="local", name="local", platform=platform, become=become)]
+        # qna requires root on macOS specifically (see TransportLocal), so
+        # --local implies --become there unless the caller said otherwise.
+        # SSH can't make the same call: the remote platform isn't known
+        # without a round trip, so it stays opt-in.
+        local_become = become if become is not None else sys.platform == "darwin"
+        targets = [Target(kind="local", name="local", platform=platform, become=local_become)]
     elif host is not None:
         targets = [
             Target(
                 kind="ssh",
                 name=host,
                 user=user,
-                become=become,
+                become=bool(become),
                 platform=platform,
                 verify_host_key=not insecure_skip_host_key_check,
             )

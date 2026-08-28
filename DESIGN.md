@@ -776,7 +776,14 @@ answers cross an untrusted network.
   `FileIOError` before answering anything, even `TRUE`, so there is no
   partial-answer mode worth preserving. Pass
   `TransportLocal(require_root_on_macos=False)` to attempt it anyway.
-- `TransportLocal(become=True)` (CLI: `--local --become`) runs qna under
+- The CLI's `--local` implies `--become` when the controller itself is macOS
+  (`sys.platform == "darwin"`), since qna needs root there unconditionally —
+  `--no-become` opts back out to the plain refusal. `--become`/`--no-become`
+  stays opt-in over SSH (the remote platform isn't known without a round
+  trip) and at the `TransportLocal` constructor level (`become=False` by
+  default; the CLI is what computes the macOS-aware default before
+  constructing the `Target`).
+- `TransportLocal(become=True)` runs qna under
   `sudo -n` and skips the refusal above — the qna process will be root
   whatever this process's euid is, so the pre-flight check would be a false
   negative. `-n` never prompts, so this needs passwordless sudo or a cached
