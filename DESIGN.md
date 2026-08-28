@@ -1,10 +1,50 @@
 # bigfix_remote_client_relevance — remote qna client-relevance eval over SSH + Docker
 
 ## Status
-Design phase. This document is the seed for the package's implementation:
-naming rules, package layout, transport contracts, CLI surface, packaging
-choices, and MCP-readiness. Implementation lands incrementally against
-the ordered milestones in the design (see § Implementation milestones).
+**Milestones M1–M5 are implemented** (parser + local eval, version
+resolution + artifact cache, SSH, containers, orchestration + CLI). This
+document remains the specification; where implementation proved a detail
+wrong, the document has been corrected and the correction noted inline.
+
+Verified end to end: `--container ubuntu:22.04 --qna-version 11.0
+--qna-version 10.0 "version of client"` resolves both streams against the
+live release site, downloads and checksum-verifies each agent package,
+extracts them inside a container, and answers `11.0.6.137` and
+`10.0.16.61` from one command.
+
+Corrections implementation forced, all applied below:
+1. `answer_types` comes from qna's `I:` lines, not `T:` — `T:` is time
+   taken. A `qna_time` field was added rather than discarding it.
+2. Exit code `0` means *no error*, not *at least one answer*. A plural
+   inspector that legitimately matches nothing must not fail a CI gate.
+3. `TransportLocal` refuses to run as non-root on macOS by default:
+   BESAgent 11.x aborts there with an uncaught `FileIOError` even for
+   `TRUE`, so a clear pre-flight message beats an opaque crash dump.
+   `require_root_on_macos=False` waives it.
+4. Class names in the prose now follow the document's own `Transport<Kind>`
+   rule.
+
+Remaining: rpm-family and SUSE bootstraps are specified but only the
+Debian/Ubuntu and macOS extract paths are exercised; Fast Query is a stub;
+the MCP server is a separate task.
+
+## Testing
+`uv run pytest` runs the offline unit suite on a bare machine. Tests
+needing a real prerequisite carry a marker and auto-skip without it:
+
+| Marker | Needs | Run it with |
+|---|---|---|
+| `live_qna` | a local qna binary; **root on macOS** | `sudo -E uv run pytest -m live_qna` |
+| `docker` | a reachable Docker daemon | `uv run pytest -m docker` |
+| `ssh_localhost` | sshd on localhost with key auth | `uv run pytest -m ssh_localhost` |
+| `network` | support.bigfix.com | `BFRCR_NETWORK_TESTS=1 uv run pytest -m network` |
+
+Release-site fixtures under `tests/fixtures/release_site/` are captured
+from the live site and trimmed to `#main-content`, so the scraper is
+tested against the real markup — including the meaningless `section-N`
+heading ids, interleaved Utilities tables, and the Patch 5 row where the
+Agent column (`11.0.5.204`) differs from every other column
+(`11.0.5.203`).
 
 ## Development methodology: Test Driven Development
 Use `pytest`. Write tests *before* implementation, observe them fail,
@@ -50,6 +90,8 @@ like:
 ```python
 # API boundary: qna's CLI vocabulary uses "relevance"; internal name stays
 # `client_relevance`.
+# A leading "Q: " is stripped: qna's file mode requires that prefix and its
+# stdin mode rejects it. A trailing newline terminates the question.
 qna_process.stdin.write(client_relevance + "\n")
 ```
 
@@ -161,6 +203,10 @@ Files in the repo are the source of truth; this section explains *why*.
   Uses `astral-sh/setup-uv@v3` + `uv sync --frozen --python
   ${{ matrix.python-version }}` + `uv run pytest`. No
   `actions/setup-python` needed.
+- **Runtime dependencies:** `asyncssh` (SSH), `docker` (containers),
+  `typer` (CLI), plus `requests`, `beautifulsoup4` and `platformdirs` added
+  when the release-site scraper and controller cache landed. `tomllib` is
+  stdlib at the 3.11 floor, so the inventory loader needs no TOML package.
 - **Dependency quarantine — 7 days** (`[tool.uv] exclude-newer = "-P7D"`).
   Resolution ignores any distribution uploaded in the last week. The
   window is a supply-chain measure: the common failure modes of a fresh
@@ -228,7 +274,7 @@ Not implemented yet — added when the project is closer to a first release.
   - `parse_raw_result_array()` → renamed `parse_qna_output()`, moved to
     `results.py`. Returned strings represent client-relevance answers.
   - `evaluate_relevance_raw_stdin()` → renamed
-    `evaluate_client_relevance_local()`, kept as `LocalTransport`'s
+    `evaluate_client_relevance_local()`, kept as `TransportLocal`'s
     implementation.
   - `E:` / `T:` line handling preserved and extended.
 - `jgstew/remote_relevance` (old action-based prototype) — **not** the
@@ -314,7 +360,8 @@ class ClientRelevanceResult:
     transport: str               # "local" | "ssh" | "container" | "fastquery"
     client_relevance: str        # input expression (internal name)
     answers: list[str]           # parsed A: lines from qna output
-    answer_types: list[str]      # parsed T: type lines (per answer)
+    answer_types: list[str]      # parsed I: result-type lines (per answer)
+    qna_time: str | None         # parsed T: line (qna's own timing)
     error: str | None            # human-readable: the first E: line for
                                  # error_kind "relevance", else an
                                  # exception / stderr summary
@@ -626,7 +673,8 @@ bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60
   same shape the future MCP tool will return.
 - Exit codes are actionable for CI gating, mirroring
   `ClientRelevanceResult.error_kind`: `0` — every (target × version)
-  produced ≥1 answer with no `E:` line; `1` — a relevance error (`E:`
+  completed with no error (an empty answer set from a plural inspector is
+  a valid result and does **not** fail the run); `1` — a relevance error (`E:`
   line); `2` — qna or bootstrap failure on a target; `3` —
   transport/connection failure; `4` — version-resolution failure. The
   worst code across the fan-out wins; per-result detail is in the
@@ -706,16 +754,21 @@ Discovery order matches the ported `find_qna_path()` plus `$PATH`.
   `bigfix-remote-client-relevance mac-test ...`.
 
 ### 4. Permissions & gotchas
-- On macOS, `qna` needs root for some inspectors —
-  `SSHTransport(become=True)` uses sudo.
+- On macOS, `qna` needs root — `TransportSSH(become=True)` uses sudo, and
+  `TransportLocal` refuses to run without it by default. Observed against
+  BESAgent 11.x on macOS 15: a non-root qna aborts with an uncaught
+  `FileIOError` before answering anything, even `TRUE`, so there is no
+  partial-answer mode worth preserving. Pass
+  `TransportLocal(require_root_on_macos=False)` to attempt it anyway.
 - Windows OpenSSH defaults to `cmd.exe`; switch the default shell to
   PowerShell (step 2) for reliable UTF-8 stdin.
 - Save client-relevance files as UTF-8, no BOM.
 - **Client relevance ≠ session relevance.** This tool is only for the
   client dialect; session relevance stays with the BigFix REST/`besapi`
   path.
-- `qna -showtypes` emits `T:` type lines — the parser retains them on the
-  result so agents can distinguish string / time / plural answers.
+- `qna -showtypes` emits `I:` result-type lines and `-t` emits a `T:`
+  timing line. The parser keeps types in `answer_types` and the timing in
+  `qna_time`, so agents can distinguish string / version / plural answers.
 
 ## Out of scope (for this task)
 - The MCP server itself (design keeps the surface compatible).
