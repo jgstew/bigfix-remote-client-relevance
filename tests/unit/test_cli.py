@@ -115,10 +115,6 @@ def test_inventory_supplies_targets(captured, tmp_path):
 # Issue #1: four images used to require writing a hosts.toml, and forcing a
 # platform for a one-shot query was impossible from the CLI at all.
 
-_M10 = pytest.mark.xfail(strict=True, reason="M10: repeatable --container/--platform")
-
-
-@_M10
 def test_container_flag_is_repeatable(captured):
     result = invoke("--container", "almalinux:9", "--container", "ubuntu:22.04", "true")
 
@@ -126,7 +122,6 @@ def test_container_flag_is_repeatable(captured):
     assert [t.image for t in captured["targets"]] == ["almalinux:9", "ubuntu:22.04"]
 
 
-@_M10
 def test_platform_flag_reaches_every_flag_target(captured):
     result = invoke(
         "--container", "almalinux:9", "--container", "rockylinux:9", "--platform", "rhel", "true"
@@ -136,7 +131,6 @@ def test_platform_flag_reaches_every_flag_target(captured):
     assert [t.platform for t in captured["targets"]] == ["rhel", "rhel"]
 
 
-@_M10
 def test_platform_applies_to_the_positional_ssh_host(captured):
     result = invoke("mac-test", "true", "--platform", "macos")
 
@@ -144,7 +138,6 @@ def test_platform_applies_to_the_positional_ssh_host(captured):
     assert captured["targets"][0].platform == "macos"
 
 
-@_M10
 def test_unknown_platform_is_a_usage_error(captured):
     result = invoke("--container", "ubuntu:22.04", "--platform", "beos", "true")
 
@@ -152,7 +145,6 @@ def test_unknown_platform_is_a_usage_error(captured):
     assert "rhel" in result.output, "the error should name the platforms that do work"
 
 
-@_M10
 def test_container_composes_with_inventory(captured, tmp_path):
     inventory = tmp_path / "hosts.toml"
     inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
@@ -163,7 +155,6 @@ def test_container_composes_with_inventory(captured, tmp_path):
     assert {t.name for t in captured["targets"]} == {"a", "almalinux:9"}
 
 
-@_M10
 def test_platform_does_not_override_inventory_targets(captured, tmp_path):
     inventory = tmp_path / "hosts.toml"
     inventory.write_text(

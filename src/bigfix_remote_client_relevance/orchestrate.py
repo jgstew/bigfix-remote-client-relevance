@@ -283,28 +283,6 @@ def worst_exit_code(results: Sequence[ClientRelevanceResult]) -> int:
     return max(_EXIT_BY_KIND.get(result.error_kind, EXIT_QNA) for result in results)
 
 
-def target_from_cli(
-    host: str | None,
-    *,
-    local: bool = False,
-    container: str | None = None,
-    user: str | None = None,
-    become: bool = False,
-    arch: str = "x86_64",
-    platform: str | None = None,
-) -> Target:
-    """Build the single target implied by the CLI's target flags."""
-    if local:
-        return Target(kind="local", name="local", platform=platform)
-    if container:
-        return Target(
-            kind="container", name=container, image=container, arch=arch, platform=platform
-        )
-    if host:
-        return Target(kind="ssh", name=host, user=user, become=become, platform=platform)
-    raise ValueError("no target given")
-
-
 __all__ = [
     "DEFAULT_MAX_PARALLEL",
     "EXIT_OK",
@@ -316,6 +294,5 @@ __all__ = [
     "default_resolver",
     "default_transport_factory",
     "evaluate_client_relevance",
-    "target_from_cli",
     "worst_exit_code",
 ]

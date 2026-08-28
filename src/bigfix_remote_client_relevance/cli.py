@@ -26,6 +26,7 @@ from typing import Annotated
 
 import typer
 
+from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
 from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
 from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
@@ -128,8 +129,13 @@ def evaluate(
         bool, typer.Option("--local", help="Evaluate against a local qna binary.")
     ] = False,
     container: Annotated[
-        str | None,
-        typer.Option("--container", metavar="IMAGE", help="Evaluate inside a container image."),
+        list[str] | None,
+        typer.Option(
+            "--container",
+            metavar="IMAGE",
+            help="Evaluate inside a container image. Repeatable, and composes "
+            "with --inventory.",
+        ),
     ] = None,
     inventory: Annotated[
         Path | None,
@@ -147,6 +153,15 @@ def evaluate(
         bool, typer.Option("--become", help="Use sudo on the target (root-only inspectors).")
     ] = False,
     arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
+    platform: Annotated[
+        str | None,
+        typer.Option(
+            "--platform",
+            metavar="PLATFORM",
+            help="Force the bootstrap platform instead of probing the target. "
+            "Applies to targets named by flags, never to --inventory hosts.",
+        ),
+    ] = None,
     insecure_skip_host_key_check: Annotated[
         bool,
         typer.Option(
@@ -172,10 +187,16 @@ def evaluate(
     _configure_logging(verbose)
     args = args or []
     qna_version = qna_version or []
+    container = container or []
 
+    # --container and --inventory compose: a fleet plus an ad-hoc image is a
+    # normal thing to want. --local is still on its own.
+    if local and (container or inventory):
+        _fail("--local cannot be combined with --container or --inventory")
     modes = [bool(local), bool(container), bool(inventory)]
-    if sum(modes) > 1:
-        _fail("choose only one of --local, --container, or --inventory")
+
+    if platform is not None and platform not in KNOWN_TARGETS:
+        _fail(f"unknown platform {platform!r}; known: {', '.join(sorted(KNOWN_TARGETS))}")
 
     # With an explicit target mode every positional is client relevance;
     # otherwise the first positional is the SSH host.
@@ -195,24 +216,28 @@ def evaluate(
 
     text = _read_client_relevance(args, client_relevance_file)
 
-    targets: list[Target]
+    # Inventory hosts carry their own platform; a global --platform would
+    # silently override it, which is the guessing this tool just stopped doing.
+    targets: list[Target] = []
     if inventory is not None:
         try:
-            targets = load_inventory(inventory)
+            targets.extend(load_inventory(inventory))
         except InventoryError as exc:
             _fail(str(exc))
-    elif local:
-        targets = [Target(kind="local", name="local")]
-    elif container:
-        targets = [Target(kind="container", name=container, image=container, arch=arch)]
-    else:
-        assert host is not None
+    targets.extend(
+        Target(kind="container", name=image, image=image, arch=arch, platform=platform)
+        for image in container
+    )
+    if local:
+        targets = [Target(kind="local", name="local", platform=platform)]
+    elif host is not None:
         targets = [
             Target(
                 kind="ssh",
                 name=host,
                 user=user,
                 become=become,
+                platform=platform,
                 verify_host_key=not insecure_skip_host_key_check,
             )
         ]
