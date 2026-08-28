@@ -132,9 +132,15 @@ async def test_tree_is_keyed_by_version_platform_and_arch(deb, cache):
 # --- rpm ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("compressor", ["gzip", "zstd"])
+@pytest.mark.parametrize("compressor", ["gzip", "zstd", "lzma"])
 async def test_rpm_extracts_qna_tree(compressor, cache):
-    """EL8-era rpms use gzip payloads, EL9-era ones zstd; both are in the wild."""
+    """EL8-era rpms use gzip payloads, EL9-era ones zstd, SLE12-era ones lzma.
+
+    rpmfile (this project's dependency, not our own code) recognizes the
+    `xz`/`zstd`/`bzip2` archive_compression tags but not the classic `lzma`
+    one SLE12 packages use, and silently falls back to gzip -- which then
+    fails opaquely ("Not a gzipped file") deep inside cpio parsing.
+    """
     tree = await ensure_extracted(
         resolved_for(FIXTURES / f"tiny-qna-{compressor}.rpm"), cache_dir=cache
     )

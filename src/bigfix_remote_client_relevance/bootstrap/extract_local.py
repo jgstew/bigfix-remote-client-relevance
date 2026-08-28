@@ -182,10 +182,29 @@ def _ar_member(artifact: Path, *, prefix: str) -> io.BytesIO:
 
 def _extract_rpm(artifact: Path, destination: Path) -> None:
     # rpmfile handles the lead, the tag headers, and every payload compressor
-    # in the wild — gzip on EL8-era packages, zstd on EL9-era ones.
+    # in the wild — gzip on EL8-era packages, zstd on EL9-era ones. It does
+    # not recognize the classic "lzma" tag SLE12-era SUSE packages use
+    # (distinct from the "xz" tag it does handle) and silently falls back to
+    # gzip, which then fails opaquely ("Not a gzipped file") deep inside cpio
+    # parsing -- a real gap in rpmfile==2.2.1, not a corrupted download.
+    # lzma.LZMAFile's default FORMAT_AUTO decodes both the "xz" container and
+    # the legacy "lzma" stream identically -- the same call rpmfile already
+    # makes for "xz" -- so pre-seeding its lazily-computed `data_file` cache
+    # (`_fileobj`/`data_offset` are exactly what rpmfile's own property reads
+    # to build that case) is enough; nothing about rpmfile itself changes.
+    import lzma
+
     import rpmfile
 
     with rpmfile.open(str(artifact)) as archive:
+        if archive.headers.get("archive_compression") == b"lzma":
+            # Not a leaked handle: this becomes rpmfile's own cached
+            # `data_file`, managed exactly like its gzip/zstd/bzip2
+            # equivalents -- none of which rpmfile explicitly closes either;
+            # `archive.__exit__` closes the underlying raw fileobj instead.
+            archive._data_file = lzma.LZMAFile(  # noqa: SIM115
+                rpmfile._SubFile(archive._fileobj, archive.data_offset)
+            )
         for member in archive.getmembers():
             # rpmfile reports permission bits only, with the file type split
             # out into these flags. Symlinks are skipped for the same reason
