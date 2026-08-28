@@ -124,9 +124,21 @@ def fake_qna(tmp_path):
             .replace("__SENTINEL__", '(here / "sentinel.txt").write_text("done")')
             .replace("__EXIT__", repr(int(exit_code)))
         )
-        path = directory / "qna"
-        path.write_text(script, encoding="utf-8")
-        path.chmod(0o755)
+        # The script always lands beside its recordings, so it can find them
+        # through __file__ under either layout below.
+        (directory / "qna.py").write_text(script, encoding="utf-8")
+
+        if sys.platform.startswith("win"):
+            # A shebang means nothing to CreateProcess, so the stub has to be
+            # something Windows can spawn. A .cmd is: CreateProcess runs it
+            # through cmd.exe, which forwards argv, passes the stdin pipe
+            # straight down, and returns the child's exit code.
+            path = directory / "qna.cmd"
+            path.write_text(f'@"{sys.executable}" "%~dp0qna.py" %*\n', encoding="utf-8")
+        else:
+            path = directory / "qna"
+            path.write_text(script, encoding="utf-8")
+            path.chmod(0o755)
         return FakeQna(path=str(path), directory=directory)
 
     return _make
@@ -247,21 +259,30 @@ def _live_qna_status() -> tuple[bool, str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _docker_available() -> bool:
+def _docker_status() -> tuple[bool, str]:
     # Uses the package's own socket discovery rather than docker.from_env(), so
     # the probe agrees with what DockerEngine will actually connect to.
     try:
         from bigfix_remote_client_relevance.transports.container import DockerEngine
     except ImportError:  # pragma: no cover - only before the package exists
-        return False
+        return False, "bigfix_remote_client_relevance is not importable yet"
     try:
         # auto_setup=False is load-bearing: this runs at collection time, and
         # a dev box with Docker stopped would otherwise launch Docker Desktop
         # and block the whole suite for the start timeout.
-        DockerEngine(auto_setup=False)._get_client()
-        return True
+        client = DockerEngine(auto_setup=False)._get_client()
+        os_type = client.info().get("OSType")  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - any failure at all means no usable daemon
-        return False
+        return False, "no reachable Docker daemon"
+
+    # Reachable is not enough: every image these tests build is a Linux one,
+    # and a daemon in Windows-container mode rejects them at the manifest.
+    if os_type != "linux":
+        return False, (
+            f"the Docker daemon runs {os_type or 'unknown'} containers; "
+            "these tests build Linux images"
+        )
+    return True, ""
 
 
 @functools.lru_cache(maxsize=1)
@@ -331,8 +352,10 @@ def pytest_collection_modifyitems(config, items):
             ok, reason = _live_qna_status()
             if not ok:
                 item.add_marker(pytest.mark.skip(reason=reason))
-        if "docker" in item.keywords and not _docker_available():
-            item.add_marker(pytest.mark.skip(reason="no reachable Docker daemon"))
+        if "docker" in item.keywords:
+            ok, reason = _docker_status()
+            if not ok:
+                item.add_marker(pytest.mark.skip(reason=reason))
         if "ssh_localhost" in item.keywords:
             ok, reason = _ssh_localhost_status()
             if not ok:

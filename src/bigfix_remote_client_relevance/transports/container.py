@@ -22,6 +22,7 @@ import logging
 import os
 import posixpath
 import shlex
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -191,7 +192,9 @@ class ContainerEngine(Protocol):
 
 
 def candidate_docker_sockets(
-    *, endpoint_lookup: Callable[[], str | None] = docker_context_endpoint
+    *,
+    endpoint_lookup: Callable[[], str | None] = docker_context_endpoint,
+    platform: str | None = None,
 ) -> list[str]:
     """Socket URLs to try, most specific first.
 
@@ -205,7 +208,13 @@ def candidate_docker_sockets(
 
     ``DOCKER_HOST`` still outranks the context: it is the more explicit
     statement of the two.
+
+    Windows gets the named pipe and nothing else: the Unix-socket fallbacks
+    below would render as ``unix://C:\\Users\\...`` there, which names no
+    socket that can exist.
     """
+    platform = platform if platform is not None else sys.platform
+
     candidates: list[str] = []
     from_env = os.environ.get("DOCKER_HOST")
     if from_env:
@@ -213,6 +222,11 @@ def candidate_docker_sockets(
     from_context = endpoint_lookup()
     if from_context:
         candidates.append(from_context)
+
+    if platform.startswith("win"):
+        candidates.append("npipe:////./pipe/docker_engine")
+        return list(dict.fromkeys(candidates))
+
     candidates.append(f"unix://{Path.home() / '.docker/run/docker.sock'}")
     candidates.append("unix:///var/run/docker.sock")
     # Colima and Rancher Desktop keep their sockets elsewhere again.
