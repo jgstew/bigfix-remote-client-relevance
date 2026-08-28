@@ -415,6 +415,183 @@ def test_rebuild_image_reaches_the_transport_factory():
     assert transport._rebuild_image is True
 
 
+# --- two budgets: image work and evaluation ------------------------------------
+#
+# One semaphore throttled everything, but pulls and evaluations have very
+# different cost profiles: eight simultaneous multi-hundred-MB pulls will
+# saturate a laptop while eight evaluations barely register.
+
+_M20 = pytest.mark.xfail(strict=True, reason="M20: image work has no budget of its own")
+
+
+class FakePreparingTransport(FakeProbingTransport):
+    """A container-style transport whose image phase is separately observable."""
+
+    def __init__(self, host, *, image_tracker=None, prepare_delay=0.0, fail_prepare=False, **kw):
+        super().__init__(host, **kw)
+        self._image_tracker = image_tracker if image_tracker is not None else {}
+        self._image_tracker.setdefault("live", 0)
+        self._image_tracker.setdefault("peak", 0)
+        self._image_tracker.setdefault("calls", 0)
+        self._prepare_delay = prepare_delay
+        self._fail_prepare = fail_prepare
+        self.order: list[str] = []
+
+    async def prepare(self, *, qna=None, timeout_s=30.0) -> None:
+        self.order.append("prepare")
+        self._image_tracker["calls"] += 1
+        self._image_tracker["live"] += 1
+        self._image_tracker["peak"] = max(
+            self._image_tracker["peak"], self._image_tracker["live"]
+        )
+        try:
+            if self._prepare_delay:
+                await asyncio.sleep(self._prepare_delay)
+            if self._fail_prepare:
+                raise RuntimeError("could not pull the image")
+        finally:
+            self._image_tracker["live"] -= 1
+
+    async def evaluate_client_relevance(self, *args, **kwargs):
+        self.order.append("evaluate")
+        return await super().evaluate_client_relevance(*args, **kwargs)
+
+
+def container_targets(count: int) -> list[Target]:
+    return [
+        Target(kind="container", name=f"image{i}", image=f"image{i}") for i in range(count)
+    ]
+
+
+@_M20
+async def test_the_image_phase_runs_before_the_evaluation():
+    made: list[FakePreparingTransport] = []
+
+    def factory(target):
+        transport = FakePreparingTransport(target.name)
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance("true", container_targets(1), transport_factory=factory)
+
+    assert made[0].order == ["prepare", "evaluate"]
+
+
+@_M20
+async def test_pull_parallel_bounds_the_image_phase():
+    tracker = {"live": 0, "peak": 0, "calls": 0}
+
+    await evaluate_client_relevance(
+        "true",
+        container_targets(8),
+        max_parallel=8,
+        pull_parallel=2,
+        transport_factory=lambda t: FakePreparingTransport(
+            t.name, image_tracker=tracker, prepare_delay=0.02
+        ),
+    )
+
+    assert tracker["calls"] == 8, "every target must have gone through the image phase"
+    assert tracker["peak"] <= 2, f"peak image concurrency was {tracker['peak']}"
+
+
+@_M20
+async def test_the_two_budgets_are_independent():
+    """A low pull limit must not throttle evaluation, or vice versa."""
+    images = {"live": 0, "peak": 0, "calls": 0}
+    evals = {"live": 0, "peak": 0}
+
+    await evaluate_client_relevance(
+        "true",
+        container_targets(6),
+        max_parallel=6,
+        pull_parallel=1,
+        transport_factory=lambda t: FakePreparingTransport(
+            t.name, image_tracker=images, tracker=evals, prepare_delay=0.01, delay=0.01
+        ),
+    )
+
+    assert images["calls"] == 6
+    assert images["peak"] == 1, "the image phase is serialized by pull_parallel=1"
+    assert evals["peak"] > 1, "but evaluation is not"
+
+
+@_M20
+async def test_a_failed_image_phase_does_not_fail_the_pair():
+    """The evaluation reports it in its own vocabulary; prepare is an optimization."""
+    made: list[FakePreparingTransport] = []
+
+    def factory(target):
+        transport = FakePreparingTransport(target.name, fail_prepare=True)
+        made.append(transport)
+        return transport
+
+    results = await evaluate_client_relevance("true", container_targets(1), transport_factory=factory)
+
+    assert made[0].order[:1] == ["prepare"], "the hook must actually have been tried"
+    assert len(results) == 1
+    assert results[0].error_kind is None
+
+
+@_M20
+async def test_transports_without_the_hook_are_not_throttled_by_the_pull_limit():
+    """A 20-host SSH sweep must not be serialized by a container-pull budget."""
+    tracker = {"live": 0, "peak": 0}
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name=f"h{i}") for i in range(8)],
+        max_parallel=8,
+        pull_parallel=1,
+        transport_factory=lambda t: FakeTransport(t.name, tracker=tracker, delay=0.02),
+    )
+
+    assert tracker["peak"] > 1
+
+
+@_M20
+def test_the_default_factory_accepts_a_coordinator():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
+
+    shared = ImageCoordinator()
+    transport = default_transport_factory(
+        Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04"), coordinator=shared
+    )
+
+    assert transport._coordinator is shared
+
+
+def test_the_default_factory_still_takes_one_argument():
+    """It is a documented public alias; adding a parameter must not break callers."""
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    for target in (
+        Target(kind="local", name="local"),
+        Target(kind="ssh", name="host"),
+        Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04"),
+    ):
+        assert default_transport_factory(target) is not None
+
+
+async def test_results_still_follow_targets_then_versions():
+    """The new phases must not disturb the documented result ordering."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="h0"), Target(kind="ssh", name="h1")],
+        qna_version=["11.0", "9.5"],
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver({"11.0": "11.0.6.137", "9.5": "9.5.22.10"}),
+    )
+
+    assert [(r.host, r.qna_version) for r in results] == [
+        ("h0", "11.0.6.137"),
+        ("h0", "9.5.22.10"),
+        ("h1", "11.0.6.137"),
+        ("h1", "9.5.22.10"),
+    ]
+
+
 # --- failure isolation -----------------------------------------------------
 
 

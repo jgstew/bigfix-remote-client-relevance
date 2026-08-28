@@ -194,6 +194,23 @@ def test_rebuild_image_requires_a_container_target(captured):
     assert "container" in result.output.lower()
 
 
+@pytest.mark.xfail(strict=True, reason="M20: --pull-parallel does not exist")
+def test_pull_parallel_is_passed_through(captured):
+    result = invoke("--container", "ubuntu:22.04", "--pull-parallel", "3", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["pull_parallel"] == 3
+
+
+@pytest.mark.xfail(strict=True, reason="M20: --pull-parallel does not exist")
+def test_pulls_default_to_a_lower_limit_than_evaluations(captured):
+    """Eight simultaneous multi-hundred-MB pulls would saturate a laptop."""
+    result = invoke("--container", "ubuntu:22.04", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["pull_parallel"] < captured["max_parallel"]
+
+
 def test_container_without_platform_leaves_it_unset(captured):
     """No --platform means the image gets probed, never assumed."""
     result = invoke("--container", "almalinux:9", "true")
