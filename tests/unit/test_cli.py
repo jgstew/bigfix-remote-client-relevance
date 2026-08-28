@@ -270,6 +270,46 @@ def test_plain_output_lists_answers(captured):
     assert "Mac OS 15.5" in result.stdout
 
 
+def result_for(host, answers, *, version="11.0.6.137", types=None, error=None, kind=None):
+    return ClientRelevanceResult(
+        host=host,
+        transport="container",
+        client_relevance="number of properties",
+        answers=answers,
+        answer_types=types or [],
+        qna_version=version,
+        error=error,
+        error_kind=kind,
+    )
+
+
+def test_plain_output_labels_each_result_in_a_fanout(captured):
+    captured["results"] = [result_for("h0", ["2134"]), result_for("h1", ["2151"])]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    assert "== h0" in result.stdout
+    assert "== h1" in result.stdout
+    assert "2134" in result.stdout and "2151" in result.stdout
+
+
+def test_plain_output_labels_carry_the_qna_version(captured):
+    captured["results"] = [
+        result_for("h", ["2134"], version="11.0.6.137"),
+        result_for("h", ["2089"], version="10.0.16.61"),
+    ]
+
+    result = invoke("--container", "a", "--qna-version", "11.0", "true")
+
+    assert "== h (qna 11.0.6.137)" in result.stdout
+
+
+def test_a_single_result_has_no_header(captured):
+    result = invoke("--local", "true")
+
+    assert "==" not in result.stdout
+
+
 def test_json_output_matches_the_result_contract(captured):
     result = invoke("--local", "--json", "true")
 
@@ -382,3 +422,136 @@ def test_errors_are_reported_on_stderr_not_stdout(monkeypatch):
 
     assert result.exit_code == 1
     json.loads(result.stdout)  # stdout stays machine-readable even on failure
+
+
+# --- --diff: where the targets disagree ---------------------------------------
+#
+# Across N targets the useful answer is not N result blobs, it is where they
+# differ. The issue that prompted this was verifying byte-identity across ten
+# images by hand with a pile of md5 calls.
+
+_M21 = pytest.mark.xfail(strict=True, reason="M21: --diff does not exist")
+
+
+@_M21
+def test_diff_collapses_identical_answers(captured):
+    captured["results"] = [result_for(f"h{i}", ["2134"]) for i in range(3)]
+
+    result = invoke("--container", "a", "--container", "b", "--container", "c", "--diff", "true")
+
+    assert result.exit_code == 0, result.output
+    assert "all targets agree (3)" in result.stdout
+    assert result.stdout.count("2134") == 1, "the shared answer is printed once"
+    for host in ("h0", "h1", "h2"):
+        assert host in result.stdout, "every target is still named"
+
+
+@_M21
+def test_diff_separates_disagreeing_answers(captured):
+    captured["results"] = [
+        result_for("h0", ["2134"]),
+        result_for("h1", ["2134"]),
+        result_for("h2", ["2151"]),
+    ]
+
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert result.exit_code == 0, result.output
+    assert "group 1 (2 targets)" in result.stdout
+    assert "group 2 (1 target)" in result.stdout
+    assert result.stdout.index("2134") < result.stdout.index("2151"), "majority first"
+
+
+@_M21
+def test_diff_treats_the_answer_type_as_part_of_the_answer(captured):
+    """An inspector answering 1 as integer here and string there is a real difference."""
+    captured["results"] = [
+        result_for("h0", ["1"], types=["integer"]),
+        result_for("h1", ["1"], types=["string"]),
+    ]
+
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert "group 1" in result.stdout and "group 2" in result.stdout
+
+
+@_M21
+def test_diff_gives_errors_their_own_group(captured):
+    captured["results"] = [
+        result_for("h0", ["2134"]),
+        result_for("h1", ["2134"]),
+        result_for("h2", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT),
+    ]
+
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert "cannot connect" in result.stdout
+    assert result.exit_code == 3, "an error still sets the exit code"
+
+
+@_M21
+def test_diff_collapses_identical_errors(captured):
+    captured["results"] = [
+        result_for(f"h{i}", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT)
+        for i in range(2)
+    ]
+
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert "all targets agree (2)" in result.stdout
+    assert result.stdout.count("cannot connect") == 1
+
+
+@_M21
+def test_diff_ignores_the_qna_version_when_grouping(captured):
+    """Comparing across versions is the point; agreeing across them is the payoff."""
+    captured["results"] = [
+        result_for("h", ["2134"], version="11.0.6.137"),
+        result_for("h", ["2134"], version="10.0.16.61"),
+    ]
+
+    result = invoke("--container", "a", "--qna-version", "11.0", "--diff", "true")
+
+    assert "all targets agree (2)" in result.stdout
+    assert "11.0.6.137" in result.stdout and "10.0.16.61" in result.stdout
+
+
+@_M21
+def test_diff_with_a_single_result_still_renders_a_group(captured):
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert result.exit_code == 0, result.output
+    assert "all targets agree (1)" in result.stdout
+    assert "Mac OS 15.5" in result.stdout
+
+
+@_M21
+def test_diff_and_json_together_is_a_usage_error(captured):
+    result = invoke("--container", "a", "--diff", "--json", "true")
+
+    assert result.exit_code == 2
+    assert "--diff" in result.output and "--json" in result.output
+    assert "text summary" in result.output
+
+
+@_M21
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [(None, 0), (ERROR_KIND_RELEVANCE, 1), (ERROR_KIND_TRANSPORT, 3)],
+)
+def test_diff_does_not_change_the_exit_code(captured, kind, expected):
+    captured["results"] = [
+        result_for("h", ["2134"], error="boom" if kind else None, kind=kind)
+    ]
+
+    assert invoke("--container", "a", "--diff", "true").exit_code == expected
+
+
+@_M21
+def test_diff_with_no_results_prints_nothing(captured):
+    captured["results"] = []
+
+    result = invoke("--container", "a", "--diff", "true")
+
+    assert "No such option" not in result.output, "the flag must be recognized"
+    assert result.stdout.strip() == ""
