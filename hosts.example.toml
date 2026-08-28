@@ -1,0 +1,50 @@
+# Example inventory for --inventory hosts.toml (or an auto-discovered
+# ./hosts.toml — see README.md#inventory).
+#
+# [defaults] applies to every [hosts.*] table below; any key repeated on a
+# host wins over the default for that host only.
+
+[defaults]
+qna_version = "11.0"        # version spec; overridable per host
+
+[hosts.this-computer]
+transport = "local"
+qna_version = []            # empty list, not a string: opts this host out of
+                             # [defaults] and probes whatever's installed
+                             # instead of pinning to "11.0"
+
+# [hosts."10.0.0.0"]           # dotted/numeric table names must be quoted --
+# transport = "ssh"            # unquoted, TOML reads 10.0.0.0 as nested keys
+# user = "jgstew"
+
+# [hosts."mac.local"]
+# transport = "ssh"
+# user = "jgstew"
+
+[hosts.ubuntu-2404]
+transport = "container"
+image = "ubuntu:24.04"
+
+[hosts.debian-12]
+transport = "container"
+image = "debian:12"
+
+[hosts.almalinux-9]
+transport = "container"
+image = "almalinux:9"
+
+[hosts.amazonlinux-2023]
+transport = "container"
+image = "amazonlinux:2023"
+
+[hosts.oraclelinux-9]
+transport = "container"
+image = "oraclelinux:9"
+
+[hosts.ubi9]
+transport = "container"
+image = "registry.access.redhat.com/ubi9/ubi"
+
+[hosts.opensuse-leap-15]
+transport = "container"
+image = "opensuse/leap:15"
