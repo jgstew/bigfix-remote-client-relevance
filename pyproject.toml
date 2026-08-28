@@ -89,6 +89,7 @@ markers = [
   "live_qna: needs a real local qna binary (root on macOS: sudo -E uv run pytest -m live_qna)",
   "docker: needs a reachable Docker daemon",
   "ssh_localhost: needs sshd on localhost with key auth for the current user",
+  "ssh_windows: needs a real Windows endpoint (set BFRCR_WINDOWS_SSH_HOST=user@host)",
   "network: reaches support.bigfix.com / software.bigfix.com (opt in with BFRCR_NETWORK_TESTS=1)",
 ]
 

@@ -210,6 +210,31 @@ def _ssh_localhost_status() -> tuple[bool, str]:
     return False, f"cannot ssh to localhost: {stderr or 'unknown failure'}"
 
 
+@functools.lru_cache(maxsize=1)
+def _ssh_windows_status() -> tuple[bool, str]:
+    """Can we reach the Windows host named by BFRCR_WINDOWS_SSH_HOST?
+
+    Opt-in by design: it needs a real Windows box, and the point of these tests
+    is the shell the box actually logs you into.
+    """
+    host = os.environ.get("BFRCR_WINDOWS_SSH_HOST")
+    if not host:
+        return False, (
+            "set BFRCR_WINDOWS_SSH_HOST=user@host to run the Windows SSH tests "
+            "against a real Windows endpoint"
+        )
+    completed = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "echo ok"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return True, ""
+    return False, f"cannot ssh to {host}: {completed.stderr.strip() or 'unknown failure'}"
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         if "live_qna" in item.keywords:
@@ -220,6 +245,10 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="no reachable Docker daemon"))
         if "ssh_localhost" in item.keywords:
             ok, reason = _ssh_localhost_status()
+            if not ok:
+                item.add_marker(pytest.mark.skip(reason=reason))
+        if "ssh_windows" in item.keywords:
+            ok, reason = _ssh_windows_status()
             if not ok:
                 item.add_marker(pytest.mark.skip(reason=reason))
         if "network" in item.keywords and os.environ.get("BFRCR_NETWORK_TESTS") != "1":

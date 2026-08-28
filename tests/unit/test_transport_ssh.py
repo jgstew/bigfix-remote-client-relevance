@@ -82,6 +82,18 @@ def make_transport(runner: FakeSSHRunner, **kwargs) -> TransportSSH:
     return TransportSSH("test-host", connection_factory=factory, **kwargs)
 
 
+def make_windows_transport(runner: FakeSSHRunner, **kwargs) -> TransportSSH:
+    kwargs["platform"] = "windows"
+    return make_transport(runner, **kwargs)
+
+
+def decode_ps(command: str) -> str:
+    """The PowerShell source inside a `-EncodedCommand` wrapper."""
+    import base64
+
+    return base64.b64decode(command.rsplit(" ", 1)[1]).decode("utf-16-le")
+
+
 def qna_ok(text: str = "A: Ubuntu\nI: singular string\nT: 0.1 ms\n"):
     return (text, "", 0)
 
@@ -494,3 +506,127 @@ async def test_writes_nothing_to_stdout(capsys):
     await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
 
     assert capsys.readouterr().out == ""
+
+
+# --- Windows: the login shell is cmd.exe, not PowerShell ---------------------
+#
+# Every Windows command this package builds is PowerShell (Test-Path, New-Item,
+# Expand-Archive, the & call operator), but Windows OpenSSH hands commands to
+# cmd.exe by default. Verified on a real Server 2022 host: the discovery probe
+# came back `'C:/Program was unexpected at this time.` So every Windows command
+# is wrapped to run through powershell.exe, leaving the login shell alone.
+
+_M14 = pytest.mark.xfail(strict=True, reason="M14: Windows commands are not wrapped for PowerShell")
+
+WINDOWS_QNA = "C:/Program Files (x86)/BigFix Enterprise/BES Client/qna.exe"
+WINDOWS_FOUND = (r"Test-Path|EncodedCommand", (f"{WINDOWS_QNA}\n", "", 0))
+
+
+@_M14
+async def test_windows_commands_are_wrapped_for_powershell():
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    await make_windows_transport(runner).evaluate_client_relevance("true")
+
+    assert runner.commands(), "the transport must have run something"
+    for command in runner.commands():
+        assert command.startswith("powershell -NoProfile -NonInteractive -EncodedCommand ")
+
+
+@_M14
+async def test_the_wrapped_command_decodes_to_the_powershell_source():
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    await make_windows_transport(runner).evaluate_client_relevance("true")
+
+    assert "Test-Path" in decode_ps(runner.commands()[0]), "discovery is still PowerShell inside"
+
+
+@_M14
+async def test_progress_output_is_silenced():
+    """Without this PowerShell writes CLIXML progress records to stderr."""
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    await make_windows_transport(runner).evaluate_client_relevance("true")
+
+    assert decode_ps(runner.commands()[0]).startswith("$ProgressPreference='SilentlyContinue';")
+
+
+@_M14
+async def test_the_encoded_payload_survives_paths_with_spaces_and_parentheses():
+    """cmd chokes on ( and &; base64 of UTF-16LE removes every quoting layer."""
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    await make_windows_transport(runner).evaluate_client_relevance("true")
+
+    eval_source = decode_ps(runner.commands()[-1])
+    assert WINDOWS_QNA in eval_source
+    assert "(x86)" in eval_source
+
+
+@_M14
+async def test_discovery_finds_a_windows_qna_path():
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    result = await make_windows_transport(runner).evaluate_client_relevance("true")
+
+    assert result.qna_path == WINDOWS_QNA
+    assert "EncodedCommand" in runner.commands()[0], "discovery must go through the wrapper"
+
+
+@_M14
+async def test_provisioning_commands_are_wrapped_too(tmp_path):
+    """provision_qna calls runner.run itself, so the wrap must be at the runner."""
+    artifact = tmp_path / "QNA11.0.6.137.zip"
+    artifact.write_bytes(b"fake zip")
+    runner = FakeSSHRunner(
+        responses=[
+            (r"EncodedCommand", ("", "", 1)),  # marker absent
+            WINDOWS_FOUND,
+        ]
+    )
+
+    await make_windows_transport(runner).evaluate_client_relevance(
+        "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
+    )
+
+    sources = [decode_ps(c) for c in runner.commands()]
+    assert any("Expand-Archive" in s for s in sources), "extraction must be wrapped"
+
+
+@_M14
+async def test_put_file_is_not_wrapped(tmp_path):
+    """SFTP is shell-independent — it is the one Windows step that already worked."""
+    artifact = tmp_path / "QNA11.0.6.137.zip"
+    artifact.write_bytes(b"fake zip")
+    runner = FakeSSHRunner(responses=[(r"EncodedCommand", ("", "", 1)), WINDOWS_FOUND])
+
+    await make_windows_transport(runner).evaluate_client_relevance(
+        "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
+    )
+
+    assert runner.pushed, "the artifact must still be pushed"
+    for _local, remote in runner.pushed:
+        assert "EncodedCommand" not in remote
+
+
+@_M14
+async def test_become_on_windows_warns(caplog):
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
+
+    with caplog.at_level(logging.WARNING):
+        await make_windows_transport(runner, become=True).evaluate_client_relevance("true")
+
+    assert "sudo" not in decode_ps(runner.commands()[-1])
+    assert any("become" in r.message.lower() or "sudo" in r.message.lower() for r in caplog.records)
+
+
+async def test_posix_commands_are_never_wrapped():
+    """The wrapper must not leak into the Linux path."""
+    runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
+
+    await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
+
+    for command in runner.commands():
+        assert "powershell" not in command.lower()
+        assert "EncodedCommand" not in command
