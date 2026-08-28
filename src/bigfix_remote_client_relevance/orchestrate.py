@@ -12,6 +12,11 @@ call. It owns three things transports deliberately do not:
 
 Failures never propagate as exceptions: one unreachable host yields one result
 with ``error_kind`` set while every other pair still evaluates.
+
+Two entry points over the same machinery: ``evaluate_client_relevance``
+returns the whole list in target-then-version order, and
+``evaluate_client_relevance_stream`` yields each result the moment its pair
+finishes, so a slow host does not hold up the ones that already answered.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import dataclasses
 import logging
 import sys
 import time
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
@@ -190,7 +195,18 @@ def _version_specs(target: Target, run_wide: str | Sequence[str] | None) -> list
     return list(chosen) or [None]
 
 
-async def evaluate_client_relevance(
+def count_work(targets: Sequence[Target], qna_version: str | Sequence[str] | None = None) -> int:
+    """How many results a fan-out over these arguments will produce.
+
+    Exposed because a streaming caller has to decide how to format its first
+    result before it knows how many follow, and this is not simply
+    ``len(targets)``: per-host ``qna_version`` overrides mean each target can
+    contribute a different number of pairs.
+    """
+    return sum(len(_version_specs(target, qna_version)) for target in targets)
+
+
+async def _evaluate_stream_indexed(
     client_relevance: str,
     targets: Sequence[Target],
     *,
@@ -200,11 +216,13 @@ async def evaluate_client_relevance(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
-) -> list[ClientRelevanceResult]:
-    """Evaluate ``client_relevance`` on every target, for every version.
+) -> AsyncIterator[tuple[int, ClientRelevanceResult]]:
+    """Shared core: yield ``(work_index, result)`` as each pair finishes.
 
-    Returns one result per (target, version) pair. Every failure mode is
-    reported inside a result rather than raised.
+    ``work_index`` is the pair's position in target-then-version order, kept
+    so callers that need that ordering (:func:`evaluate_client_relevance`) can
+    reconstruct it even though completion order is whatever finishes first.
+    Every failure mode is reported inside a result rather than raised.
     """
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
@@ -357,10 +375,101 @@ async def evaluate_client_relevance(
         len(work),
         max_parallel,
     )
-    async with asyncio.TaskGroup() as group:
-        tasks = [group.create_task(_one(target, spec)) for target, spec in work]
 
-    return [task.result() for task in tasks]
+    async def _one_indexed(
+        index: int, target: Target, spec: str | None
+    ) -> tuple[int, ClientRelevanceResult]:
+        return index, await _one(target, spec)
+
+    # Plain tasks + as_completed, not a TaskGroup: TaskGroup only releases its
+    # results once every task has finished, which is exactly the "all at
+    # once" behavior a streaming caller wants to avoid. This is safe because
+    # _one() never lets an exception escape -- every failure mode above comes
+    # back as a result, not a raise -- so there is nothing here for
+    # TaskGroup's cancel-siblings-on-error behavior to actually add.
+    tasks = [
+        asyncio.create_task(_one_indexed(index, target, spec))
+        for index, (target, spec) in enumerate(work)
+    ]
+    try:
+        for coro in asyncio.as_completed(tasks):
+            yield await coro
+    finally:
+        # A consumer that stops early -- `break`, an exception, or an
+        # abandoned generator -- would otherwise leave the remaining
+        # evaluations running against live SSH connections and containers
+        # with nobody to collect them. TaskGroup gave us this for free; on
+        # plain tasks it has to be written out.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def evaluate_client_relevance_stream(
+    client_relevance: str,
+    targets: Sequence[Target],
+    *,
+    qna_version: str | Sequence[str] | None = None,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
+    pull_parallel: int = DEFAULT_PULL_PARALLEL,
+    timeout_s: float = 30.0,
+    transport_factory: TransportFactory | None = None,
+    resolver: Resolver | None = None,
+) -> AsyncIterator[ClientRelevanceResult]:
+    """Evaluate ``client_relevance`` on every target, for every version.
+
+    Yields each ``ClientRelevanceResult`` as soon as its (target, version)
+    pair finishes, in completion order -- a slow SSH host never makes a fast
+    local container wait. Use this for live progress; use
+    :func:`evaluate_client_relevance` when you need the full set at once in
+    target-then-version order (e.g. ``--diff``, which groups across all of
+    them).
+    """
+    async for _index, result in _evaluate_stream_indexed(
+        client_relevance,
+        targets,
+        qna_version=qna_version,
+        max_parallel=max_parallel,
+        pull_parallel=pull_parallel,
+        timeout_s=timeout_s,
+        transport_factory=transport_factory,
+        resolver=resolver,
+    ):
+        yield result
+
+
+async def evaluate_client_relevance(
+    client_relevance: str,
+    targets: Sequence[Target],
+    *,
+    qna_version: str | Sequence[str] | None = None,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
+    pull_parallel: int = DEFAULT_PULL_PARALLEL,
+    timeout_s: float = 30.0,
+    transport_factory: TransportFactory | None = None,
+    resolver: Resolver | None = None,
+) -> list[ClientRelevanceResult]:
+    """Evaluate ``client_relevance`` on every target, for every version.
+
+    Returns one result per (target, version) pair, in target-then-version
+    order. Every failure mode is reported inside a result rather than raised.
+    Waits for the whole fan-out; for incremental results as they arrive, use
+    :func:`evaluate_client_relevance_stream`.
+    """
+    by_index: dict[int, ClientRelevanceResult] = {}
+    async for index, result in _evaluate_stream_indexed(
+        client_relevance,
+        targets,
+        qna_version=qna_version,
+        max_parallel=max_parallel,
+        pull_parallel=pull_parallel,
+        timeout_s=timeout_s,
+        transport_factory=transport_factory,
+        resolver=resolver,
+    ):
+        by_index[index] = result
+    return [by_index[i] for i in range(len(by_index))]
 
 
 def worst_exit_code(results: Sequence[ClientRelevanceResult]) -> int:

@@ -684,7 +684,14 @@ bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60
   repeatable for multi-version fan-out; `--refresh-versions` and
   `--fetch-on-target` are described in § qna binary cache & distribution.
 - `--json` emits one `ClientRelevanceResult` per (target × version) —
-  same shape the future MCP tool will return.
+  same shape the future MCP tool will return — as a single array, once the
+  whole fan-out is in.
+- `--jsonl` emits those same records one per line, written as each target
+  answers rather than at the end. Same schema, different framing; the two
+  are mutually exclusive. This is the framing the stdio MCP server wants:
+  a long fan-out can relay partial results instead of going silent until
+  the slowest endpoint returns. `--diff` cannot stream in either framing,
+  since the grouping is only defined once every answer exists.
 - Exit codes are actionable for CI gating, mirroring
   `ClientRelevanceResult.error_kind`: `0` — every (target × version)
   completed with no error (an empty answer set from a plural inspector is

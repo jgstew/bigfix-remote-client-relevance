@@ -66,6 +66,31 @@ bigfix-remote-client-relevance --inventory hosts.toml -f probe.rel --json
 `--json` writes one document per (target × version) to stdout; logs go to
 stderr, so piping into `jq` always works.
 
+### Streaming
+
+Results are emitted as each target answers, in completion order rather than
+inventory order — a slow SSH endpoint no longer holds up the containers that
+already finished. This applies to plain text and to `--jsonl`, which writes
+one compact JSON object per line:
+
+```bash
+bigfix-remote-client-relevance --inventory hosts.toml --jsonl "version of client" | jq -c '{host, elapsed_ms}'
+```
+
+```
+{"host":"local","elapsed_ms":928}
+{"host":"container:debian:12@x86_64","elapsed_ms":653}
+{"host":"ssh:192.168.4.115","elapsed_ms":2603}
+```
+
+`--jsonl` carries exactly the same fields as `--json`; the only difference is
+the framing, so pick `--jsonl` for a line-oriented reader and `--json` when
+you want one document to parse in full. They are mutually exclusive.
+
+`--json` and `--diff` are whole-set views — one array, and a grouping that
+only exists once every answer is in — so those two still print once at the
+end. Exit codes are always decided after the full fan-out, streaming or not.
+
 ### Exit codes
 
 Actionable for CI gating; the worst across the fan-out wins.
@@ -108,6 +133,19 @@ results = await evaluate_client_relevance(
     qna_version="11.0",
 )
 ```
+
+For results as they arrive rather than all at once — live progress, or an MCP
+tool streaming partial output — iterate the streaming variant instead:
+
+```python
+from bigfix_remote_client_relevance import evaluate_client_relevance_stream
+
+async for result in evaluate_client_relevance_stream("name of operating system", targets):
+    print(result.host, result.answers)
+```
+
+It yields in completion order; `evaluate_client_relevance` waits for the whole
+fan-out and returns target-then-version order.
 
 One `ClientRelevanceResult` comes back per (target × version), carrying
 `answers`, `answer_types`, `error` / `error_kind`, the resolved `qna_version`,

@@ -18,6 +18,7 @@ import logging
 from bigfix_remote_client_relevance.orchestrate import (
     Target,
     evaluate_client_relevance,
+    evaluate_client_relevance_stream,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
@@ -46,6 +47,7 @@ __all__ = [
     "TransportLocal",
     "TransportSSH",
     "evaluate_client_relevance",
+    "evaluate_client_relevance_stream",
     "find_qna_path",
     "parse_qna_output",
     "worst_exit_code",

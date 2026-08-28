@@ -47,8 +47,23 @@ def captured(monkeypatch):
             ],
         )
 
-    monkeypatch.setattr(cli_module, "evaluate_client_relevance", fake_evaluate)
+    _patch_orchestrator(monkeypatch, fake_evaluate)
     return record
+
+
+def _patch_orchestrator(monkeypatch, fake_evaluate):
+    """Stand in for both orchestrator entry points with one fake.
+
+    The CLI streams for plain output and batches for --json/--diff, so a
+    double that covers only one of them silently misses half the paths.
+    """
+
+    async def fake_stream(client_relevance, targets, **kwargs):
+        for result in await fake_evaluate(client_relevance, targets, **kwargs):
+            yield result
+
+    monkeypatch.setattr(cli_module, "evaluate_client_relevance", fake_evaluate)
+    monkeypatch.setattr(cli_module, "evaluate_client_relevance_stream", fake_stream)
 
 
 def invoke(*args):
@@ -384,16 +399,27 @@ def test_plain_output_lists_answers(captured):
     assert "Mac OS 15.5" in result.stdout
 
 
-def result_for(host, answers, *, version="11.0.6.137", types=None, error=None, kind=None):
+def result_for(
+    host,
+    answers,
+    *,
+    version="11.0.6.137",
+    types=None,
+    error=None,
+    kind=None,
+    transport="container",
+    platform=None,
+):
     return ClientRelevanceResult(
         host=host,
-        transport="container",
+        transport=transport,
         client_relevance="number of properties",
         answers=answers,
         answer_types=types or [],
         qna_version=version,
         error=error,
         error_kind=kind,
+        platform=platform,
     )
 
 
@@ -413,15 +439,98 @@ def test_plain_output_labels_carry_the_qna_version(captured):
         result_for("h", ["2089"], version="10.0.16.61"),
     ]
 
-    result = invoke("--container", "a", "--qna-version", "11.0", "true")
+    # Two version specs, matching the two results above: the CLI decides
+    # whether to label from the pair count it can predict before the run,
+    # so a one-pair invocation would (correctly) print no headers at all.
+    result = invoke("--container", "a", "--qna-version", "11.0", "--qna-version", "10.0", "true")
 
     assert "== h (qna 11.0.6.137)" in result.stdout
+    assert "== h (qna 10.0.16.61)" in result.stdout
 
 
 def test_a_single_result_has_no_header(captured):
     result = invoke("--local", "true")
 
     assert "==" not in result.stdout
+
+
+def test_ssh_headers_are_prefixed_with_the_transport(captured):
+    """A bare '192.168.4.115' doesn't say how it's reached; 'ssh:' does."""
+    captured["results"] = [
+        result_for("192.168.4.115", ["yes"], transport="ssh"),
+        result_for("h1", ["2151"]),  # transport="container", already self-labelled
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    assert "== ssh:192.168.4.115" in result.stdout
+    assert "== h1" in result.stdout, "container's own label must not get a redundant prefix"
+
+
+def test_ssh_headers_show_the_platform_when_known(captured):
+    """The point: 'ssh:10.0.0.5' alone doesn't say Windows from Linux from
+    macOS -- the platform qna actually resolved does."""
+    captured["results"] = [
+        result_for("10.0.0.5", ["yes"], transport="ssh", platform="windows"),
+        result_for("10.0.0.6", ["yes"], transport="ssh", platform=None),
+        result_for("h1", ["2151"], platform="ubuntu"),  # container: already self-labelled
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "--container", "c", "true")
+
+    assert "== ssh:10.0.0.5:windows (qna 11.0.6.137)" in result.stdout
+    assert "== ssh:10.0.0.6 (qna 11.0.6.137)" in result.stdout, (
+        "unknown platform: omit, don't guess"
+    )
+    assert "== h1 (qna 11.0.6.137)" in result.stdout, "container's own label already names its OS"
+
+
+def test_local_headers_are_not_prefixed(captured):
+    captured["results"] = [
+        result_for("local", ["yes"], transport="local"),
+        result_for("h1", ["2151"]),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    assert "== local (qna" in result.stdout
+    assert "== local:local" not in result.stdout
+
+
+def test_diff_headers_are_also_prefixed_for_ssh(captured):
+    captured["results"] = [
+        result_for("192.168.4.115", ["yes"], transport="ssh"),
+        result_for("other", ["no"], transport="ssh"),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "--diff", "true")
+
+    assert "-- ssh:192.168.4.115" in result.stdout
+    assert "-- ssh:other" in result.stdout
+
+
+def test_diff_headers_also_show_the_platform(captured):
+    captured["results"] = [
+        result_for("10.0.0.5", ["yes"], transport="ssh", platform="windows"),
+        result_for("10.0.0.6", ["no"], transport="ssh", platform="ubuntu"),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "--diff", "true")
+
+    assert "-- ssh:10.0.0.5:windows" in result.stdout
+    assert "-- ssh:10.0.0.6:ubuntu" in result.stdout
+
+
+def test_json_host_field_is_unaffected_by_the_display_prefix(captured):
+    """--json's `host` stays exactly result.host -- the prefix is display-only,
+    since _update_inventory_platforms matches it against inventory table names
+    verbatim."""
+    captured["results"] = [result_for("192.168.4.115", ["yes"], transport="ssh")]
+
+    result = invoke("--container", "a", "--json", "true")
+
+    payload = json.loads(result.stdout)
+    assert payload[0]["host"] == "192.168.4.115"
 
 
 def test_json_output_matches_the_result_contract(captured):
@@ -449,6 +558,76 @@ def test_json_is_pretty_printed_but_still_parses(captured):
     json.loads(result.stdout)
 
 
+# --- --jsonl ---------------------------------------------------------------
+
+
+def test_jsonl_emits_one_parseable_record_per_line(captured):
+    captured["results"] = [result_for("h0", ["2134"]), result_for("h1", ["2151"])]
+
+    result = invoke("--container", "a", "--container", "b", "--jsonl", "true")
+
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2, "one line per result, no array wrapper and no blank lines"
+    assert [json.loads(line)["host"] for line in lines] == ["h0", "h1"]
+
+
+def test_jsonl_records_carry_the_same_fields_as_json(captured):
+    """Two framings of one schema -- the fields must not diverge."""
+    as_array = json.loads(invoke("--local", "--json", "true").stdout)
+    as_lines = [
+        json.loads(line) for line in invoke("--local", "--jsonl", "true").stdout.splitlines()
+    ]
+
+    assert as_lines == as_array
+
+
+def test_jsonl_never_wraps_a_record_across_lines(captured):
+    """A record containing a newline must not break the line framing."""
+    captured["results"] = [result_for("h0", ["line one\nline two"])]
+
+    result = invoke("--container", "a", "--jsonl", "true")
+
+    assert len(result.stdout.splitlines()) == 1
+    assert json.loads(result.stdout)["answers"] == ["line one\nline two"]
+
+
+def test_jsonl_stdout_carries_only_the_payload(captured):
+    """The MCP-readiness test again: -vv logs must not land between records."""
+    result = runner.invoke(cli_module.app, ["--local", "-vv", "--jsonl", "true"])
+
+    assert result.exit_code == 0, result.output
+    for line in result.stdout.splitlines():
+        json.loads(line)
+
+
+def test_jsonl_reports_errors_as_records_and_still_exits_nonzero(captured):
+    captured["results"] = [
+        result_for("h0", [], error="boom", kind=ERROR_KIND_RELEVANCE),
+        result_for("h1", ["2151"]),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "--jsonl", "true")
+
+    assert result.exit_code == 1
+    records = {json.loads(line)["host"]: json.loads(line) for line in result.stdout.splitlines()}
+    assert records["h0"]["error_kind"] == ERROR_KIND_RELEVANCE
+    assert records["h1"]["error_kind"] is None
+
+
+def test_json_and_jsonl_together_is_a_usage_error(captured):
+    result = invoke("--local", "--json", "--jsonl", "true")
+
+    assert result.exit_code != 0
+    assert "--json" in result.output and "--jsonl" in result.output
+
+
+def test_diff_and_jsonl_together_is_a_usage_error(captured):
+    result = invoke("--container", "a", "--diff", "--jsonl", "true")
+
+    assert result.exit_code != 0
+    assert "--diff" in result.output
+
+
 # --- exit codes ------------------------------------------------------------
 
 
@@ -469,7 +648,7 @@ def test_exit_code_reflects_worst_result(captured, monkeypatch, kind, expected):
             )
         ]
 
-    monkeypatch.setattr(cli_module, "evaluate_client_relevance", fake_evaluate)
+    _patch_orchestrator(monkeypatch, fake_evaluate)
 
     result = invoke("--local", "true")
 

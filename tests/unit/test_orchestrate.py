@@ -19,7 +19,9 @@ from bigfix_remote_client_relevance.orchestrate import (
     EXIT_RESOLVE,
     EXIT_TRANSPORT,
     Target,
+    count_work,
     evaluate_client_relevance,
+    evaluate_client_relevance_stream,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.results import (
@@ -815,6 +817,121 @@ async def test_results_still_follow_targets_then_versions():
         ("h1", "11.0.6.137"),
         ("h1", "9.5.22.10"),
     ]
+
+
+# --- streaming -------------------------------------------------------------
+
+
+async def test_stream_yields_a_result_before_the_slow_target_finishes():
+    """The whole point: a fast host is not held hostage by a slow one."""
+    slow = Target(kind="ssh", name="slow")
+    fast = Target(kind="ssh", name="fast")
+
+    def factory(target):
+        return FakeTransport(target.name, delay=0.20 if target.name == "slow" else 0.0)
+
+    first = None
+    async for result in evaluate_client_relevance_stream(
+        "true", [slow, fast], transport_factory=factory
+    ):
+        first = result
+        break
+
+    assert first is not None
+    assert first.host == "fast", "results must arrive in completion order, not target order"
+
+
+async def test_breaking_out_of_the_stream_cancels_the_rest():
+    """An abandoned stream must not leave evaluations running against live
+    connections with nobody to collect them."""
+    started: list[str] = []
+    finished: list[str] = []
+
+    class TrackingTransport(FakeTransport):
+        async def evaluate_client_relevance(self, client_relevance, **kwargs):
+            started.append(self.host)
+            result = await super().evaluate_client_relevance(client_relevance, **kwargs)
+            finished.append(self.host)
+            return result
+
+    def factory(target):
+        return TrackingTransport(target.name, delay=0.0 if target.name == "fast" else 5.0)
+
+    stream = evaluate_client_relevance_stream(
+        "true",
+        [Target(kind="ssh", name="fast"), Target(kind="ssh", name="slow")],
+        transport_factory=factory,
+    )
+    async for _result in stream:
+        break
+    await stream.aclose()
+
+    assert finished == ["fast"], "the slow evaluation should have been cancelled, not awaited"
+
+
+async def test_stream_yields_every_pair_exactly_once():
+    seen = []
+    async for result in evaluate_client_relevance_stream(
+        "true",
+        [Target(kind="ssh", name="h0"), Target(kind="ssh", name="h1")],
+        qna_version=["11.0", "9.5"],
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver({"11.0": "11.0.6.137", "9.5": "9.5.22.10"}),
+    ):
+        seen.append((result.host, result.qna_version))
+
+    assert sorted(seen) == [
+        ("h0", "11.0.6.137"),
+        ("h0", "9.5.22.10"),
+        ("h1", "11.0.6.137"),
+        ("h1", "9.5.22.10"),
+    ]
+
+
+async def test_stream_reports_a_failing_target_as_a_result_not_a_raise():
+    """Streaming keeps the orchestrator's contract: failures are results."""
+
+    class ExplodingTransport(FakeTransport):
+        async def evaluate_client_relevance(self, *a, **k):
+            raise RuntimeError("host is on fire")
+
+    def factory(target):
+        return (
+            ExplodingTransport(target.name) if target.name == "bad" else FakeTransport(target.name)
+        )
+
+    seen = {}
+    async for result in evaluate_client_relevance_stream(
+        "true",
+        [Target(kind="ssh", name="bad"), Target(kind="ssh", name="good")],
+        transport_factory=factory,
+    ):
+        seen[result.host] = result
+
+    assert seen["bad"].error_kind == ERROR_KIND_TRANSPORT
+    assert seen["good"].error_kind is None
+
+
+async def test_stream_and_batch_agree_on_the_same_run():
+    """Two entry points, one machinery -- they must not drift apart."""
+    targets = [Target(kind="ssh", name=f"h{i}") for i in range(3)]
+    kwargs = {"transport_factory": lambda t: FakeTransport(t.name)}
+
+    batched = await evaluate_client_relevance("true", targets, **kwargs)
+    streamed = [r async for r in evaluate_client_relevance_stream("true", targets, **kwargs)]
+
+    assert sorted(r.host for r in batched) == sorted(r.host for r in streamed)
+
+
+def test_count_work_matches_what_the_fanout_produces():
+    """The CLI predicts the result count to format its first streamed result,
+    so this must stay in step with the grid the orchestrator actually builds."""
+    targets = [
+        Target(kind="ssh", name="h0"),
+        Target(kind="ssh", name="h1", qna_version=["11.0", "9.5"]),
+    ]
+
+    assert count_work(targets, "11.0") == 3
 
 
 # --- failure isolation -----------------------------------------------------

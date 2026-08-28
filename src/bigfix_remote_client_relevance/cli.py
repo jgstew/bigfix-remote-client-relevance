@@ -37,7 +37,9 @@ from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_PULL_PARALLEL,
     EXIT_QNA,
     Target,
+    count_work,
     evaluate_client_relevance,
+    evaluate_client_relevance_stream,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.results import ClientRelevanceResult
@@ -88,22 +90,60 @@ def _read_client_relevance(inline: list[str], from_file: Path | None) -> str:
     return " ".join(inline)
 
 
+def _display_host(result: ClientRelevanceResult) -> str:
+    """The host as shown in headers -- not necessarily ``result.host`` as-is.
+
+    ``local`` and ``container:<image>@<arch>`` already say how they're
+    reached; a bare ssh host like ``192.168.4.115`` doesn't, and an
+    inventory can mix an ssh and a fastquery entry for the same address.
+    This is display-only: ``result.host`` itself stays untouched, since
+    ``_update_inventory_platforms`` matches it against the inventory's
+    table names verbatim.
+    """
+    if result.transport in ("ssh", "fastquery") and not result.host.startswith(
+        f"{result.transport}:"
+    ):
+        return f"{result.transport}:{result.host}"
+    return result.host
+
+
+def _label(result: ClientRelevanceResult) -> str:
+    """Full header text: the display host, its platform when known, and the
+    qna version -- e.g. ``ssh:192.168.4.115:windows (qna 11.0.6.137)``, echoing
+    the ``container:<image>@<arch>`` shape's colon-separated qualifier.
+
+    Platform is shown only for ssh/fastquery, the two transports whose host
+    string alone doesn't say what's on the other end (an inventory full of
+    bare IPs and SSH aliases gives no hint which is Windows, macOS, or
+    Linux). ``local`` is always this machine and a container image already
+    names its own OS, so both would just be repeating themselves.
+    """
+    label = _display_host(result)
+    if result.transport in ("ssh", "fastquery") and result.platform:
+        label = f"{label}:{result.platform}"
+    if result.qna_version:
+        label = f"{label} (qna {result.qna_version})"
+    return label
+
+
+def _render_one_plain(result: ClientRelevanceResult, *, labelled: bool) -> str:
+    """One result's section. Shared by the batch and streaming renderers, so
+    the two can never drift into printing the same result differently."""
+    lines: list[str] = []
+    if labelled:
+        lines.append(f"== {_label(result)}")
+    lines.extend(result.answers)
+    if result.error:
+        # Errors go to stdout only as part of a labelled section; the
+        # summary on stderr is what a human reads.
+        lines.append(f"!! {result.error_kind}: {result.error}")
+    return "\n".join(lines)
+
+
 def _render_plain(results: list[ClientRelevanceResult]) -> str:
     """Answers for a single result; host-labelled sections for a fan-out."""
-    lines: list[str] = []
     multiple = len(results) > 1
-    for result in results:
-        if multiple:
-            label = result.host
-            if result.qna_version:
-                label = f"{label} (qna {result.qna_version})"
-            lines.append(f"== {label}")
-        lines.extend(result.answers)
-        if result.error:
-            # Errors go to stdout only as part of a labelled section; the
-            # summary on stderr is what a human reads.
-            lines.append(f"!! {result.error_kind}: {result.error}")
-    return "\n".join(lines)
+    return "\n".join(_render_one_plain(result, labelled=multiple) for result in results)
 
 
 def _diff_key(result: ClientRelevanceResult) -> tuple[object, ...]:
@@ -122,12 +162,6 @@ def _diff_key(result: ClientRelevanceResult) -> tuple[object, ...]:
         tuple(result.answers),
         tuple(result.answer_types),
     )
-
-
-def _label(result: ClientRelevanceResult) -> str:
-    if result.qna_version:
-        return f"{result.host} (qna {result.qna_version})"
-    return result.host
 
 
 def _plural(count: int, noun: str) -> str:
@@ -325,6 +359,16 @@ def evaluate(
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit one JSON document per (target x version).")
     ] = False,
+    as_jsonl: Annotated[
+        bool,
+        typer.Option(
+            "--jsonl",
+            help=(
+                "Like --json, but one compact JSON object per line, written as "
+                "each target answers instead of all at once."
+            ),
+        ),
+    ] = False,
     diff: Annotated[
         bool,
         typer.Option(
@@ -354,10 +398,16 @@ def evaluate(
     if rebuild_image and not container:
         _fail("--rebuild-image only applies to --container targets")
 
-    if diff and as_json:
+    if diff and (as_json or as_jsonl):
         # --json is one schema, a flat array of results, and it is the future
         # MCP tool's contract; `jq 'group_by(.answers)'` covers this case.
+        # --diff can never stream anyway: the grouping needs every answer in.
         _fail("--diff renders a text summary; use --json on its own for machine-readable results")
+
+    if as_json and as_jsonl:
+        # Same records, two framings. Emitting both would put an array and
+        # bare objects on the one channel that has to stay parseable.
+        _fail("--json and --jsonl are two framings of the same records; pick one")
 
     # With an explicit target mode every positional is client relevance;
     # otherwise the first positional is the SSH host.
@@ -420,30 +470,63 @@ def evaluate(
             )
         ]
 
-    results = asyncio.run(
-        evaluate_client_relevance(
+    # --json and --diff are the whole-set views -- one array, and a grouping
+    # that only exists once every answer is in -- so they alone wait for the
+    # full fan-out. Plain text and --jsonl are both per-result framings and
+    # can emit as each target answers, so a slow SSH endpoint stops holding
+    # up the containers that already finished.
+    stream = not as_json and not diff
+    # Decided before the run rather than from len(results), so the streaming
+    # path labels its first section the same way the batch path would.
+    labelled = count_work(targets, qna_version or None) > 1
+
+    def _render_streamed(result: ClientRelevanceResult) -> str:
+        if as_jsonl:
+            # Compact and newline-free: one record per line is the whole
+            # contract a line-oriented reader depends on.
+            return json.dumps(dataclasses.asdict(result), separators=(",", ":"))
+        return _render_one_plain(result, labelled=labelled)
+
+    async def _run() -> list[ClientRelevanceResult]:
+        if not stream:
+            return await evaluate_client_relevance(
+                text,
+                targets,
+                qna_version=qna_version or None,
+                max_parallel=max_parallel,
+                pull_parallel=pull_parallel,
+                timeout_s=timeout,
+            )
+        collected: list[ClientRelevanceResult] = []
+        async for result in evaluate_client_relevance_stream(
             text,
             targets,
             qna_version=qna_version or None,
             max_parallel=max_parallel,
             pull_parallel=pull_parallel,
             timeout_s=timeout,
-        )
-    )
+        ):
+            collected.append(result)
+            line = _render_streamed(result)
+            if line:
+                typer.echo(line)
+        return collected
+
+    results = asyncio.run(_run())
 
     _summarize_failures(results)
 
     if inventory is not None and update_inventory and inventory_targets:
         _update_inventory_platforms(inventory, inventory_targets, results)
 
-    if as_json:
-        payload = json.dumps([dataclasses.asdict(r) for r in results], indent=2)
-    elif diff and results:
-        payload = _render_diff(results)
-    else:
-        payload = _render_plain(results)
-    if payload:
-        typer.echo(payload)
+    if not stream:
+        payload = (
+            json.dumps([dataclasses.asdict(r) for r in results], indent=2)
+            if as_json
+            else _render_diff(results)
+        )
+        if payload:
+            typer.echo(payload)
 
     raise typer.Exit(worst_exit_code(results) if results else EXIT_QNA)
 
