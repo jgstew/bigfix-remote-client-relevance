@@ -66,6 +66,14 @@ class FakeSSHRunner:
         return any(re.search(pattern, c) for c in self.commands())
 
 
+@pytest.fixture(autouse=True)
+def isolated_state_dir(tmp_path, monkeypatch):
+    """Keep the prereq-check cache out of the developer's real state directory."""
+    import platformdirs
+
+    monkeypatch.setattr(platformdirs, "user_state_dir", lambda *a, **k: str(tmp_path / "state"))
+
+
 def make_transport(runner: FakeSSHRunner, **kwargs) -> TransportSSH:
     async def factory() -> FakeSSHRunner:
         return runner
@@ -76,6 +84,10 @@ def make_transport(runner: FakeSSHRunner, **kwargs) -> TransportSSH:
 
 def qna_ok(text: str = "A: Ubuntu\nI: singular string\nT: 0.1 ms\n"):
     return (text, "", 0)
+
+
+# A target that reports all deb-family extraction tools present.
+PREREQS_OK = (r"prereq-probe", ("dpkg-deb ar tar", "", 0))
 
 
 # --- evaluation against an already-installed qna ---------------------------
@@ -247,6 +259,7 @@ async def test_absent_marker_pushes_then_extracts(resolved):
     runner = FakeSSHRunner(
         responses=[
             (r"bfrcr-complete", ("", "", 1)),  # marker absent
+            PREREQS_OK,
             (r"-showtypes", qna_ok()),
         ]
     )
@@ -258,17 +271,19 @@ async def test_absent_marker_pushes_then_extracts(resolved):
     assert local == resolved.artifact_path
     assert "11.0.6.137" in remote
 
+    # Match the extraction command specifically: the prereq probe also mentions
+    # dpkg-deb, so a loose substring match would find the wrong command.
     commands = runner.commands()
-    push_index = next(i for i, c in enumerate(commands) if "mkdir" in c)
-    extract_index = next(i for i, c in enumerate(commands) if "dpkg-deb" in c or "ar x" in c)
+    staging_index = next(i for i, c in enumerate(commands) if c.startswith("mkdir -p"))
+    extract_index = next(i for i, c in enumerate(commands) if "dpkg-deb -x" in c)
     marker_index = next(i for i, c in enumerate(commands) if "bfrcr-complete" in c and ">" in c)
-    assert push_index < extract_index < marker_index
+    assert staging_index < extract_index < marker_index
 
 
 async def test_extract_uses_temp_dir_then_renames(resolved):
     """A half-extracted tree must never be mistaken for a complete one."""
     runner = FakeSSHRunner(
-        responses=[(r"bfrcr-complete", ("", "", 1)), (r"-showtypes", qna_ok())]
+        responses=[(r"bfrcr-complete", ("", "", 1)), PREREQS_OK, (r"-showtypes", qna_ok())]
     )
 
     await make_transport(runner).evaluate_client_relevance("true", qna=resolved)

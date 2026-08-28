@@ -7,8 +7,10 @@ mapping) only appear when a process is actually run.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
+import shutil
 import sys
 
 import pytest
@@ -181,19 +183,65 @@ async def test_explicit_qna_path_overrides_constructor(fake_qna):
     assert result.answers == ["override"]
 
 
-async def test_resolved_qna_not_supported_until_m3(fake_qna, tmp_path):
-    """TransportLocal accepts the kwarg for protocol compliance; M3 implements it."""
-    stub = fake_qna(stdout="A: yes\n")
-    artifact = tmp_path / "QNA11.0.6.137.zip"
-    artifact.touch()
+async def test_resolved_qna_provisions_into_a_versioned_directory(tmp_path, monkeypatch):
+    """A pinned version is extracted locally under its own version directory."""
+    from bigfix_remote_client_relevance.bootstrap import provision, targets
 
-    result = await TransportLocal().evaluate_client_relevance(
-        "true",
-        qna_path=stub.path,
-        qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact),
+    monkeypatch.setattr(provision, "APP_NAME", "bfrcr-test")
+    # Keep the extracted tree inside tmp_path rather than the real /tmp.
+    spec = targets.spec_for("macos")
+    monkeypatch.setitem(
+        targets.KNOWN_TARGETS,
+        "macos",
+        dataclasses.replace(spec, cache_root=str(tmp_path / "bigfix_qna")),
     )
 
+    artifact = tmp_path / "BESAgent-11.0.6.137-BigFix_MacOS11.0.pkg"
+    artifact.write_bytes(b"not a real pkg")
+
+    result = await TransportLocal(target="macos", state_dir=tmp_path / "state").evaluate_client_relevance(
+        "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
+    )
+
+    # The stub artifact cannot actually be unpacked, so this must surface as a
+    # bootstrap failure naming the extraction step rather than crashing.
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "extract" in (result.error or "").lower()
+    assert result.qna_version == "11.0.6.137"
+
+
+async def test_resolved_qna_reuses_an_already_provisioned_tree(tmp_path, monkeypatch, fake_qna):
+    """A version already extracted locally is reused without re-extracting."""
+    from bigfix_remote_client_relevance.bootstrap import targets
+    from bigfix_remote_client_relevance.bootstrap.targets import MARKER_FILENAME
+
+    root = tmp_path / "bigfix_qna"
+    spec = targets.spec_for("ubuntu")
+    monkeypatch.setitem(
+        targets.KNOWN_TARGETS, "ubuntu", dataclasses.replace(spec, cache_root=str(root))
+    )
+
+    # Lay down a complete-looking tree with a working stub qna in it.
+    version_dir = root / "11.0.6.137"
+    qna_dir = version_dir / "opt" / "BESClient" / "bin"
+    qna_dir.mkdir(parents=True)
+    stub = fake_qna(stdout="A: Ubuntu\nI: singular string\nT: 0.1 ms\n")
+    # The stub reads its canned output from its own directory, so move the
+    # whole thing rather than just the executable.
+    shutil.copytree(stub.directory, qna_dir, dirs_exist_ok=True)
+    (qna_dir / "qna").chmod(0o755)
+    (version_dir / MARKER_FILENAME).write_text("11.0.6.137")
+
+    artifact = tmp_path / "BESAgent-11.0.6.137-ubuntu18.amd64.deb"
+    artifact.write_bytes(b"unused")
+
+    result = await TransportLocal(target="ubuntu").evaluate_client_relevance(
+        "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
+    )
+
+    assert result.error_kind is None
+    assert result.answers == ["Ubuntu"]
+    assert result.qna_version == "11.0.6.137"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")

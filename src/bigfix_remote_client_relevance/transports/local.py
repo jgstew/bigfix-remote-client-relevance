@@ -10,10 +10,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
+from bigfix_remote_client_relevance.bootstrap.provision import (
+    BootstrapFailure,
+    RunResult,
+    provision_qna,
+)
+from bigfix_remote_client_relevance.bootstrap.targets import spec_for
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
@@ -48,6 +56,35 @@ def normalize_stdin_payload(client_relevance: str) -> str:
     return payload
 
 
+class LocalRunner:
+    """Runs provisioning commands on this machine.
+
+    Satisfies the same :class:`~...bootstrap.provision.CommandRunner` protocol
+    the SSH and container transports use, so all three share one provisioning
+    sequence. "Delivering" a file here is just a copy.
+    """
+
+    async def run(
+        self, command: str, *, input: str | None = None, timeout: float | None = None
+    ) -> RunResult:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        payload = input.encode("utf-8") if input else None
+        stdout, stderr = await asyncio.wait_for(process.communicate(payload), timeout=timeout)
+        return (
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+            process.returncode or 0,
+        )
+
+    async def put_file(self, local: Path, remote: str) -> None:
+        await asyncio.to_thread(shutil.copy, local, remote)
+
+
 class TransportLocal:
     """Runs qna as a subprocess on the controller itself.
 
@@ -61,10 +98,25 @@ class TransportLocal:
         *,
         candidates: Sequence[str] | None = None,
         require_root_on_macos: bool = True,
+        target: str | None = None,
+        state_dir: Path | None = None,
+        recheck_prereqs: bool = False,
     ) -> None:
         self._qna_path = qna_path
         self._candidates = candidates
         self._require_root_on_macos = require_root_on_macos
+        self._target = target
+        self._state_dir = state_dir
+        self._recheck_prereqs = recheck_prereqs
+
+    def _local_target(self) -> str:
+        if self._target is not None:
+            return self._target
+        if sys.platform == "darwin":
+            return "macos"
+        if sys.platform.startswith("win"):
+            return "windows"
+        return "ubuntu"
 
     async def evaluate_client_relevance(
         self,
@@ -81,23 +133,29 @@ class TransportLocal:
                 "host": TRANSPORT_NAME,
                 "transport": TRANSPORT_NAME,
                 "client_relevance": client_relevance,
+                "qna_version": qna.version if qna else None,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
             base.update(overrides)
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
-        if qna is not None:
-            # Provisioning a pinned version locally arrives with the bootstrap
-            # extract phase in M3; until then, say so plainly.
-            return _result(
-                error="provisioning a pinned qna version is not implemented for the "
-                "local transport yet",
-                error_kind=ERROR_KIND_BOOTSTRAP,
-            )
-
         root_problem = self._macos_root_problem()
         if root_problem is not None:
             return _result(error=root_problem, error_kind=ERROR_KIND_BOOTSTRAP)
+
+        if qna is not None:
+            try:
+                qna_path = await provision_qna(
+                    LocalRunner(),
+                    spec_for(self._local_target()),
+                    qna,
+                    host_label="local",
+                    state_dir=self._state_dir,
+                    recheck_prereqs=self._recheck_prereqs,
+                    timeout_s=max(timeout_s, 300.0),
+                )
+            except BootstrapFailure as exc:
+                return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
 
         resolved_path = qna_path or self._qna_path or find_qna_path(self._candidates)
         if resolved_path is None:
