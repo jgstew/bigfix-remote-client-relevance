@@ -80,6 +80,21 @@ FAMILY_SANITY_COMMAND = (
 
 _SPEC_FAMILIES = {"ubuntu": "deb", "debian": "deb", "rhel": "rpm", "suse": "rpm"}
 
+# Where the extracted tree is staged, read-only, while the prepared image is
+# built; distinct from QNA_MOUNT so a build-in-progress container never
+# confuses the two.
+_BUILD_STAGING_MOUNT = "/opt/.bfrcr_qna_src"
+
+
+def prepared_image_tag(base_digest: str, version: str, arch: str) -> str:
+    """Tag for the image holding ``version`` baked into ``base_digest``.
+
+    Keyed on the base image's own content digest, not its tag name, so a
+    moving tag like ``ubuntu:latest`` invalidates the cache on its own.
+    """
+    short_digest = base_digest.rpartition(":")[2][:12]
+    return f"bfrcr/prepared:{short_digest}-{version}-{arch}"
+
 
 def _platform_parts(platform: str | None) -> tuple[str, str] | None:
     """``"linux/amd64"`` -> ``("linux", "amd64")``, else ``None``."""
@@ -137,6 +152,12 @@ class ContainerEngine(Protocol):
     ) -> RunResult: ...
 
     async def stop(self, container_id: str) -> None: ...
+
+    async def image_digest(self, image: str) -> str: ...
+
+    async def image_exists(self, image: str) -> bool: ...
+
+    async def commit(self, container_id: str, tag: str) -> None: ...
 
 
 def candidate_docker_sockets() -> list[str]:
@@ -310,6 +331,35 @@ class DockerEngine:
         except ContainerEngineError:
             logger.warning("could not remove container %s", container_id)
 
+    async def image_digest(self, image: str) -> str:
+        def _digest() -> str:
+            client = self._get_client()
+            return str(client.images.get(image).id)  # type: ignore[attr-defined]
+
+        return await self._guard(_digest)
+
+    async def image_exists(self, image: str) -> bool:
+        def _exists() -> bool:
+            import docker.errors
+
+            client = self._get_client()
+            try:
+                client.images.get(image)  # type: ignore[attr-defined]
+            except docker.errors.ImageNotFound:
+                return False
+            return True
+
+        return await self._guard(_exists)
+
+    async def commit(self, container_id: str, tag: str) -> None:
+        def _commit() -> None:
+            client = self._get_client()
+            container = client.containers.get(container_id)  # type: ignore[attr-defined]
+            repository, _sep, tag_name = tag.partition(":")
+            container.commit(repository=repository, tag=tag_name or "latest")
+
+        await self._guard(_commit)
+
     @staticmethod
     async def _guard(fn: Callable[[], T]) -> T:
         """Run a blocking SDK call off the event loop, normalizing its errors."""
@@ -346,6 +396,7 @@ class TransportContainer:
         keep_alive: bool = False,
         target: str | None = None,
         extractor: Extractor | None = None,
+        rebuild_image: bool = False,
     ) -> None:
         self.image = image
         self.arch = arch
@@ -354,6 +405,7 @@ class TransportContainer:
         self._target = target
         self._probed: str | None = None
         self._extractor = extractor or ensure_extracted
+        self._rebuild_image = rebuild_image
         self._container_id: str | None = None
 
     @property
@@ -417,6 +469,7 @@ class TransportContainer:
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
         mounts: dict[str, str] = {}
+        image_to_run = self.image
 
         transient_container: str | None = None
         try:
@@ -430,8 +483,7 @@ class TransportContainer:
                 spec = spec_for(self._target or "ubuntu")
 
             if qna is not None:
-                tree = await self._extractor(qna)
-                mounts[str(tree)] = f"{QNA_MOUNT}:ro"
+                image_to_run, mounts = await self._prepare_qna_image(qna, timeout_s=timeout_s)
                 qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
 
             # A probed platform came from the image itself; only a
@@ -443,7 +495,7 @@ class TransportContainer:
             needs_container = self._keep_alive or needs_sanity
 
             if needs_container:
-                container_id = await self._acquire_container(mounts)
+                container_id = await self._acquire_container(mounts, image=image_to_run)
                 if not self._keep_alive:
                     transient_container = container_id
                 if needs_sanity:
@@ -456,7 +508,7 @@ class TransportContainer:
                 )
             else:
                 stdout, stderr, exit_code = await self._engine.run_one_shot(
-                    self.image,
+                    image_to_run,
                     self._eval_command(spec, qna_path),
                     input=normalize_stdin_payload(client_relevance),
                     mounts=mounts,
@@ -511,15 +563,62 @@ class TransportContainer:
                 "it to let the image be probed"
             )
 
-    async def _acquire_container(self, mounts: dict[str, str]) -> str:
+    async def _acquire_container(self, mounts: dict[str, str], *, image: str | None = None) -> str:
         if self._keep_alive and self._container_id is not None:
             return self._container_id
         container_id = await self._engine.start(
-            self.image, mounts=mounts, platform=self.platform
+            image or self.image, mounts=mounts, platform=self.platform
         )
         if self._keep_alive:
             self._container_id = container_id
         return container_id
+
+    async def _prepare_qna_image(
+        self, qna: ResolvedQna, *, timeout_s: float
+    ) -> tuple[str, dict[str, str]]:
+        """Return ``(image, mounts)`` to run the eval against.
+
+        The first run against a given (base image digest, version, arch)
+        builds a derived image with the qna tree baked in and commits it;
+        later runs start that image directly, no mount and no extraction.
+        A base image without a shell to build in (e.g. distroless) falls
+        back to mounting the extracted tree, same as before this cache
+        existed.
+        """
+        digest = await self._engine.image_digest(self.image)
+        tag = prepared_image_tag(digest, qna.version, self.arch)
+        if self._rebuild_image or not await self._engine.image_exists(tag):
+            # Only pay for extraction when a build (or its fallback) needs the
+            # tree; a cache hit skips both.
+            tree = await self._extractor(qna)
+            if await self._build_prepared_image(tree, tag, timeout_s=timeout_s):
+                return tag, {}
+            return self.image, {str(tree): f"{QNA_MOUNT}:ro"}
+        return tag, {}
+
+    async def _build_prepared_image(self, tree: Path, tag: str, *, timeout_s: float) -> bool:
+        container_id = await self._engine.start(
+            self.image,
+            mounts={str(tree): f"{_BUILD_STAGING_MOUNT}:ro"},
+            platform=self.platform,
+        )
+        try:
+            _stdout, stderr, exit_code = await self._engine.exec_in(
+                container_id,
+                f"cp -a {_BUILD_STAGING_MOUNT} {QNA_MOUNT} && chmod -R a+rX {QNA_MOUNT}",
+                timeout=timeout_s,
+            )
+            if exit_code != 0:
+                logger.info(
+                    "could not build a prepared image for %s, mounting instead: %s",
+                    self.image,
+                    stderr.strip(),
+                )
+                return False
+            await self._engine.commit(container_id, tag)
+            return True
+        finally:
+            await self._engine.stop(container_id)
 
     def _eval_command(self, spec: TargetSpec, qna_path: str | None) -> str:
         # API boundary: qna's CLI vocabulary uses "relevance"; internal name

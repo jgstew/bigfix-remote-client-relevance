@@ -141,6 +141,13 @@ def evaluate(
         Path | None,
         typer.Option("--inventory", help="Evaluate across the hosts in a hosts.toml file."),
     ] = None,
+    rebuild_image: Annotated[
+        bool,
+        typer.Option(
+            "--rebuild-image",
+            help="Force a fresh prepared container image instead of reusing a cached one.",
+        ),
+    ] = False,
     qna_version: Annotated[
         list[str] | None,
         typer.Option(
@@ -198,6 +205,9 @@ def evaluate(
     if platform is not None and platform not in KNOWN_TARGETS:
         _fail(f"unknown platform {platform!r}; known: {', '.join(sorted(KNOWN_TARGETS))}")
 
+    if rebuild_image and not container:
+        _fail("--rebuild-image only applies to --container targets")
+
     # With an explicit target mode every positional is client relevance;
     # otherwise the first positional is the SSH host.
     host: str | None = None
@@ -225,7 +235,14 @@ def evaluate(
         except InventoryError as exc:
             _fail(str(exc))
     targets.extend(
-        Target(kind="container", name=image, image=image, arch=arch, platform=platform)
+        Target(
+            kind="container",
+            name=image,
+            image=image,
+            arch=arch,
+            platform=platform,
+            rebuild_image=rebuild_image,
+        )
         for image in container
     )
     if local:

@@ -404,7 +404,6 @@ async def test_no_probe_when_no_version_is_pinned():
     assert made[0].probed == 0
 
 
-@pytest.mark.xfail(strict=True, reason="M13: Target has no rebuild_image field yet")
 def test_rebuild_image_reaches_the_transport_factory():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 

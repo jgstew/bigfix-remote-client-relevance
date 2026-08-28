@@ -79,6 +79,9 @@ class Target:
     """Per-target override of the run-wide version spec."""
 
     keep_alive: bool = False
+    rebuild_image: bool = False
+    """Container only. Force a fresh prepared image instead of reusing a cached one."""
+
     verify_host_key: bool = True
     """SSH only. Off removes protection against interception; lab hosts only."""
 
@@ -119,6 +122,7 @@ def default_transport_factory(target: Target) -> Transport:
             arch=target.arch,
             keep_alive=target.keep_alive,
             target=target.platform,
+            rebuild_image=target.rebuild_image,
         )
     if target.kind == "fastquery":
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery

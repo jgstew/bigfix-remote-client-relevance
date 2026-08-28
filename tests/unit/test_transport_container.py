@@ -419,15 +419,16 @@ async def test_inconclusive_sanity_output_does_not_block(resolved, extracted):
 
 
 async def test_sanity_check_container_is_stopped_afterward(resolved, extracted):
-    """The sanity check is the only reason a non-keep-alive run starts a container."""
+    """The sanity check needs its own transient container, stopped afterward."""
     engine = FakeEngine(responses=[SANITY_DEB_ONLY, EVAL_OK])
 
     await TransportContainer(
         "ubuntu:22.04", engine=engine, target="ubuntu", extractor=extracted
     ).evaluate_client_relevance("true", qna=resolved)
 
-    assert len(engine.started) == 1
-    assert len(engine.stopped) == 1
+    # One container to build the prepared image, one for the sanity check.
+    assert len(engine.started) == 2
+    assert len(engine.stopped) == 2
 
 
 async def test_probed_platform_skips_the_sanity_check(resolved, extracted):
@@ -440,7 +441,7 @@ async def test_probed_platform_skips_the_sanity_check(resolved, extracted):
 
     assert result.error_kind is None
     assert not any("command -v dpkg" in c for c in engine.commands())
-    assert engine.started == [], "no sanity check, no keep_alive: no container needed"
+    assert len(engine.started) == 1, "only the prepared-image build needs a container here"
 
 
 # --- controller-side extraction ----------------------------------------------
@@ -466,18 +467,7 @@ def extracted(tmp_path):
     return extractor
 
 
-async def test_qna_run_mounts_the_extracted_tree_not_the_artifact(resolved, extracted):
-    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
-
-    await TransportContainer(
-        "ubuntu:22.04", engine=engine, extractor=extracted
-    ).evaluate_client_relevance("true", qna=resolved)
-
-    mounts = engine.one_shots[-1]["mounts"]
-    assert mounts == {str(extracted.tree): f"{QNA_MOUNT}:ro"}
-
-
-async def test_qna_run_needs_no_provisioning_in_the_image(resolved, extracted):
+async def test_qna_run_needs_no_extraction_tools_in_the_image(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK])
 
     await TransportContainer(
@@ -485,12 +475,11 @@ async def test_qna_run_needs_no_provisioning_in_the_image(resolved, extracted):
     ).evaluate_client_relevance("true", qna=resolved)
 
     joined = " ; ".join(engine.commands())
-    assert engine.started == [], "a probed platform needs neither provisioning nor a container"
     for absent in ("prereq-probe", "rpm2cpio", "dpkg-deb", "bfrcr-complete"):
         assert absent not in joined, f"{absent} must no longer run inside the image"
 
 
-async def test_eval_uses_the_mounted_qna(resolved, extracted):
+async def test_eval_uses_the_prepared_qna_path(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
 
     result = await TransportContainer(
@@ -501,7 +490,7 @@ async def test_eval_uses_the_mounted_qna(resolved, extracted):
     assert "/opt/bigfix_qna/opt/BESClient/bin/qna" in str(engine.one_shots[-1]["command"])
 
 
-async def test_keep_alive_starts_with_the_extracted_mount(resolved, extracted):
+async def test_keep_alive_runs_the_prepared_image_with_no_mount(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
     transport = TransportContainer(
         "ubuntu:22.04", engine=engine, keep_alive=True, extractor=extracted
@@ -509,7 +498,9 @@ async def test_keep_alive_starts_with_the_extracted_mount(resolved, extracted):
 
     await transport.evaluate_client_relevance("true", qna=resolved)
 
-    assert engine.started[0]["mounts"] == {str(extracted.tree): "/opt/bigfix_qna:ro"}
+    persistent = engine.started[-1]
+    assert persistent["image"] in engine.existing_tags
+    assert persistent["mounts"] == {}
     await transport.aclose()
 
 
@@ -548,10 +539,6 @@ async def test_provisioning_timeout_is_not_inflated(resolved, extracted):
 # already baked in; later runs against the same (image digest, version, arch)
 # start it directly, no mount, no unpack, sub-second start.
 
-_M13 = pytest.mark.xfail(strict=True, reason="M13: prepared-image cache not implemented")
-
-
-@_M13
 async def test_prepared_image_tag_scheme():
     from bigfix_remote_client_relevance.transports.container import prepared_image_tag
 
@@ -564,7 +551,6 @@ async def test_prepared_image_tag_scheme():
     assert "ab" * 32 not in tag
 
 
-@_M13
 async def test_first_qna_run_builds_a_prepared_image(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
 
@@ -574,7 +560,7 @@ async def test_first_qna_run_builds_a_prepared_image(resolved, extracted):
 
     assert len(engine.started) == 1, "the base image starts once to build the prepared image"
     build_mounts = engine.started[0]["mounts"]
-    assert list(build_mounts.values())[0].endswith(":ro")
+    assert next(iter(build_mounts.values())).endswith(":ro")
     assert any("cp -a" in c for c in engine.commands())
     assert len(engine.committed) == 1
     tag = engine.committed[0][1]
@@ -582,7 +568,6 @@ async def test_first_qna_run_builds_a_prepared_image(resolved, extracted):
     assert engine.one_shots[-1]["mounts"] == {}, "the prepared image needs no mount"
 
 
-@_M13
 async def test_second_run_skips_the_build(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, extractor=extracted)
@@ -595,7 +580,6 @@ async def test_second_run_skips_the_build(resolved, extracted):
     assert len(extracted.calls) == 1, "a cached prepared image needs no re-extraction"
 
 
-@_M13
 async def test_rebuild_image_forces_a_rebuild(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
 
@@ -609,7 +593,6 @@ async def test_rebuild_image_forces_a_rebuild(resolved, extracted):
     assert len(engine.committed) == 2
 
 
-@_M13
 async def test_base_digest_change_produces_a_different_tag(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK], digest="sha256:first")
     await TransportContainer(
@@ -625,7 +608,6 @@ async def test_base_digest_change_produces_a_different_tag(resolved, extracted):
     assert len(tags) == 2, "a moved base image must not reuse a stale prepared image"
 
 
-@_M13
 async def test_build_failure_falls_back_to_the_mount_flow(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK], cp_exit_code=1)
 

@@ -121,6 +121,26 @@ it crosses the wire once ever rather than once per run.
 Only Windows has a standalone QnA download; every other platform extracts qna
 out of the agent package without installing it.
 
+### Containers
+
+With `--container`, an unspecified platform is **probed**, not assumed — the
+image is asked what it is (the same check SSH runs), and an unrecognized
+answer fails loudly rather than silently running the wrong agent. Pass
+`--platform` to skip the probe or override it for a fleet.
+
+The qna artifact is extracted once on the controller and bind-mounted in, so
+an image needs no package manager of its own — `rpm2cpio`/`cpio` or
+`dpkg-deb`/`ar`/`tar` are never required inside a container. The first run
+against a given (image, qna version, arch) also builds a small derived image
+with the tree baked in and reuses it on every later run against the same
+combination — no mount, no extraction, sub-second start. Pass
+`--rebuild-image` to force a fresh one. These derived images are tagged
+`bfrcr/prepared:*` and are safe to remove at any time:
+
+```bash
+docker rmi $(docker images 'bfrcr/prepared:*' -q)
+```
+
 ## Requirements
 
 - Python 3.11+
