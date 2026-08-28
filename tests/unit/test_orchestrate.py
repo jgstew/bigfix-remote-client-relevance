@@ -915,10 +915,15 @@ async def test_stream_reports_a_failing_target_as_a_result_not_a_raise():
 async def test_stream_and_batch_agree_on_the_same_run():
     """Two entry points, one machinery -- they must not drift apart."""
     targets = [Target(kind="ssh", name=f"h{i}") for i in range(3)]
-    kwargs = {"transport_factory": lambda t: FakeTransport(t.name)}
 
-    batched = await evaluate_client_relevance("true", targets, **kwargs)
-    streamed = [r async for r in evaluate_client_relevance_stream("true", targets, **kwargs)]
+    def factory(target):
+        return FakeTransport(target.name)
+
+    batched = await evaluate_client_relevance("true", targets, transport_factory=factory)
+    streamed = [
+        r
+        async for r in evaluate_client_relevance_stream("true", targets, transport_factory=factory)
+    ]
 
     assert sorted(r.host for r in batched) == sorted(r.host for r in streamed)
 
