@@ -193,22 +193,37 @@ _SUSE_TOKENS = frozenset({"suse", "opensuse", "sles", "opensuse-leap", "opensuse
 _DEBIAN_TOKENS = frozenset({"debian", "raspbian"})
 
 
-def classify_uname(probe_output: str) -> str:
+def classify_uname(probe_output: str, *, strict: bool = False) -> str:
     """Turn a target probe into a :data:`KNOWN_TARGETS` key.
 
     The probe emits ``uname -s`` on the first line and, on Linux, the
     ``ID``/``ID_LIKE`` fields from ``/etc/os-release`` on the second. Windows
     has no ``uname``, so empty output means Windows.
+
+    With ``strict=True`` every guess raises :class:`UnknownTargetError`
+    instead: SSH probes an unknown box where guessing beats refusing, but a
+    container probe is fully controlled, and a wrong guess there silently
+    hands an rpm-family image the Debian agent.
     """
+
+    def _refuse(why: str) -> str:
+        if strict:
+            raise UnknownTargetError(
+                f"cannot classify target from probe output {probe_output!r} ({why}); "
+                "pass an explicit platform (e.g. --platform) from: "
+                + ", ".join(sorted(KNOWN_TARGETS))
+            )
+        return "windows" if why != "unrecognized Linux distribution" else "ubuntu"
+
     lines = [line.strip() for line in probe_output.splitlines() if line.strip()]
     if not lines:
-        return "windows"
+        return _refuse("empty probe output")
 
     kernel = lines[0].lower()
     if kernel.startswith("darwin"):
         return "macos"
     if not kernel.startswith("linux"):
-        return "windows"
+        return _refuse(f"unsupported kernel {lines[0]!r}")
 
     tokens = {token.strip().strip('"') for line in lines[1:] for token in line.lower().split()}
     if tokens & _SUSE_TOKENS:
@@ -217,9 +232,11 @@ def classify_uname(probe_output: str) -> str:
         return "rhel"
     if tokens & _DEBIAN_TOKENS and "ubuntu" not in tokens:
         return "debian"
-    # Ubuntu, and anything unrecognized: the deb family is by far the more
-    # common case, so guessing it beats refusing to proceed.
-    return "ubuntu"
+    if "ubuntu" in tokens:
+        return "ubuntu"
+    # Anything unrecognized: the deb family is by far the more common case,
+    # so (non-strict) guessing it beats refusing to proceed.
+    return _refuse("unrecognized Linux distribution")
 
 
 __all__ = [

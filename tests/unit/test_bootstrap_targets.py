@@ -155,29 +155,22 @@ def test_classify_unrecognized_linux_defaults_to_deb_family():
 # is fully controlled, so a guess would fabricate data (issue #1): strict mode
 # refuses instead.
 
-_M6 = pytest.mark.xfail(strict=True, reason="M6: strict classification not implemented")
-
-
-@_M6
 def test_strict_mode_refuses_unrecognized_linux():
     with pytest.raises(UnknownTargetError):
         classify_uname("Linux\nsomething-exotic", strict=True)
 
 
-@_M6
 def test_strict_mode_refuses_empty_probe_output():
     """Empty output means Windows over SSH, but 'probe failed' in a container."""
     with pytest.raises(UnknownTargetError):
         classify_uname("", strict=True)
 
 
-@_M6
 def test_strict_mode_refuses_a_non_linux_non_darwin_kernel():
     with pytest.raises(UnknownTargetError):
         classify_uname("FreeBSD 14", strict=True)
 
 
-@_M6
 def test_strict_mode_error_names_the_probe_and_the_fix():
     with pytest.raises(UnknownTargetError) as excinfo:
         classify_uname("Linux\nsomething-exotic", strict=True)
@@ -187,7 +180,6 @@ def test_strict_mode_error_names_the_probe_and_the_fix():
     assert "platform" in message.lower(), "error must point at the explicit-platform escape hatch"
 
 
-@_M6
 @pytest.mark.parametrize(
     ("probe", "expected"),
     [
