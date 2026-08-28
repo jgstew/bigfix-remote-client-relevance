@@ -152,6 +152,10 @@ so a brand-new endpoint needs its key trusted first. For throwaway lab hosts,
 `--insecure-skip-host-key-check` skips that at the cost of the connection's
 protection against interception.
 
+Windows endpoints need OpenSSH server and nothing else — commands are invoked
+through `powershell.exe` explicitly, so the stock `cmd.exe` default shell works
+and no registry change is required.
+
 ## Development
 
 ```bash

@@ -738,9 +738,11 @@ Discovery order matches the ported `find_qna_path()` plus `$PATH`.
   `sudo systemsetup -setremotelogin on`.
 - **Windows:**
   `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0`,
-  `Start-Service sshd; Set-Service sshd -StartupType Automatic`, open
-  TCP/22, and set the default shell to PowerShell for predictable
-  stdin/UTF-8:
+  `Start-Service sshd; Set-Service sshd -StartupType Automatic`, and open
+  TCP/22. **No shell change is needed** — Windows commands are invoked
+  through `powershell.exe` explicitly (see *Windows shell* below), so the
+  stock `cmd.exe` default shell works. Switching the default shell to
+  PowerShell is still supported and harmless:
   `New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force`.
 
 ### 3. Host key verification
@@ -772,8 +774,20 @@ answers cross an untrusted network.
   `FileIOError` before answering anything, even `TRUE`, so there is no
   partial-answer mode worth preserving. Pass
   `TransportLocal(require_root_on_macos=False)` to attempt it anyway.
-- Windows OpenSSH defaults to `cmd.exe`; switch the default shell to
-  PowerShell (step 2) for reliable UTF-8 stdin.
+- **Windows shell.** Every Windows command this package builds is PowerShell
+  (`Test-Path`, `New-Item`, `Expand-Archive`, the `&` call operator), but
+  Windows OpenSSH hands commands to `cmd.exe` unless the `DefaultShell`
+  registry value says otherwise. Rather than requiring that edit, the SSH
+  runner wraps Windows commands as
+  `powershell -NoProfile -NonInteractive -EncodedCommand <base64 UTF-16LE>`.
+  `-EncodedCommand` rather than `-Command` because the commands embed single
+  quotes and paths with spaces *and* parentheses (`C:/Program Files (x86)/…`),
+  and both `(` and `&` are cmd metacharacters — unencoded, the discovery probe
+  fails with `'C:/Program was unexpected at this time.` The wrapped source
+  also silences `$ProgressPreference`, without which PowerShell writes CLIXML
+  progress records to stderr, where the qna outcome classifier reads. SFTP
+  (the artifact push) is shell-independent and is not wrapped. Verified
+  against a real Server 2022 host whose login shell is `cmd.exe`.
 - Save client-relevance files as UTF-8, no BOM.
 - **Client relevance ≠ session relevance.** This tool is only for the
   client dialect; session relevance stays with the BigFix REST/`besapi`

@@ -47,8 +47,12 @@ class FakeSSHRunner:
         self, command: str, *, input: str | None = None, timeout: float | None = None
     ) -> tuple[str, str, int]:
         self.calls.append(RunCall(command=command, input=input))
+        # Windows commands arrive base64-encoded, so match responses against the
+        # PowerShell inside the wrapper — otherwise every pattern would have to
+        # be written against opaque base64.
+        subject = decode_ps(command) if "-EncodedCommand " in command else command
         for pattern, response in self.responses:
-            if re.search(pattern, command):
+            if re.search(pattern, subject):
                 return response
         return self.default
 
@@ -516,13 +520,11 @@ async def test_writes_nothing_to_stdout(capsys):
 # came back `'C:/Program was unexpected at this time.` So every Windows command
 # is wrapped to run through powershell.exe, leaving the login shell alone.
 
-_M14 = pytest.mark.xfail(strict=True, reason="M14: Windows commands are not wrapped for PowerShell")
-
 WINDOWS_QNA = "C:/Program Files (x86)/BigFix Enterprise/BES Client/qna.exe"
-WINDOWS_FOUND = (r"Test-Path|EncodedCommand", (f"{WINDOWS_QNA}\n", "", 0))
+WINDOWS_FOUND = (r"Test-Path", (f"{WINDOWS_QNA}\n", "", 0))
+WINDOWS_PREREQS_OK = (r"prereq-probe", ("Expand-Archive", "", 0))
 
 
-@_M14
 async def test_windows_commands_are_wrapped_for_powershell():
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
 
@@ -533,7 +535,6 @@ async def test_windows_commands_are_wrapped_for_powershell():
         assert command.startswith("powershell -NoProfile -NonInteractive -EncodedCommand ")
 
 
-@_M14
 async def test_the_wrapped_command_decodes_to_the_powershell_source():
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
 
@@ -542,7 +543,6 @@ async def test_the_wrapped_command_decodes_to_the_powershell_source():
     assert "Test-Path" in decode_ps(runner.commands()[0]), "discovery is still PowerShell inside"
 
 
-@_M14
 async def test_progress_output_is_silenced():
     """Without this PowerShell writes CLIXML progress records to stderr."""
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
@@ -552,7 +552,6 @@ async def test_progress_output_is_silenced():
     assert decode_ps(runner.commands()[0]).startswith("$ProgressPreference='SilentlyContinue';")
 
 
-@_M14
 async def test_the_encoded_payload_survives_paths_with_spaces_and_parentheses():
     """cmd chokes on ( and &; base64 of UTF-16LE removes every quoting layer."""
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
@@ -564,7 +563,6 @@ async def test_the_encoded_payload_survives_paths_with_spaces_and_parentheses():
     assert "(x86)" in eval_source
 
 
-@_M14
 async def test_discovery_finds_a_windows_qna_path():
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
 
@@ -574,14 +572,14 @@ async def test_discovery_finds_a_windows_qna_path():
     assert "EncodedCommand" in runner.commands()[0], "discovery must go through the wrapper"
 
 
-@_M14
 async def test_provisioning_commands_are_wrapped_too(tmp_path):
     """provision_qna calls runner.run itself, so the wrap must be at the runner."""
     artifact = tmp_path / "QNA11.0.6.137.zip"
     artifact.write_bytes(b"fake zip")
     runner = FakeSSHRunner(
         responses=[
-            (r"EncodedCommand", ("", "", 1)),  # marker absent
+            (r"bfrcr-complete", ("", "", 1)),  # marker absent
+            WINDOWS_PREREQS_OK,
             WINDOWS_FOUND,
         ]
     )
@@ -594,12 +592,13 @@ async def test_provisioning_commands_are_wrapped_too(tmp_path):
     assert any("Expand-Archive" in s for s in sources), "extraction must be wrapped"
 
 
-@_M14
 async def test_put_file_is_not_wrapped(tmp_path):
     """SFTP is shell-independent — it is the one Windows step that already worked."""
     artifact = tmp_path / "QNA11.0.6.137.zip"
     artifact.write_bytes(b"fake zip")
-    runner = FakeSSHRunner(responses=[(r"EncodedCommand", ("", "", 1)), WINDOWS_FOUND])
+    runner = FakeSSHRunner(
+        responses=[(r"bfrcr-complete", ("", "", 1)), WINDOWS_PREREQS_OK, WINDOWS_FOUND]
+    )
 
     await make_windows_transport(runner).evaluate_client_relevance(
         "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
@@ -610,7 +609,6 @@ async def test_put_file_is_not_wrapped(tmp_path):
         assert "EncodedCommand" not in remote
 
 
-@_M14
 async def test_become_on_windows_warns(caplog):
     runner = FakeSSHRunner(responses=[WINDOWS_FOUND])
 

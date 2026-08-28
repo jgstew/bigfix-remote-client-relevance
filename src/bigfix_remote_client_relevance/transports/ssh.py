@@ -17,6 +17,7 @@ to a host that cannot unpack it wastes the slowest step in the sequence.
 
 from __future__ import annotations
 
+import base64
 import logging
 import shlex
 import time
@@ -55,6 +56,59 @@ TRANSPORT_NAME = "ssh"
 
 class SSHConnectionError(Exception):
     """Connecting to or authenticating with the target failed."""
+
+
+def powershell_command(source: str) -> str:
+    """Wrap PowerShell so it survives whatever login shell the host uses.
+
+    Windows OpenSSH hands commands to the shell named by the ``DefaultShell``
+    registry value, which is ``cmd.exe`` unless someone changed it — and every
+    Windows command this package builds is PowerShell. Rather than requiring
+    that registry edit, invoke ``powershell.exe`` explicitly.
+
+    ``-EncodedCommand`` rather than ``-Command`` because the commands embed
+    single quotes and paths with spaces *and* parentheses (``C:/Program Files
+    (x86)/...``); ``(`` and ``&`` are cmd metacharacters, so an unencoded
+    command fails with ``'C:/Program was unexpected at this time.`` Base64
+    leaves cmd nothing to misparse.
+
+    ``$ProgressPreference`` is silenced because PowerShell otherwise writes
+    CLIXML progress records to stderr, which the qna outcome classifier reads.
+
+    The encoding inflates by roughly 2.7x against cmd's ~8191 character limit,
+    so sources beyond ~3000 characters would truncate. Everything built here is
+    short, and the client relevance itself travels on stdin, not the command line.
+    """
+    payload = f"$ProgressPreference='SilentlyContinue'; {source}"
+    encoded = base64.b64encode(payload.encode("utf-16-le")).decode("ascii")
+    return f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+
+
+class _PowerShellRunner:
+    """Runs every command through powershell.exe, leaving the login shell alone.
+
+    Wrapping at the runner rather than at each call site is what makes this
+    reach provisioning too: :func:`provision_qna` is handed a runner and calls
+    ``run`` itself, so a wrapper applied inside the transport would miss it.
+    """
+
+    def __init__(self, inner: SSHRunner) -> None:
+        self._inner = inner
+
+    async def run(
+        self, command: str, *, input: str | None = None, timeout: float | None = None
+    ) -> RunResult:
+        logger.debug("windows command: %s", command)
+        return await self._inner.run(
+            powershell_command(command), input=input, timeout=timeout
+        )
+
+    async def put_file(self, local: Path, remote: str) -> None:
+        # SFTP is shell-independent, so this needs no wrapping.
+        await self._inner.put_file(local, remote)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 class SSHRunner(Protocol):
@@ -230,6 +284,17 @@ class TransportSSH:
             runner = await self._connection()
             spec = await self._resolve_spec(runner, timeout_s)
 
+            if spec.family == "windows":
+                # The probe above is POSIX on purpose; everything after it is
+                # PowerShell, so it goes through powershell.exe explicitly.
+                runner = _PowerShellRunner(runner)
+                if self._become:
+                    logger.warning(
+                        "--become has no effect on %s: elevation over SSH is a "
+                        "Windows-side configuration, not a sudo call",
+                        self.host,
+                    )
+
             if qna is not None:
                 qna_path = await provision_qna(
                     runner,
@@ -312,8 +377,17 @@ class TransportSSH:
             )
             probe = f"{tests} command -v qna 2>/dev/null || true"
 
-        stdout, _stderr, _code = await runner.run(probe, timeout=timeout_s)
+        stdout, stderr, code = await runner.run(probe, timeout=timeout_s)
         found = stdout.strip().splitlines()
+        if not found and stderr.strip():
+            # Without this a shell-level failure (the wrong interpreter, a
+            # missing binary) surfaces only as "no qna binary found".
+            logger.debug(
+                "qna discovery on %s produced no candidates (exit %d): %s",
+                self.host,
+                code,
+                stderr.strip(),
+            )
         return found[0].strip() if found and found[0].strip() else None
 
     # -- evaluation ---------------------------------------------------------

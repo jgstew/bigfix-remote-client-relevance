@@ -155,11 +155,17 @@ async def check_prereqs(
         except (OSError, ValueError):
             pass  # unreadable cache just means re-probing
 
-    stdout, _stderr, _code = await runner.run(prereq_probe_command(spec), timeout=timeout_s)
+    stdout, stderr, code = await runner.run(prereq_probe_command(spec), timeout=timeout_s)
     present = set(stdout.split())
     missing = [p for p in spec.prereqs if p.tool not in present]
 
     if missing and not _satisfied_by_alternatives(spec, present):
+        if stderr.strip():
+            # A probe that could not run at all reports every tool as missing,
+            # which reads as "install these" when the real fault is the shell.
+            logger.debug(
+                "prereq probe on %s failed (exit %d): %s", host_label, code, stderr.strip()
+            )
         names = ", ".join(p.tool for p in missing)
         hints = "; ".join(f"{p.tool}: {p.install_hint}" for p in missing)
         raise BootstrapFailure(
