@@ -104,6 +104,29 @@ def test_an_unmapped_deb_soname_has_no_package():
     assert package_for_soname("libfoo.so.9", family="deb", manager="apt-get") is None
 
 
+def test_dbus_maps_to_the_suse_specific_package_under_zypper():
+    """SUSE's own naming differs from the RHEL/Fedora-confirmed "rpm" rows --
+    zypper's own package for this soname is libdbus-1-3, not dbus-libs.
+    Confirmed live against opensuse/leap:15: the "rpm" family's dbus-libs
+    does not exist there and fails loudly ("No provider of 'dbus-libs'
+    found"), while libdbus-1-3 installs cleanly."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_for_soname
+
+    # family is still the coarse "rpm" bucket -- manager="zypper" alone must
+    # be enough to prefer the SUSE-specific row over it.
+    assert package_for_soname("libdbus-1.so.3", family="rpm", manager="zypper") == "libdbus-1-3"
+
+
+def test_an_unmapped_suse_soname_falls_back_to_the_provides_name():
+    """zypper resolves rpm virtual Provides too, confirmed live: `zypper install
+    'libdbus-1.so.3()(64bit)'` correctly resolved and installed libdbus-1-3."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_for_soname
+
+    package = package_for_soname("libfoo.so.9", family="rpm", manager="zypper")
+
+    assert package == "libfoo.so.9()(64bit)"
+
+
 def test_the_provides_name_is_shell_quoted():
     """Bare parentheses would be shell metacharacters."""
     from bigfix_remote_client_relevance.transports.container_libs import (

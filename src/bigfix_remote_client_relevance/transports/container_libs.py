@@ -53,7 +53,7 @@ _MANAGER_PRIORITY = ("dnf", "microdnf", "yum", "apt-get", "zypper", "apk")
 # wrong answer, so adding one is cheap and low-risk.
 PACKAGE_FOR_SONAME: dict[str, dict[str, str]] = {
     "rpm": {
-        "libdbus-1.so.3": "dbus-libs",  # confirmed
+        "libdbus-1.so.3": "dbus-libs",  # confirmed on rockylinux:9/amazonlinux:2023 (dnf/yum)
         "libstdc++.so.6": "libstdc++",
         "libgcc_s.so.1": "libgcc",
         "libz.so.1": "zlib",
@@ -61,6 +61,14 @@ PACKAGE_FOR_SONAME: dict[str, dict[str, str]] = {
         "libnsl.so.1": "libnsl",
         "libuuid.so.1": "libuuid",
         "libselinux.so.1": "libselinux",
+    },
+    # SUSE is rpm-format but not dnf/yum-family naming: its own package for
+    # this soname is "libdbus-1-3", not "dbus-libs" -- confirmed live against
+    # opensuse/leap:15, where "dbus-libs" doesn't exist at all ("No provider
+    # of 'dbus-libs' found"). Checked ahead of the generic "rpm" table for any
+    # zypper manager, so SUSE never silently gets the RHEL/Fedora answer.
+    "suse": {
+        "libdbus-1.so.3": "libdbus-1-3",  # confirmed
     },
     "deb": {
         "libdbus-1.so.3": "libdbus-1-3",  # confirmed
@@ -74,6 +82,13 @@ PACKAGE_FOR_SONAME: dict[str, dict[str, str]] = {
 }
 
 _RPM_MANAGERS = frozenset({"dnf", "microdnf", "yum"})
+# zypper packages are real rpms too and understand the same virtual Provides
+# capability string ("libfoo.so.N()(64bit)") dnf/yum resolve directly --
+# confirmed live: `zypper install 'libdbus-1.so.3()(64bit)'` correctly
+# resolved and installed libdbus-1-3. It gets its own set rather than joining
+# _RPM_MANAGERS because the "suse" table lookup above must run first, ahead
+# of the RHEL/Fedora-only "rpm" table.
+_ZYPPER_MANAGERS = frozenset({"zypper"})
 
 
 def package_manager_from(probe_output: str) -> str | None:
@@ -92,11 +107,23 @@ def package_for_soname(soname: str, *, family: str | None, manager: str) -> str 
     rpm managers can resolve one directly and need no table entry. dpkg has no
     offline equivalent — ``apt-file`` would need its own install and index
     download — so an unmapped soname there is reported rather than guessed at.
+
+    ``manager`` alone decides the SUSE case, ahead of ``family``: SUSE is
+    still the coarse "rpm" family for extraction-tool purposes (it really is
+    rpm-format), but zypper is unique to SUSE among supported managers, and
+    its own package names differ from the RHEL/Fedora ones the "rpm" table
+    was confirmed against. Checking it first means a SUSE target can never
+    silently get a RHEL answer just because both share one family bucket.
     """
-    mapped = PACKAGE_FOR_SONAME.get(family or "", {}).get(soname)
-    if mapped is not None:
-        return mapped
-    if manager in _RPM_MANAGERS:
+    if manager in _ZYPPER_MANAGERS:
+        mapped = PACKAGE_FOR_SONAME.get("suse", {}).get(soname)
+        if mapped is not None:
+            return mapped
+    else:
+        mapped = PACKAGE_FOR_SONAME.get(family or "", {}).get(soname)
+        if mapped is not None:
+            return mapped
+    if manager in _RPM_MANAGERS or manager in _ZYPPER_MANAGERS:
         return f"{soname}()(64bit)"
     return None
 
