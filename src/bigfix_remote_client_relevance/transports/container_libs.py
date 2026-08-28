@@ -29,7 +29,8 @@ def missing_shared_library(stderr: str) -> str | None:
     'GLIBC_2.34' not found``: those are genuine incompatibilities between the
     binary and the image, and installing a package will not fix them.
     """
-    raise NotImplementedError
+    match = _SHARED_LIB_RE.search(stderr)
+    return match.group("soname") if match else None
 
 
 __all__ = ["missing_shared_library"]

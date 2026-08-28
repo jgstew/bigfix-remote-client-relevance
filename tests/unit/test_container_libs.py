@@ -8,13 +8,7 @@ the real message captured from that image.
 
 from __future__ import annotations
 
-import pytest
-
 from bigfix_remote_client_relevance.transports.container_libs import missing_shared_library
-
-pytestmark = pytest.mark.xfail(
-    strict=True, reason="M15: shared-library detection not implemented"
-)
 
 ROCKY_STDERR = (
     "/opt/bigfix_qna/opt/BESClient/bin/qna: error while loading shared libraries: "

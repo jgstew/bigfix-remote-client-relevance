@@ -538,15 +538,12 @@ async def test_provisioning_timeout_is_not_inflated(resolved, extracted):
 # missing-binary heuristic matches — so a present-but-unlinkable qna on
 # rockylinux:9 was reported as "no qna in image". Captured from that image.
 
-_M15 = pytest.mark.xfail(strict=True, reason="M15: link failures read as a missing binary")
-
 ROCKY_LINK_FAILURE = (
     "/opt/bigfix_qna/opt/BESClient/bin/qna: error while loading shared libraries: "
     "libdbus-1.so.3: cannot open shared object file: No such file or directory"
 )
 
 
-@_M15
 async def test_an_unlinkable_qna_is_not_reported_as_missing():
     engine = FakeEngine(responses=[(r"-showtypes", ("", ROCKY_LINK_FAILURE, 127))])
 
@@ -558,7 +555,6 @@ async def test_an_unlinkable_qna_is_not_reported_as_missing():
     assert "libdbus-1.so.3" in (result.error or ""), "the error must name the library"
 
 
-@_M15
 async def test_a_link_failure_says_what_to_do_about_it():
     engine = FakeEngine(responses=[(r"-showtypes", ("", ROCKY_LINK_FAILURE, 127))])
 

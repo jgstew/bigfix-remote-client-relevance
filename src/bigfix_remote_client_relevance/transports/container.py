@@ -45,6 +45,7 @@ from bigfix_remote_client_relevance.results import (
     ResolvedQna,
     parse_qna_output,
 )
+from bigfix_remote_client_relevance.transports.container_libs import missing_shared_library
 from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
@@ -531,8 +532,18 @@ class TransportContainer:
         parsed = parse_qna_output(stdout)
         error, error_kind = classify_qna_outcome(parsed, exit_code, stderr)
 
+        # qna is there but the image lacks something it links against.
+        soname = missing_shared_library(stderr)
+        if error_kind is not None and soname is not None:
+            error_kind = ERROR_KIND_BOOTSTRAP
+            error = (
+                f"qna cannot start in image {self.image}: missing shared library "
+                f"{soname}; install the package providing it in the image "
+                f"({stderr.strip()})"
+            )
+
         # A missing binary is a provisioning problem, not a qna crash.
-        if error_kind is not None and _looks_like_missing_qna(exit_code, stderr):
+        elif error_kind is not None and _looks_like_missing_qna(exit_code, stderr):
             error_kind = ERROR_KIND_BOOTSTRAP
             error = (
                 f"no qna in image {self.image}; pass a qna version to provision one "
@@ -633,6 +644,11 @@ class TransportContainer:
 
 
 def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
+    # A binary that cannot link exits 127 too, and the linker's message ends in
+    # "No such file or directory" — so that case is ruled out first, or every
+    # missing shared library would be reported as a missing binary.
+    if missing_shared_library(stderr) is not None:
+        return False
     lowered = stderr.lower()
     return exit_code in (126, 127) or "not found" in lowered or "no such file" in lowered
 
