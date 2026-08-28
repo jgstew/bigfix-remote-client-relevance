@@ -65,7 +65,13 @@ class FakeEngine:
         timeout: float | None = None,
     ) -> tuple[str, str, int]:
         self.one_shots.append(
-            {"image": image, "command": command, "input": input, "mounts": mounts or {}}
+            {
+                "image": image,
+                "command": command,
+                "input": input,
+                "mounts": mounts or {},
+                "timeout": timeout,
+            }
         )
         return self._answer(command)
 
@@ -489,6 +495,168 @@ async def test_probed_platform_skips_the_sanity_check(resolved):
 
     assert result.error_kind is None
     assert not any("command -v dpkg" in c for c in engine.commands())
+
+
+# --- controller-side extraction ----------------------------------------------
+#
+# Issue #1: unpacking inside the target made dpkg-deb/ar+tar or rpm2cpio+cpio a
+# prerequisite of every image. The engine is local, so the artifact is unpacked
+# on the controller and the resulting tree bind-mounted read-only instead.
+
+_M12 = pytest.mark.xfail(strict=True, reason="M12: controller-side mount not implemented")
+
+
+@pytest.fixture
+def extracted(tmp_path):
+    """A stand-in for a controller-side extracted tree, plus a call counter."""
+    tree = tmp_path / "extracted" / "11.0.6.137" / "ubuntu-x86_64"
+    (tree / "opt" / "BESClient" / "bin").mkdir(parents=True)
+    (tree / "opt" / "BESClient" / "bin" / "qna").write_text("#!/bin/sh\n")
+    calls: list[object] = []
+
+    async def extractor(qna):
+        calls.append(qna)
+        return tree
+
+    extractor.tree = tree
+    extractor.calls = calls
+    return extractor
+
+
+@_M12
+async def test_qna_run_mounts_the_extracted_tree_not_the_artifact(resolved, extracted):
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu", extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    mounts = engine.one_shots[0]["mounts"]
+    assert mounts == {str(extracted.tree): "/opt/bigfix_qna:ro"}
+    assert ARTIFACT_MOUNT not in " ".join(mounts.values())
+
+
+@_M12
+async def test_qna_run_needs_no_provisioning_in_the_image(resolved, extracted):
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer(
+        "rockylinux:9", engine=engine, target="rhel", extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    joined = " ; ".join(engine.commands())
+    assert engine.started == [], "a provisioned run is now a single one-shot"
+    for absent in ("prereq-probe", "rpm2cpio", "dpkg-deb", "bfrcr-complete"):
+        assert absent not in joined, f"{absent} must no longer run inside the image"
+
+
+@_M12
+async def test_eval_uses_the_mounted_qna(resolved, extracted):
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu", extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.qna_path == "/opt/bigfix_qna/opt/BESClient/bin/qna"
+    assert "/opt/bigfix_qna/opt/BESClient/bin/qna" in str(engine.one_shots[0]["command"])
+
+
+@_M12
+async def test_keep_alive_starts_with_the_extracted_mount(resolved, extracted):
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu", keep_alive=True, extractor=extracted
+    )
+
+    await transport.evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.started[0]["mounts"] == {str(extracted.tree): "/opt/bigfix_qna:ro"}
+    await transport.aclose()
+
+
+@_M12
+async def test_extraction_failure_reports_bootstrap_and_starts_nothing(resolved):
+    from bigfix_remote_client_relevance.bootstrap.extract_local import LocalExtractionError
+
+    async def failing_extractor(qna):
+        raise LocalExtractionError("could not extract fixture.deb: bad magic")
+
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu", extractor=failing_extractor
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "extract" in (result.error or "")
+    assert engine.started == [] and engine.one_shots == []
+
+
+@_M12
+async def test_provisioning_timeout_is_not_inflated(resolved, extracted):
+    """The 300s floor covered an in-image unpack that no longer happens."""
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu", extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved, timeout_s=12.0)
+
+    assert engine.one_shots[0]["timeout"] == 12.0
+
+
+# --- image architecture ------------------------------------------------------
+
+
+@dataclass
+class FakeImage:
+    attrs: dict[str, object]
+
+
+class FakeDockerClient:
+    """Just enough of the docker SDK to drive ensure_image."""
+
+    def __init__(self, existing: FakeImage | None = None) -> None:
+        self.images = self
+        self.existing = existing
+        self.pulled: list[dict[str, object]] = []
+
+    def get(self, image: str) -> FakeImage:
+        import docker.errors
+
+        if self.existing is None:
+            raise docker.errors.ImageNotFound(image)
+        return self.existing
+
+    def pull(self, image: str, platform: str | None = None) -> None:
+        self.pulled.append({"image": image, "platform": platform})
+
+    def ping(self) -> bool:
+        return True
+
+
+def engine_with(client: FakeDockerClient):
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    return DockerEngine(client=client)
+
+
+@pytest.mark.xfail(strict=True, reason="M12: ensure_image ignores platform — issue #1")
+async def test_ensure_image_repulls_on_architecture_mismatch():
+    """A cached arm64 image satisfies images.get, then creation 404s on amd64."""
+    client = FakeDockerClient(FakeImage(attrs={"Architecture": "arm64", "Os": "linux"}))
+
+    await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/amd64"}]
+
+
+async def test_ensure_image_does_not_pull_when_the_architecture_matches():
+    client = FakeDockerClient(FakeImage(attrs={"Architecture": "amd64", "Os": "linux"}))
+
+    await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled == []
 
 
 # --- keep-alive ------------------------------------------------------------
