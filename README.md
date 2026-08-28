@@ -167,9 +167,11 @@ summary — for machine consumption use `--json` on its own.
 ### Containers
 
 With `--container`, an unspecified platform is **probed**, not assumed — the
-image is asked what it is (the same check SSH runs), and an unrecognized
-answer fails loudly rather than silently running the wrong agent. Pass
-`--platform` to skip the probe or override it for a fleet.
+image is asked what it is (the same check SSH runs, including over
+`--inventory`, and for the same reason: a wrong guess silently hands the box
+a `.deb` or an `.rpm` it can't extract), and an unrecognized answer fails
+loudly rather than silently running the wrong agent. Pass `--platform` to
+skip the probe or override it for a fleet.
 
 The qna artifact is extracted once on the controller and bind-mounted in, so
 an image needs no package manager of its own — `rpm2cpio`/`cpio` or

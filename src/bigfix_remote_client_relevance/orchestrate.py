@@ -165,8 +165,11 @@ async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
     )
     from bigfix_remote_client_relevance.bootstrap.targets import spec_for
 
-    # Containers always arrive here with platform set (probed in _one); the
-    # "ubuntu" fallback remains for SSH, which keeps its guessing behavior.
+    # Containers and SSH both now expose resolve_platform, so _one() probes
+    # either before it ever reaches here -- target.platform is never None for
+    # them in the normal fan-out. "ubuntu" is a defensive fallback for
+    # `local` (no comparable probe exists) and for a resolver called
+    # directly, bypassing _one()'s probe step.
     platform_key = target.platform or ("macos" if target.kind == "local" else "ubuntu")
     release_platform = spec_for(platform_key).release_platform
 
