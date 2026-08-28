@@ -33,6 +33,16 @@ def qna_output():
     return _load
 
 
+@pytest.fixture
+def release_site_fixture():
+    """Load a captured support.bigfix.com page from tests/fixtures/release_site/."""
+
+    def _load(name: str) -> str:
+        return (FIXTURES / "release_site" / name).read_text(encoding="utf-8")
+
+    return _load
+
+
 # --- fake qna binaries -----------------------------------------------------
 
 # A real executable is used rather than a mocked subprocess: the failure modes

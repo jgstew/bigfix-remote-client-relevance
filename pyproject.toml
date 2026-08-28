@@ -26,7 +26,10 @@ classifiers = [
 ]
 dependencies = [
   "asyncssh>=2.14",
+  "beautifulsoup4>=4.12",
   "docker>=7.0",
+  "platformdirs>=4",
+  "requests>=2.31",
   "typer>=0.12",
 ]
 
