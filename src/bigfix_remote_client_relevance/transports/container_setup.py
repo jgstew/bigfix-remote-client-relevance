@@ -35,7 +35,8 @@ def _run_docker(argv: list[str], timeout: float) -> subprocess.CompletedProcess[
     docker = shutil.which("docker")
     if docker is None:
         raise FileNotFoundError("docker")
-    return subprocess.run(  # noqa: S603 - fixed argv, no shell
+    # Fixed argv, no shell: nothing here interpolates user input.
+    return subprocess.run(
         [docker, *argv],
         capture_output=True,
         text=True,
