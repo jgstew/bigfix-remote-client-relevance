@@ -415,6 +415,15 @@ def test_rebuild_image_reaches_the_transport_factory():
     assert transport._rebuild_image is True
 
 
+def test_become_reaches_the_local_transport():
+    """`become` was plumbed for ssh only; local dropped it on the floor."""
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    transport = default_transport_factory(Target(kind="local", name="local", become=True))
+
+    assert transport._become is True
+
+
 # --- two budgets: image work and evaluation ------------------------------------
 #
 # One semaphore throttled everything, but pulls and evaluations have very

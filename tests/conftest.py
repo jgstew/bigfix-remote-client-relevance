@@ -132,6 +132,78 @@ def fake_qna(tmp_path):
     return _make
 
 
+# --- fake sudo -------------------------------------------------------------
+
+# Real sudo cannot run here: it would prompt, or be absent on a CI runner. A
+# stub on PATH proves what argv assertions cannot -- that the relevance
+# expression still reaches qna's stdin *through* the extra exec.
+_FAKE_SUDO_SCRIPT = '''#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+here = pathlib.Path(__file__).resolve().parent
+(here / "argv.txt").write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+
+deny = here / "deny.bin"
+if deny.exists():
+    sys.stderr.buffer.write(deny.read_bytes())
+    sys.stderr.buffer.flush()
+    sys.exit(1)
+
+# Drop sudo's own options; what remains is the command real sudo would run.
+rest = list(sys.argv[1:])
+while rest and rest[0].startswith("-"):
+    rest.pop(0)
+if not rest:
+    sys.stderr.write("sudo: no command specified\\n")
+    sys.exit(1)
+# execv, not a subprocess: the command must inherit this process's stdin pipe.
+os.execv(rest[0], rest)
+'''
+
+
+@dataclass
+class FakeSudo:
+    """A stub sudo on PATH plus the record of how it was invoked."""
+
+    directory: Path
+
+    @property
+    def argv(self) -> list[str]:
+        text = (self.directory / "argv.txt").read_text(encoding="utf-8")
+        return text.split("\n") if text else []
+
+    @property
+    def was_invoked(self) -> bool:
+        return (self.directory / "argv.txt").exists()
+
+
+@pytest.fixture
+def fake_sudo(tmp_path, monkeypatch):
+    """Factory for a stub ``sudo`` at the front of PATH.
+
+    The default passes the command through so a `fake_qna` behind it still
+    runs; ``deny`` makes it refuse the way `sudo -n` does without a usable
+    credential -- stderr, exit 1, and the command never executed.
+    """
+    counter = itertools.count()
+
+    def _make(*, deny: str | None = None) -> FakeSudo:
+        directory = tmp_path / f"fake_sudo_{next(counter)}"
+        directory.mkdir()
+        if deny is not None:
+            (directory / "deny.bin").write_bytes(deny.encode("utf-8"))
+
+        path = directory / "sudo"
+        path.write_text(_FAKE_SUDO_SCRIPT, encoding="utf-8")
+        path.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+        return FakeSudo(directory=directory)
+
+    return _make
+
+
 @pytest.fixture
 def allow_non_root_macos(monkeypatch):
     """Neutralize the macOS root check so subprocess behavior can be tested.

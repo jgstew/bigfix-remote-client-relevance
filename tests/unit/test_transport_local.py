@@ -22,7 +22,10 @@ from bigfix_remote_client_relevance.results import (
     ERROR_KIND_TRANSPORT,
     ResolvedQna,
 )
-from bigfix_remote_client_relevance.transports.local import TransportLocal
+from bigfix_remote_client_relevance.transports.local import (
+    TransportLocal,
+    sudo_privilege_problem,
+)
 
 pytestmark = pytest.mark.usefixtures("allow_non_root_macos")
 
@@ -303,3 +306,216 @@ async def test_root_check_does_not_apply_off_macos(fake_qna, monkeypatch):
     result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind is None
+
+
+# --- privilege escalation --------------------------------------------------
+
+
+def test_become_prefixes_the_argv_with_sudo_n():
+    argv = TransportLocal(become=True)._eval_argv("/opt/qna")
+
+    assert argv == ["sudo", "-n", "/opt/qna", "-t", "-showtypes"]
+
+
+def test_without_become_the_argv_has_no_sudo():
+    assert TransportLocal()._eval_argv("/opt/qna") == ["/opt/qna", "-t", "-showtypes"]
+
+
+def test_become_is_ignored_on_windows_with_a_warning(monkeypatch, caplog):
+    """Windows has no sudo, and its 24H2 shim opens a UAC prompt that would hang."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    with caplog.at_level(logging.WARNING):
+        argv = TransportLocal(become=True)._eval_argv(r"C:\qna.exe")
+
+    assert argv == [r"C:\qna.exe", "-t", "-showtypes"]
+    assert any("become" in r.message.lower() for r in caplog.records)
+
+
+def test_become_applies_on_linux_not_just_macos(monkeypatch):
+    """Root-only inspectors are not a macOS peculiarity."""
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert TransportLocal(become=True)._eval_argv("/opt/qna")[:2] == ["sudo", "-n"]
+
+
+async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo):
+    stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
+    sudo = fake_sudo()
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert sudo.argv == ["-n", stub.path, "-t", "-showtypes"]
+    assert stub.argv == ["-t", "-showtypes"]
+    assert result.answers == ["yes"]
+    assert result.error_kind is None
+
+
+async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo):
+    """`sudo -n` never reads stdin, so the expression survives the extra exec."""
+    stub = fake_qna(stdout="A: yes\n")
+    fake_sudo()
+
+    await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert stub.stdin_text == "true\n"
+
+
+async def test_become_strips_the_q_prefix_through_sudo(fake_qna, fake_sudo):
+    stub = fake_qna(stdout="A: yes\n")
+    fake_sudo()
+
+    await TransportLocal(become=True).evaluate_client_relevance(
+        "Q: version of client", qna_path=stub.path
+    )
+
+    assert stub.stdin_text == "version of client\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_become_skips_the_macos_root_refusal(fake_qna, fake_sudo, monkeypatch):
+    """sudo makes qna root, so this process's euid is not what the check thinks."""
+    stub = fake_qna(stdout="A: yes\n")
+    fake_sudo()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.error_kind is None
+    assert stub.was_invoked
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_become_suppresses_the_non_root_warning(fake_qna, fake_sudo, monkeypatch, caplog):
+    """The waiver's warning is about running unelevated; become is the opposite."""
+    stub = fake_qna(stdout="A: yes\n")
+    fake_sudo()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        result = await TransportLocal(
+            become=True, require_root_on_macos=False
+        ).evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert result.error_kind is None
+    assert not [r for r in caplog.records if "root" in r.message.lower()]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_become_as_root_on_macos_still_uses_sudo(fake_qna, fake_sudo, monkeypatch):
+    """Predictable argv beats saving an exec; TransportSSH does not check uid either."""
+    stub = fake_qna(stdout="A: yes\n")
+    sudo = fake_sudo()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+
+    await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert sudo.was_invoked
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_macos_root_refusal_survives_without_become(fake_qna, monkeypatch):
+    """Regression guard: the become early-return must not swallow the default path."""
+    stub = fake_qna(stdout="A: unreachable\n")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
+    result = await TransportLocal(become=False).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert not stub.was_invoked
+
+
+async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo):
+    """A privilege problem is not the relevance engine failing."""
+    stub = fake_qna(stdout="A: unreachable\n")
+    fake_sudo(deny="sudo: a password is required\n")
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "sudo" in (result.error or "").lower()
+    assert "nopasswd" in (result.error or "").lower()
+    assert not stub.was_invoked
+
+
+async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo):
+    stub = fake_qna(stdout="")
+    fake_sudo(deny="sudo: someone is not in the sudoers file.\n")
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert "not in the sudoers file" in (result.error or "")
+
+
+async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo):
+    stub = fake_qna(stdout="", stderr="qna: bad expression\n", exit_code=3)
+    fake_sudo()
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.error_kind == ERROR_KIND_QNA
+
+
+async def test_relevance_error_under_become_stays_a_relevance_error(
+    fake_qna, fake_sudo, qna_output
+):
+    stub = fake_qna(stdout=qna_output("relevance_error"))
+    fake_sudo()
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "namez of it", qna_path=stub.path
+    )
+
+    assert result.error_kind == ERROR_KIND_RELEVANCE
+
+
+async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, tmp_path):
+    """Blaming the qna path for a failed `sudo` exec sends the user the wrong way."""
+    stub = fake_qna(stdout="A: yes\n")
+    empty = tmp_path / "empty_path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+    result = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "sudo" in (result.error or "").lower()
+    assert stub.path not in (result.error or "")
+
+
+async def test_sudo_stderr_is_ignored_without_become(fake_qna):
+    """Only a become run may be reclassified; qna stderr must never trigger it."""
+    stub = fake_qna(stdout="", stderr="sudo: a password is required\n", exit_code=1)
+
+    result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert result.error_kind == ERROR_KIND_QNA
+
+
+def test_sudo_privilege_problem_detects_a_sudo_line():
+    problem = sudo_privilege_problem("sudo: a password is required\n")
+
+    assert problem is not None
+    assert "a password is required" in problem
+
+
+def test_sudo_privilege_problem_ignores_plain_qna_stderr():
+    assert sudo_privilege_problem("qna: could not open file\n") is None

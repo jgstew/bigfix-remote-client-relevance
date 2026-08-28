@@ -75,6 +75,14 @@ def test_local_flag_selects_local(captured):
     assert captured["client_relevance"] == "version of client"
 
 
+def test_local_become_reaches_the_target(captured):
+    """--become was silently ignored on the local branch."""
+    result = invoke("--local", "--become", "version of client")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].become is True
+
+
 def test_container_flag_selects_container(captured):
     result = invoke("--container", "ubuntu:22.04", "true")
 
