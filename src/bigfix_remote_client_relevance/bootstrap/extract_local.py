@@ -131,6 +131,8 @@ def _extract_deb(artifact: Path, destination: Path) -> None:
 
 def _extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
     for member in tar.getmembers():
+        if member.isdir() and PurePosixPath(member.name).name in ("", "."):
+            continue  # the archive's own root entry; destination already exists
         target = _safe_destination(destination, member.name)
         if member.isdir():
             target.mkdir(parents=True, exist_ok=True)

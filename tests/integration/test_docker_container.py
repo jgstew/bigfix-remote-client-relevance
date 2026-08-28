@@ -127,8 +127,11 @@ async def test_keep_alive_container_is_reused(stub_qna_image):
     reason="needs a real qna artifact; set BFRCR_NETWORK_TESTS=1 to download one",
 )
 async def test_provisions_a_real_qna_version_into_ubuntu(tmp_path):
-    """Full resolve -> fetch -> mount -> extract -> eval against a real agent."""
+    """Full resolve -> fetch -> extract on the controller -> mount -> eval."""
+    from functools import partial
+
     from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
     from bigfix_remote_client_relevance.bootstrap.release_site import (
         artifact_for,
         resolve_version_spec,
@@ -139,7 +142,10 @@ async def test_provisions_a_real_qna_version_into_ubuntu(tmp_path):
     resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
 
     transport = TransportContainer(
-        IMAGE, engine=DockerEngine(), target="ubuntu", state_dir=tmp_path / "state"
+        IMAGE,
+        engine=DockerEngine(),
+        target="ubuntu",
+        extractor=partial(ensure_extracted, cache_dir=tmp_path / "cache"),
     )
     result = await transport.evaluate_client_relevance(
         "name of operating system", qna=resolved, timeout_s=300.0

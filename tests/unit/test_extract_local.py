@@ -222,6 +222,35 @@ async def test_unsupported_format_raises(tmp_path, cache, name):
     assert artifact.suffix in str(excinfo.value)
 
 
+async def test_deb_with_a_root_directory_entry_extracts_cleanly(tmp_path, cache):
+    """Real BESAgent debs include a '.' entry for the payload's own root."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:xz") as tar:
+        root = tarfile.TarInfo(".")
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        tar.addfile(root)
+        info = tarfile.TarInfo(f"./{QNA_MEMBER}")
+        info.size = len(QNA_BODY)
+        info.mode = 0o755
+        tar.addfile(info, io.BytesIO(QNA_BODY))
+
+    artifact = tmp_path / "with-root.deb"
+    artifact.write_bytes(
+        _ar_archive(
+            [
+                ("debian-binary", b"2.0\n"),
+                ("control.tar.gz", _data_tar("gz", {"control": b"Package: fixture\n"})),
+                ("data.tar.xz", buffer.getvalue()),
+            ]
+        )
+    )
+
+    tree = await ensure_extracted(resolved_for(artifact), cache_dir=cache)
+
+    assert qna_in(tree).read_bytes() == QNA_BODY
+
+
 async def test_rejects_path_traversal_members(tmp_path, cache):
     escape = tmp_path / "escapee"
     artifact = write_deb(

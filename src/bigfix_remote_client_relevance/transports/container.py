@@ -8,9 +8,11 @@ the answer for macOS and Windows since neither runs meaningfully in a container.
 The docker SDK sits behind :class:`ContainerEngine` so another OCI engine
 (podman) can slot in, and so the transport is testable without a daemon.
 
-Artifacts are bind-mounted read-only rather than copied in: the engine is
-local, so there is nothing to gain from a copy, and a read-only mount means a
-container cannot corrupt the controller's cache.
+The qna artifact is extracted on the controller (see ``bootstrap.extract_local``)
+and the resulting tree bind-mounted read-only, rather than unpacked inside the
+target: the engine is local, so a container never needs dpkg-deb/ar+tar or
+rpm2cpio+cpio of its own, and a read-only mount means it cannot corrupt the
+controller's cache.
 """
 
 from __future__ import annotations
@@ -18,18 +20,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import posixpath
 import shlex
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Protocol, TypeVar
 
-from bigfix_remote_client_relevance.bootstrap.provision import (
-    BootstrapFailure,
-    RunResult,
-    provision_qna,
-    qna_path_for,
+from bigfix_remote_client_relevance.bootstrap.extract_local import (
+    LocalExtractionError,
+    ensure_extracted,
 )
+from bigfix_remote_client_relevance.bootstrap.provision import BootstrapFailure, RunResult
 from bigfix_remote_client_relevance.bootstrap.targets import (
     TargetSpec,
     UnknownTargetError,
@@ -55,8 +57,10 @@ TRANSPORT_NAME = "container"
 
 T = TypeVar("T")
 
-ARTIFACT_MOUNT = "/bigfix_qna_artifacts"
-"""Where the controller's cached artifact appears inside the container."""
+Extractor = Callable[[ResolvedQna], Awaitable[Path]]
+
+QNA_MOUNT = "/opt/bigfix_qna"
+"""Where the controller-extracted qna tree is bind-mounted, read-only."""
 
 DEFAULT_QNA_COMMAND = "qna"
 
@@ -75,6 +79,24 @@ FAMILY_SANITY_COMMAND = (
 )
 
 _SPEC_FAMILIES = {"ubuntu": "deb", "debian": "deb", "rhel": "rpm", "suse": "rpm"}
+
+
+def _platform_parts(platform: str | None) -> tuple[str, str] | None:
+    """``"linux/amd64"`` -> ``("linux", "amd64")``, else ``None``."""
+    if platform is None or "/" not in platform:
+        return None
+    os_name, _sep, arch = platform.partition("/")
+    return os_name, arch
+
+
+def _image_platform(image: object) -> tuple[str, str] | None:
+    attrs = getattr(image, "attrs", None)
+    if not isinstance(attrs, dict):
+        return None
+    os_name, arch = attrs.get("Os"), attrs.get("Architecture")
+    if not os_name or not arch:
+        return None
+    return str(os_name), str(arch)
 
 
 class ContainerEngineError(Exception):
@@ -180,9 +202,20 @@ class DockerEngine:
 
             client = self._get_client()
             try:
-                client.images.get(image)  # type: ignore[attr-defined]
+                found = client.images.get(image)  # type: ignore[attr-defined]
             except docker.errors.ImageNotFound:
                 logger.info("pulling image %s", image)
+                client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
+                return
+
+            # images.get ignores platform: a cached image of the wrong
+            # architecture satisfies it, then container creation 404s. Compare
+            # what's actually on disk and re-pull on mismatch.
+            wanted = _platform_parts(platform)
+            if wanted is not None and _image_platform(found) not in (None, wanted):
+                logger.info(
+                    "cached %s is %s, not %s; re-pulling", image, _image_platform(found), wanted
+                )
                 client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
 
         await self._guard(_ensure)
@@ -301,31 +334,6 @@ def _stdin_path(container_id: str) -> str:
     return f"/tmp/.bfrcr-stdin-{container_id[:12]}"
 
 
-class _ContainerRunner:
-    """Adapts a running container to the provisioning CommandRunner protocol.
-
-    ``put_file`` is a copy from the read-only mount rather than a transfer:
-    the artifact is already visible inside the container.
-    """
-
-    def __init__(self, engine: ContainerEngine, container_id: str) -> None:
-        self._engine = engine
-        self._container_id = container_id
-
-    async def run(
-        self, command: str, *, input: str | None = None, timeout: float | None = None
-    ) -> RunResult:
-        return await self._engine.exec_in(
-            self._container_id, command, input=input, timeout=timeout
-        )
-
-    async def put_file(self, local: Path, remote: str) -> None:
-        source = f"{ARTIFACT_MOUNT}/{local.name}"
-        _stdout, stderr, code = await self.run(f"cp {shlex.quote(source)} {shlex.quote(remote)}")
-        if code != 0:
-            raise BootstrapFailure(f"could not stage {local.name} in the container: {stderr}")
-
-
 class TransportContainer:
     """Runs qna inside a short-lived (or kept-alive) container."""
 
@@ -337,8 +345,7 @@ class TransportContainer:
         arch: str = "x86_64",
         keep_alive: bool = False,
         target: str | None = None,
-        state_dir: Path | None = None,
-        recheck_prereqs: bool = False,
+        extractor: Extractor | None = None,
     ) -> None:
         self.image = image
         self.arch = arch
@@ -346,8 +353,7 @@ class TransportContainer:
         self._keep_alive = keep_alive
         self._target = target
         self._probed: str | None = None
-        self._state_dir = state_dir
-        self._recheck_prereqs = recheck_prereqs
+        self._extractor = extractor or ensure_extracted
         self._container_id: str | None = None
 
     @property
@@ -411,10 +417,6 @@ class TransportContainer:
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
         mounts: dict[str, str] = {}
-        if qna is not None and qna.artifact_path is not None:
-            # Mount the artifact's directory, read-only, so the container can
-            # read it but never write back into the controller's cache.
-            mounts[str(qna.artifact_path.parent)] = f"{ARTIFACT_MOUNT}:ro"
 
         transient_container: str | None = None
         try:
@@ -427,30 +429,27 @@ class TransportContainer:
             else:
                 spec = spec_for(self._target or "ubuntu")
 
-            needs_container = qna is not None or self._keep_alive
+            if qna is not None:
+                tree = await self._extractor(qna)
+                mounts[str(tree)] = f"{QNA_MOUNT}:ro"
+                qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
+
+            # A probed platform came from the image itself; only a
+            # human-supplied one can contradict what the image carries, so
+            # only that case pays for the sanity check.
+            needs_sanity = (
+                qna is not None and self._target is not None and spec.name in _SPEC_FAMILIES
+            )
+            needs_container = self._keep_alive or needs_sanity
+
             if needs_container:
                 container_id = await self._acquire_container(mounts)
                 if not self._keep_alive:
                     transient_container = container_id
-                runner = _ContainerRunner(self._engine, container_id)
-
-                if qna is not None and self._target is not None:
-                    # A probed platform came from the image itself; only a
-                    # human-supplied one can contradict what the image carries.
-                    await self._check_family(runner, spec)
-
-                if qna is not None:
-                    qna_path = await provision_qna(
-                        runner,
-                        spec,
-                        qna,
-                        host_label=self.host,
-                        state_dir=self._state_dir,
-                        recheck_prereqs=self._recheck_prereqs,
-                        timeout_s=max(timeout_s, 300.0),
-                    )
-
-                stdout, stderr, exit_code = await runner.run(
+                if needs_sanity:
+                    await self._check_family(container_id, spec)
+                stdout, stderr, exit_code = await self._engine.exec_in(
+                    container_id,
                     self._eval_command(spec, qna_path),
                     input=normalize_stdin_payload(client_relevance),
                     timeout=timeout_s,
@@ -466,7 +465,7 @@ class TransportContainer:
                 )
         except UnknownTargetError as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
-        except BootstrapFailure as exc:
+        except (BootstrapFailure, LocalExtractionError) as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
         except (ContainerEngineError, OSError, TimeoutError) as exc:
             return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
@@ -499,11 +498,9 @@ class TransportContainer:
             exit_code=exit_code,
         )
 
-    async def _check_family(self, runner: _ContainerRunner, spec: TargetSpec) -> None:
-        family = _SPEC_FAMILIES.get(spec.name)
-        if family is None:
-            return
-        stdout, _stderr, _code = await runner.run(FAMILY_SANITY_COMMAND)
+    async def _check_family(self, container_id: str, spec: TargetSpec) -> None:
+        family = _SPEC_FAMILIES[spec.name]
+        stdout, _stderr, _code = await self._engine.exec_in(container_id, FAMILY_SANITY_COMMAND)
         tools = set(stdout.split())
         opposite = {"deb": ("rpm", "dpkg"), "rpm": ("dpkg", "rpm")}[family]
         wrong_tool, right_tool = opposite
@@ -532,7 +529,8 @@ class TransportContainer:
 
     def resolved_qna_path(self, version: str) -> str:
         """Where a provisioned version lands inside the container."""
-        return qna_path_for(spec_for(self._target or self._probed or "ubuntu"), version)
+        spec = spec_for(self._target or self._probed or "ubuntu")
+        return posixpath.join(QNA_MOUNT, spec.qna_relative_path)
 
 
 def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
@@ -541,7 +539,7 @@ def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
 
 
 __all__ = [
-    "ARTIFACT_MOUNT",
+    "QNA_MOUNT",
     "ContainerEngine",
     "ContainerEngineError",
     "DockerEngine",
