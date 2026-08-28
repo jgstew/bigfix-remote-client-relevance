@@ -44,8 +44,14 @@ class FakeEngine:
     stopped: list[str] = field(default_factory=list)
     one_shots: list[dict[str, object]] = field(default_factory=list)
     execs: list[ExecCall] = field(default_factory=list)
+    digest: str = "sha256:basedigest"
+    existing_tags: set = field(default_factory=set)
+    committed: list[tuple[str, str]] = field(default_factory=list)
+    cp_exit_code: int = 0
 
     def _answer(self, command: str) -> tuple[str, str, int]:
+        if "cp -a" in command:
+            return ("", "" if self.cp_exit_code == 0 else "cp: no such shell", self.cp_exit_code)
         for pattern, response in self.responses:
             if re.search(pattern, command):
                 return response
@@ -53,6 +59,16 @@ class FakeEngine:
 
     async def ensure_image(self, image: str, *, platform: str | None = None) -> None:
         self.pulled.append(image)
+
+    async def image_digest(self, image: str) -> str:
+        return self.digest
+
+    async def image_exists(self, image: str) -> bool:
+        return image in self.existing_tags
+
+    async def commit(self, container_id: str, tag: str) -> None:
+        self.committed.append((container_id, tag))
+        self.existing_tags.add(tag)
 
     async def run_one_shot(
         self,
@@ -523,6 +539,104 @@ async def test_provisioning_timeout_is_not_inflated(resolved, extracted):
     ).evaluate_client_relevance("true", qna=resolved, timeout_s=12.0)
 
     assert engine.one_shots[-1]["timeout"] == 12.0
+
+
+# --- prepared-image cache -----------------------------------------------------
+#
+# Issue #1: provisioning per run is the wrong unit of work for a matrix sweep.
+# The first qna run against an image builds a derived image with the tree
+# already baked in; later runs against the same (image digest, version, arch)
+# start it directly, no mount, no unpack, sub-second start.
+
+_M13 = pytest.mark.xfail(strict=True, reason="M13: prepared-image cache not implemented")
+
+
+@_M13
+async def test_prepared_image_tag_scheme():
+    from bigfix_remote_client_relevance.transports.container import prepared_image_tag
+
+    tag = prepared_image_tag("sha256:" + "ab" * 32, "11.0.6.137", "x86_64")
+
+    assert tag.startswith("bfrcr/prepared:")
+    assert "11.0.6.137" in tag
+    assert "x86_64" in tag
+    # truncated, not the full 64-char digest
+    assert "ab" * 32 not in tag
+
+
+@_M13
+async def test_first_qna_run_builds_a_prepared_image(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.started) == 1, "the base image starts once to build the prepared image"
+    build_mounts = engine.started[0]["mounts"]
+    assert list(build_mounts.values())[0].endswith(":ro")
+    assert any("cp -a" in c for c in engine.commands())
+    assert len(engine.committed) == 1
+    tag = engine.committed[0][1]
+    assert engine.one_shots[-1]["image"] == tag
+    assert engine.one_shots[-1]["mounts"] == {}, "the prepared image needs no mount"
+
+
+@_M13
+async def test_second_run_skips_the_build(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, extractor=extracted)
+
+    await transport.evaluate_client_relevance("true", qna=resolved)
+    await transport.evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.started) == 1, "only the first run builds"
+    assert len(engine.committed) == 1
+    assert len(extracted.calls) == 1, "a cached prepared image needs no re-extraction"
+
+
+@_M13
+async def test_rebuild_image_forces_a_rebuild(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted, rebuild_image=True
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.committed) == 2
+
+
+@_M13
+async def test_base_digest_change_produces_a_different_tag(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK], digest="sha256:first")
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    engine.digest = "sha256:second"
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    tags = {tag for _cid, tag in engine.committed}
+    assert len(tags) == 2, "a moved base image must not reuse a stale prepared image"
+
+
+@_M13
+async def test_build_failure_falls_back_to_the_mount_flow(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK], cp_exit_code=1)
+
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert any("cp -a" in c for c in engine.commands()), "a build must actually be attempted"
+    assert result.error_kind is None, "a distroless base without cp/coreutils still works"
+    assert engine.committed == []
+    assert engine.one_shots[-1]["mounts"] == {str(extracted.tree): f"{QNA_MOUNT}:ro"}
 
 
 # --- image architecture ------------------------------------------------------

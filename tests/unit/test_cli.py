@@ -180,6 +180,25 @@ def test_local_still_excludes_container_and_inventory(captured, tmp_path):
     assert invoke("--local", "--inventory", str(inventory), "true").exit_code != 0
 
 
+_M13 = pytest.mark.xfail(strict=True, reason="M13: --rebuild-image not implemented")
+
+
+@_M13
+def test_rebuild_image_flag_reaches_the_container_target(captured):
+    result = invoke("--container", "ubuntu:22.04", "--rebuild-image", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].rebuild_image is True
+
+
+@_M13
+def test_rebuild_image_requires_a_container_target(captured):
+    result = invoke("mac-test", "true", "--rebuild-image")
+
+    assert result.exit_code != 0
+    assert "container" in result.output.lower()
+
+
 def test_container_without_platform_leaves_it_unset(captured):
     """No --platform means the image gets probed, never assumed."""
     result = invoke("--container", "almalinux:9", "true")
