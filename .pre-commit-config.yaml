@@ -18,6 +18,7 @@ repos:
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: end-of-file-fixer
+        exclude: \.svg$
       - id: trailing-whitespace
       - id: mixed-line-ending
       - id: detect-private-key

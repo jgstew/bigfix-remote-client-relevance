@@ -283,6 +283,10 @@ binary, Docker, sshd, or the network are marked and auto-skip — see
   an earlier action-deployment approach, superseded by the SSH and container
   transports.
 
+## Demo
+
+![Demo](docs/demos/demo_1.svg)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
