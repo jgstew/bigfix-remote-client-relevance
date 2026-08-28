@@ -66,6 +66,14 @@ bigfix-remote-client-relevance --inventory hosts.toml -f probe.rel --json
 `--json` writes one document per (target × version) to stdout; logs go to
 stderr, so piping into `jq` always works.
 
+If no target is given at all — no `--local`, `--container`, `--inventory`,
+or `HOST` — and a `hosts.toml` exists in the current directory, it's used
+automatically, so the above also works as:
+
+```bash
+bigfix-remote-client-relevance -f probe.rel --json
+```
+
 ### Streaming
 
 Results are emitted as each target answers, in completion order rather than

@@ -132,11 +132,26 @@ def test_container_flag_selects_container(captured):
     assert target.image == "ubuntu:22.04"
 
 
-def test_no_target_is_a_usage_error(captured):
+def test_no_target_is_a_usage_error(captured, tmp_path, monkeypatch):
+    # No hosts.toml here, so there's nothing to imply -- see
+    # test_no_target_defaults_to_hosts_toml_when_present for the flip side.
+    monkeypatch.chdir(tmp_path)
+
     result = invoke("name of operating system")
 
     assert result.exit_code != 0
     assert "target" in result.output.lower() or "host" in result.output.lower()
+
+
+def test_no_target_defaults_to_hosts_toml_when_present(captured, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "hosts.toml").write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert {t.name for t in captured["targets"]} == {"a"}
+    assert captured["client_relevance"] == "name of operating system"
 
 
 def test_two_target_modes_is_a_usage_error(captured):

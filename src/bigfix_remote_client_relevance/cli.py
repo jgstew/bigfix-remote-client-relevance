@@ -54,6 +54,10 @@ app = typer.Typer(
 
 USAGE_EXIT_CODE = 2
 
+# Implied when no target is given and this file exists in the current
+# directory -- see the `not any(modes)` branch in `evaluate`.
+DEFAULT_INVENTORY_PATH = Path("hosts.toml")
+
 
 def _configure_logging(verbosity: int) -> None:
     """Send logs to stderr, leaving stdout free for the payload.
@@ -267,7 +271,13 @@ def evaluate(
     ] = None,
     inventory: Annotated[
         Path | None,
-        typer.Option("--inventory", help="Evaluate across the hosts in a hosts.toml file."),
+        typer.Option(
+            "--inventory",
+            help=(
+                "Evaluate across the hosts in a hosts.toml file. Implied when "
+                "no target is given and hosts.toml exists in the current directory."
+            ),
+        ),
     ] = None,
     update_inventory: Annotated[
         bool,
@@ -414,16 +424,22 @@ def evaluate(
     host: str | None = None
     if not any(modes):
         # A bare `HOST` with no relevance and a bare relevance with no target
-        # look identical here, so say what a complete invocation needs.
+        # look identical here, so say what a complete invocation needs --
+        # unless a hosts.toml sits right here, in which case that's obviously
+        # what was meant and there's no need to spell out --inventory.
         needed = 1 if client_relevance_file else 2
         if len(args) < needed:
-            _fail(
-                "expected a target and a client relevance, e.g. "
-                '`HOST "name of operating system"`; or choose a target with '
-                "--local, --container IMAGE, or --inventory hosts.toml"
-            )
-        host = args[0]
-        args = args[1:]
+            if DEFAULT_INVENTORY_PATH.exists():
+                inventory = DEFAULT_INVENTORY_PATH
+            else:
+                _fail(
+                    "expected a target and a client relevance, e.g. "
+                    '`HOST "name of operating system"`; or choose a target with '
+                    "--local, --container IMAGE, or --inventory hosts.toml"
+                )
+        else:
+            host = args[0]
+            args = args[1:]
 
     text = _read_client_relevance(args, client_relevance_file)
 
