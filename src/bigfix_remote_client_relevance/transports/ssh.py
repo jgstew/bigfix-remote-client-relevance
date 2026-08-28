@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 TRANSPORT_NAME = "ssh"
 
+
 class SSHConnectionError(Exception):
     """Connecting to or authenticating with the target failed."""
 
@@ -101,9 +102,7 @@ class _PowerShellRunner:
         self, command: str, *, input: str | None = None, timeout: float | None = None
     ) -> RunResult:
         logger.debug("windows command: %s", command)
-        return await self._inner.run(
-            powershell_command(command), input=input, timeout=timeout
-        )
+        return await self._inner.run(powershell_command(command), input=input, timeout=timeout)
 
     async def put_file(self, local: Path, remote: str) -> None:
         # SFTP is shell-independent, so this needs no wrapping.
@@ -312,8 +311,10 @@ class TransportSSH:
                 qna_path = await self._discover_qna(runner, spec, timeout_s)
                 if qna_path is None:
                     return _result(
-                        error=f"no qna binary found on {self.host}; "
-                        "pass qna_path or a qna version to provision one",
+                        error=(
+                            f"no qna binary found on {self.host}; "
+                            "pass qna_path or a qna version to provision one"
+                        ),
                         error_kind=ERROR_KIND_BOOTSTRAP,
                     )
 
@@ -376,7 +377,7 @@ class TransportSSH:
         :meth:`reprobe_platform` (which deliberately does not).
         """
         stdout, _stderr, _code = await runner.run(
-            "uname -s; . /etc/os-release 2>/dev/null && echo \"$ID $ID_LIKE\"",
+            'uname -s; . /etc/os-release 2>/dev/null && echo "$ID $ID_LIKE"',
             timeout=timeout_s,
         )
         target = classify_uname(stdout)

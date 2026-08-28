@@ -46,7 +46,9 @@ def test_a_remote_tcp_endpoint_is_kept():
 
 
 def test_an_ssh_endpoint_is_kept():
-    assert docker_context_endpoint(runner_returning("ssh://user@build-box")) == "ssh://user@build-box"
+    assert (
+        docker_context_endpoint(runner_returning("ssh://user@build-box")) == "ssh://user@build-box"
+    )
 
 
 def test_a_missing_docker_binary_is_not_an_error():
@@ -98,6 +100,7 @@ def test_the_probe_asks_for_the_docker_endpoint():
 #
 # "is Docker running?" is a question the tool can answer for itself. Detection
 # is injectable so no test ever launches anything.
+
 
 def fake_host(*, installed: tuple[str, ...] = (), apps: tuple[str, ...] = ()):
     """A machine with the named binaries on PATH and the named apps installed."""

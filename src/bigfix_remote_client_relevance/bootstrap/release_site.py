@@ -87,9 +87,7 @@ def _default_fetch(url: str) -> str:
 def _soup(html: str, url: str) -> BeautifulSoup:
     soup = BeautifulSoup(html, "html.parser")
     if soup.find("table") is None:
-        raise ResolveError(
-            f"no tables found at {url}; the release site layout may have changed"
-        )
+        raise ResolveError(f"no tables found at {url}; the release site layout may have changed")
     return soup
 
 
@@ -360,9 +358,7 @@ def artifact_for(
                 arch=arch,
             )
 
-    raise ResolveError(
-        f"no {platform}/{arch} qna artifact for {full_version} at {page_url}"
-    )
+    raise ResolveError(f"no {platform}/{arch} qna artifact for {full_version} at {page_url}")
 
 
 def _checksums_for(page_url: str, fetch: Fetcher) -> dict[str, str]:

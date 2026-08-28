@@ -121,7 +121,7 @@ async def test_nonzero_exit_maps_to_qna_kind(fake_qna):
     assert "fatal internal error" in (result.error or "")
 
 
-async def test_unparseable_output_maps_to_qna_kind(fake_qna):
+async def test_unparsable_output_maps_to_qna_kind(fake_qna):
     """Exit 0 but nothing recognizable on any channel is a qna failure."""
     stub = fake_qna(stdout="totally unexpected output\n")
 
@@ -168,12 +168,12 @@ async def test_missing_binary_maps_to_bootstrap(monkeypatch):
 
 
 async def test_invalid_utf8_output_is_replaced_not_raised(fake_qna):
-    stub = fake_qna(stdout_bytes=b"A: caf\xff\xfe\nI: singular string\nT: 0.1 ms\n")
+    stub = fake_qna(stdout_bytes=b"A: calf\xff\xfe\nI: singular string\nT: 0.1 ms\n")
 
     result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind is None
-    assert result.answers and result.answers[0].startswith("caf")
+    assert result.answers and result.answers[0].startswith("calf")
 
 
 async def test_constructor_qna_path_used_as_default(fake_qna):
@@ -212,7 +212,9 @@ async def test_resolved_qna_provisions_into_a_versioned_directory(tmp_path, monk
     artifact = tmp_path / "BESAgent-11.0.6.137-BigFix_MacOS11.0.pkg"
     artifact.write_bytes(b"not a real pkg")
 
-    result = await TransportLocal(target="macos", state_dir=tmp_path / "state").evaluate_client_relevance(
+    result = await TransportLocal(
+        target="macos", state_dir=tmp_path / "state"
+    ).evaluate_client_relevance(
         "true", qna=ResolvedQna(version="11.0.6.137", artifact_path=artifact)
     )
 
@@ -368,9 +370,7 @@ async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo, monkeypatch):
     stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
     sudo = fake_sudo()
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert sudo.argv == ["-n", stub.path, "-t", "-showtypes"]
     assert stub.argv == ["-t", "-showtypes"]
@@ -411,9 +411,7 @@ async def test_become_skips_the_macos_root_refusal(fake_qna, fake_sudo, monkeypa
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind is None
     assert stub.was_invoked
@@ -472,9 +470,7 @@ async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, m
     stub = fake_qna(stdout="A: unreachable\n")
     fake_sudo(deny="sudo: a password is required\n")
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
     assert "sudo" in (result.error or "").lower()
@@ -488,9 +484,7 @@ async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo, mo
     stub = fake_qna(stdout="")
     fake_sudo(deny="sudo: someone is not in the sudoers file.\n")
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert "not in the sudoers file" in (result.error or "")
 
@@ -501,9 +495,7 @@ async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo
     stub = fake_qna(stdout="", stderr="qna: bad expression\n", exit_code=3)
     fake_sudo()
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind == ERROR_KIND_QNA
 
@@ -532,9 +524,7 @@ async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, t
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
 
-    result = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
     assert "sudo" in (result.error or "").lower()
@@ -586,15 +576,11 @@ async def test_broken_elevation_cache_is_per_instance(fake_qna, fake_sudo, monke
     stub = fake_qna(stdout="A: yes\n")
     sudo = fake_sudo(deny="sudo: a password is required\n")
 
-    broken = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    broken = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
     assert broken.error_kind == ERROR_KIND_BOOTSTRAP
     assert sudo.call_count == 1
 
-    fresh = await TransportLocal(become=True).evaluate_client_relevance(
-        "true", qna_path=stub.path
-    )
+    fresh = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
     assert fresh.error_kind == ERROR_KIND_BOOTSTRAP
     assert sudo.call_count == 2, "a new instance must attempt sudo again, not reuse the cache"

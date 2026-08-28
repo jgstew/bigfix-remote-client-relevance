@@ -128,7 +128,10 @@ async def test_evaluate_with_installed_qna(qna_output):
 
 async def test_client_relevance_is_piped_on_stdin():
     runner = FakeSSHRunner(
-        responses=[(r"-x |command -v", ("/opt/BESClient/bin/qna\n", "", 0)), (r"-showtypes", qna_ok())]
+        responses=[
+            (r"-x |command -v", ("/opt/BESClient/bin/qna\n", "", 0)),
+            (r"-showtypes", qna_ok()),
+        ]
     )
 
     await make_transport(runner).evaluate_client_relevance("Q: version of client")
@@ -141,9 +144,7 @@ async def test_client_relevance_is_piped_on_stdin():
 async def test_explicit_qna_path_skips_discovery():
     runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
 
-    result = await make_transport(runner).evaluate_client_relevance(
-        "true", qna_path="/custom/qna"
-    )
+    result = await make_transport(runner).evaluate_client_relevance("true", qna_path="/custom/qna")
 
     assert result.qna_path == "/custom/qna"
     assert "/custom/qna" in " ".join(runner.commands())
@@ -328,9 +329,7 @@ async def test_no_exception_escapes_on_unexpected_error():
 async def test_become_wraps_the_eval_in_sudo():
     runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
 
-    await make_transport(runner, become=True).evaluate_client_relevance(
-        "true", qna_path="/opt/qna"
-    )
+    await make_transport(runner, become=True).evaluate_client_relevance("true", qna_path="/opt/qna")
 
     eval_command = next(c for c in runner.commands() if "-showtypes" in c)
     assert eval_command.startswith("sudo -n ")
@@ -346,9 +345,7 @@ async def test_without_become_no_sudo():
 
 async def test_sudo_password_refusal_is_a_bootstrap_error_not_a_qna_error():
     """A privilege problem is not the relevance engine failing."""
-    runner = FakeSSHRunner(
-        responses=[(r"^sudo -n", ("", "sudo: a password is required\n", 1))]
-    )
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", ("", "sudo: a password is required\n", 1))])
 
     result = await make_transport(runner, become=True).evaluate_client_relevance(
         "true", qna_path="/opt/qna"
@@ -361,9 +358,7 @@ async def test_sudo_password_refusal_is_a_bootstrap_error_not_a_qna_error():
 
 async def test_sudo_refusal_keeps_the_original_sudo_line():
     runner = FakeSSHRunner(
-        responses=[
-            (r"^sudo -n", ("", "sudo: user is not in the sudoers file.\n", 1))
-        ]
+        responses=[(r"^sudo -n", ("", "sudo: user is not in the sudoers file.\n", 1))]
     )
 
     result = await make_transport(runner, become=True).evaluate_client_relevance(
@@ -395,13 +390,9 @@ async def test_relevance_error_under_become_stays_a_relevance_error(qna_output):
 
 async def test_sudo_stderr_is_ignored_without_become():
     """Only a become run may be reclassified; qna stderr must never trigger it."""
-    runner = FakeSSHRunner(
-        responses=[(r"-showtypes", ("", "sudo: a password is required\n", 1))]
-    )
+    runner = FakeSSHRunner(responses=[(r"-showtypes", ("", "sudo: a password is required\n", 1))])
 
-    result = await make_transport(runner).evaluate_client_relevance(
-        "true", qna_path="/opt/qna"
-    )
+    result = await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
 
     assert result.error_kind == ERROR_KIND_QNA
 
@@ -548,14 +539,12 @@ async def test_recheck_prereqs_forces_another_probe(resolved, tmp_path):
             (r"-showtypes", qna_ok()),
         ]
     )
-    await make_transport(runner, state_dir=tmp_path).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    await make_transport(runner, state_dir=tmp_path).evaluate_client_relevance("true", qna=resolved)
     before = sum(1 for c in runner.commands() if "prereq-probe" in c)
 
-    await make_transport(runner, state_dir=tmp_path, recheck_prereqs=True).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    await make_transport(
+        runner, state_dir=tmp_path, recheck_prereqs=True
+    ).evaluate_client_relevance("true", qna=resolved)
 
     assert sum(1 for c in runner.commands() if "prereq-probe" in c) > before
 
@@ -573,9 +562,7 @@ async def test_showtypes_unsupported_degrades_to_plain_t(caplog):
     )
 
     with caplog.at_level(logging.WARNING):
-        result = await make_transport(runner).evaluate_client_relevance(
-            "true", qna_path="/opt/qna"
-        )
+        result = await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
 
     assert result.error_kind is None
     assert result.answers == ["9.5.13.79"]
@@ -595,9 +582,7 @@ async def test_connection_opened_once_and_reused():
         opened += 1
         return runner
 
-    transport = TransportSSH(
-        "test-host", connection_factory=counting_factory, platform="ubuntu"
-    )
+    transport = TransportSSH("test-host", connection_factory=counting_factory, platform="ubuntu")
     await transport.evaluate_client_relevance("true", qna_path="/opt/qna")
     await transport.evaluate_client_relevance("true", qna_path="/opt/qna")
 

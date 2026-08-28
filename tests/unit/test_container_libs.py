@@ -64,6 +64,7 @@ def test_the_first_missing_library_is_reported():
 
 # --- choosing what to install -------------------------------------------------
 
+
 def test_the_package_manager_probe_prefers_dnf_over_yum():
     """A dnf image usually also has yum; dnf's transactions are smaller."""
     from bigfix_remote_client_relevance.transports.container_libs import package_manager_from

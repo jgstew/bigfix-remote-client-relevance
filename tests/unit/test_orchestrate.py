@@ -193,7 +193,10 @@ async def test_transports_only_ever_see_resolved_versions():
         return transport
 
     await evaluate_client_relevance(
-        "true", SSH_TARGETS, qna_version="11.0", transport_factory=factory,
+        "true",
+        SSH_TARGETS,
+        qna_version="11.0",
+        transport_factory=factory,
         resolver=make_resolver(),
     )
 
@@ -248,6 +251,7 @@ async def test_one_version_failing_does_not_block_the_other():
 # so a container with no declared platform must be probed BEFORE resolution —
 # probing in the transport alone would still download the wrong agent.
 
+
 class FakeProbingTransport(FakeTransport):
     """A container-style transport whose probe answers with a canned platform."""
 
@@ -300,7 +304,9 @@ async def test_probed_platforms_split_the_resolution_dedupe():
         resolver=platform_recording_resolver(seen),
     )
 
-    assert sorted(seen, key=str) == ["rhel", "ubuntu"], "different platforms need distinct artifacts"
+    assert sorted(seen, key=str) == ["rhel", "ubuntu"], (
+        "different platforms need distinct artifacts"
+    )
 
 
 async def test_matching_probed_platforms_share_one_resolution():
@@ -568,9 +574,7 @@ async def test_no_probe_when_no_version_is_pinned():
 def test_rebuild_image_reaches_the_transport_factory():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 
-    target = Target(
-        kind="container", name="ubuntu:22.04", image="ubuntu:22.04", rebuild_image=True
-    )
+    target = Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", rebuild_image=True)
     transport = default_transport_factory(target)
 
     assert transport._rebuild_image is True
@@ -645,10 +649,13 @@ def test_unspecified_ssh_become_is_false_even_on_macos(monkeypatch):
 # different cost profiles: eight simultaneous multi-hundred-MB pulls will
 # saturate a laptop while eight evaluations barely register.
 
+
 class FakePreparingTransport(FakeProbingTransport):
     """A container-style transport whose image phase is separately observable."""
 
-    def __init__(self, host, *, image_tracker=None, prepare_delay=0.0, fail_prepare=False, **kw):
+    def __init__(
+        self, host, *, image_tracker=None, prepare_delay=0.0, fail_prepare=False, **kw
+    ) -> None:
         super().__init__(host, **kw)
         self._image_tracker = image_tracker if image_tracker is not None else {}
         self._image_tracker.setdefault("live", 0)
@@ -662,9 +669,7 @@ class FakePreparingTransport(FakeProbingTransport):
         self.order.append("prepare")
         self._image_tracker["calls"] += 1
         self._image_tracker["live"] += 1
-        self._image_tracker["peak"] = max(
-            self._image_tracker["peak"], self._image_tracker["live"]
-        )
+        self._image_tracker["peak"] = max(self._image_tracker["peak"], self._image_tracker["live"])
         try:
             if self._prepare_delay:
                 await asyncio.sleep(self._prepare_delay)
@@ -679,9 +684,7 @@ class FakePreparingTransport(FakeProbingTransport):
 
 
 def container_targets(count: int) -> list[Target]:
-    return [
-        Target(kind="container", name=f"image{i}", image=f"image{i}") for i in range(count)
-    ]
+    return [Target(kind="container", name=f"image{i}", image=f"image{i}") for i in range(count)]
 
 
 async def test_the_image_phase_runs_before_the_evaluation():
@@ -748,7 +751,9 @@ async def test_a_failed_image_phase_does_not_fail_the_pair():
         made.append(transport)
         return transport
 
-    results = await evaluate_client_relevance("true", container_targets(1), transport_factory=factory)
+    results = await evaluate_client_relevance(
+        "true", container_targets(1), transport_factory=factory
+    )
 
     assert made[0].order[:1] == ["prepare"], "the hook must actually have been tried"
     assert len(results) == 1
@@ -821,8 +826,10 @@ async def test_one_target_failing_does_not_cancel_the_others():
             raise RuntimeError("host is on fire")
 
     def factory(target):
-        return ExplodingTransport(target.name) if target.name == "host1" else FakeTransport(
-            target.name
+        return (
+            ExplodingTransport(target.name)
+            if target.name == "host1"
+            else FakeTransport(target.name)
         )
 
     results = await evaluate_client_relevance("true", SSH_TARGETS, transport_factory=factory)

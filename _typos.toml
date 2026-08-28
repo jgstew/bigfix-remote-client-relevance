@@ -1,0 +1,7 @@
+[default.extend-words]
+# "rhe" is the BigFix release-site's short token for RHEL (e.g. filenames
+# like `BESAgent-11.0.6.137-rhe7.x86_64.rpm`), not a typo of "the". Without
+# this, `typos` silently "fixes" it in both the release-site regex
+# (bootstrap/release_site.py) and the captured checksum fixtures, breaking
+# real RHEL artifact matching.
+rhe = "rhe"

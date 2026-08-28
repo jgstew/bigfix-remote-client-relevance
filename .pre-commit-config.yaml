@@ -1,0 +1,214 @@
+---
+# run on only items staged in git:  pre-commit
+# automatically run on commit:      pre-commit install
+# check all files in repo:          pre-commit run --all-files
+# run the pre-push hooks by hand:   pre-commit run --all-files --hook-stage pre-push
+# check all files in repo:          pre-commit run --all-files --hook-stage manual
+# update all pre-commit hooks:      pre-commit autoupdate
+# https://github.com/pre-commit/pre-commit-hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: detect-private-key
+      # Block direct commits to the integration branches; work on a feature
+      # branch and open a PR instead. Bypass for a deliberate exception with
+      # `git commit --no-verify`.
+      # - id: no-commit-to-branch
+      #   args: ["--branch=main", "--branch=master"]
+
+  # ruff replaces black + flake8 + isort: `ruff-check` lints (and fixes),
+  # `ruff-format` is the formatter. Config lives in pyproject.toml.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: aab412d509121cb5f7533134b7e67f9fab59c682 # v0.16.4
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Security-focused AST linter for common Python mistakes (hardcoded
+  # passwords, shell=True, insecure deserialization, etc.). -lll restricts
+  # output to high-severity findings only, so it stays quiet on the low/medium
+  # noise (e.g. `assert` in tests) that would otherwise need per-file ignores.
+  - repo: https://github.com/PyCQA/bandit
+    rev: 92ae8b82fb422a639f0ed8d99e96cea769594e08 # 1.9.4
+    hooks:
+      - id: bandit
+        args: ["-r", "-lll"]
+        files: ^src/
+
+  # Enforces a few Python style rules slyp's author found error-prone in
+  # practice (e.g. no bare string-literal concatenation across lines).
+  - repo: https://github.com/sirosen/slyp
+    rev: 072ea633cef088f143be7c16499d1564485dfc0c # 0.9.0
+    hooks:
+      - id: slyp
+
+  # Scores the package's distribution metadata (README, classifiers, project
+  # URLs, etc.) against packaging best practices. Its own default hook is
+  # `always_run: true` on every commit; overridden here to fire only when a
+  # file that actually affects that metadata changes. No setup.py/setup.cfg
+  # in this repo (hatchling + pyproject.toml only).
+  - repo: https://github.com/regebro/pyroma
+    rev: dd478a67d029502036973a9f596ec4b2c0614bf7 # 5.0.1
+    hooks:
+      - id: pyroma
+        always_run: false
+        files: |
+          (?x)^(
+              README.md|
+              pyproject.toml|
+              src/bigfix_remote_client_relevance/__init__.py
+          )$
+        stages: [manual]
+
+  # False positives (e.g. "rhe" -> "the") are whitelisted in _typos.toml
+  # rather than excluded by path, so real artifact filenames/regexes stay
+  # covered instead of silently skipped.
+  - repo: https://github.com/crate-ci/typos
+    rev: 8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
+    hooks:
+      - id: typos
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8 # v2.4.3
+    hooks:
+      - id: codespell
+
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530 # v1.38.0
+    hooks:
+      - id: yamllint
+        args: [-c=.yamllint.yaml]
+
+  - repo: https://github.com/asottile/pyupgrade
+    rev: ce40a160603ab0e7d9c627ae33d7ef3906e2d2b2 # v3.19.1
+    hooks:
+      - id: pyupgrade
+        name: Upgrade Python syntax
+        args: [--py311-plus]
+        stages: [pre-push, manual]
+
+  - repo: https://github.com/pre-commit/pygrep-hooks
+    rev: 3a6eb0fadf60b3cccfd80bad9dbb6fae7e47b316 # v1.10.0
+    hooks:
+      - id: python-check-blanket-noqa
+        stages: [manual]
+      - id: python-no-log-warn
+        stages: [manual]
+      - id: python-use-type-annotations
+        stages: [manual]
+      - id: python-no-eval
+        stages: [manual]
+      - id: python-check-blanket-type-ignore
+        stages: [manual]
+
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: 4b2e70d08cb2ccd26d1fba73588de41c7a5d50b7 # v0.25
+    hooks:
+      - id: validate-pyproject
+        stages: [manual]
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 12e63946db2c5cfcc9030fac21c3883ba88c6ed8 # 0.38.0
+    hooks:
+      - id: check-github-workflows
+        args: ["--verbose"]
+        stages: [manual]
+      - id: check-dependabot
+        stages: [manual]
+
+  - repo: https://github.com/woodruffw/zizmor-pre-commit
+    # Find security issues in GitHub Actions CI/CD setups.
+    rev: 451b56af716f9f0d0c2b816503a3fd0cf8b036fa # v1.29.0
+    hooks:
+      - id: zizmor
+        stages: [pre-push, manual]
+        # --no-progress is the hook's own default arg and has to be repeated:
+        # setting `args` replaces the list, it does not append to it.
+        # Online mode has no flag: zizmor runs offline unless it finds a token
+        # in GH_TOKEN / GITHUB_TOKEN / ZIZMOR_GITHUB_TOKEN, so export one
+        # (`export GH_TOKEN="$(gh auth token)"`) before running this hook
+        # locally to get the online-only audits.
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: b84c4a0a90bd58c7d82ae8f0d4d5e77b1ddd3ce6 # 0.12.5
+    hooks:
+      - id: uv-lock
+      # uv-sync is a post-checkout/post-merge/post-rewrite hook, not a
+      # pre-commit one: it re-syncs .venv after a pull or branch switch. It only
+      # fires once those hook types are installed:
+      #     pre-commit install --hook-type post-checkout --hook-type post-merge
+      - id: uv-sync
+        args: ["--locked"]
+      # Known-vulnerability check against the lock file. `uv audit` is still
+      # experimental and needs the network, so it is manual-only rather than
+      # blocking every commit.
+      - id: uv-audit
+        stages: [manual]
+        args: ["--preview-features", "audit-command"]
+
+  # Mirrors of what a release run does, so lock drift or a broken build backend
+  # pin is caught before the release workflow hits it:
+  #     pre-commit run --hook-stage manual uv-lock-check uv-build-wheel
+  #
+  # These are `stages: [pre-push, manual]` - too slow to want on every `git
+  # commit`, but they should still gate code leaving the machine. `manual` has
+  # to stay in the list for CI to see them at all, and the pre-push half only
+  # fires once the hook type is installed:
+  #     pre-commit install --hook-type pre-push
+  - repo: local
+    hooks:
+      # `pre-commit/mirrors-mypy` runs mypy in its own isolated environment,
+      # which lacks this project's runtime deps (requests, platformdirs,
+      # asyncssh, tomlkit, typer) and, when given only the staged filenames,
+      # loses cross-module context and reports no-any-return/untyped-decorator
+      # errors that don't reproduce under a full-package run. Running it
+      # through `uv run` against the whole package instead uses this repo's
+      # real, dependency-complete venv and matches CI exactly (`uv run mypy
+      # src`, .github/workflows/test.yaml).
+      - id: mypy
+        name: mypy (uv run mypy src)
+        language: system
+        pass_filenames: false
+        files: ^src/
+        entry: uv run --frozen mypy src
+      - id: uv-lock-check
+        name: uv lock --check (uv.lock matches pyproject.toml)
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push, manual]
+        entry: uv lock --check
+      - id: uv-build-wheel
+        name: uv build --wheel (build backend pin works)
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push, manual]
+        # built into a temp dir so the repo's own dist/ is not created or stale-filled
+        entry: sh -c 'out="$(mktemp -d)"; trap "rm -rf \"$out\"" EXIT; uv build --wheel --out-dir "$out"'
+      - id: pytest
+        name: pytest (see config in pyproject.toml)
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push, manual]
+        entry: uv run --frozen pytest
+
+  - repo: meta
+    hooks:
+      - id: check-useless-excludes
+        stages: [manual]
+      - id: check-hooks-apply
+        stages: [manual]

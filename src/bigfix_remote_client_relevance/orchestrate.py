@@ -180,9 +180,7 @@ async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
     return await ensure_artifact(version, ref)
 
 
-def _version_specs(
-    target: Target, run_wide: str | Sequence[str] | None
-) -> list[str | None]:
+def _version_specs(target: Target, run_wide: str | Sequence[str] | None) -> list[str | None]:
     """Which version specs apply to this target, per-target override winning."""
     chosen = target.qna_version if target.qna_version is not None else run_wide
     if chosen is None:

@@ -48,7 +48,7 @@ def release_site_fixture():
 # A real executable is used rather than a mocked subprocess: the failure modes
 # that matter here (stdin encoding, pipe close, timeout kill, exit codes) only
 # show up when an actual process is spawned.
-_FAKE_QNA_SCRIPT = '''#!/usr/bin/env python3
+_FAKE_QNA_SCRIPT = """#!/usr/bin/env python3
 import pathlib
 import sys
 import time
@@ -63,7 +63,7 @@ sys.stdout.buffer.flush()
 sys.stderr.buffer.flush()
 __SENTINEL__
 sys.exit(__EXIT__)
-'''
+"""
 
 
 @dataclass
@@ -149,7 +149,7 @@ def fake_qna(tmp_path):
 # Real sudo cannot run here: it would prompt, or be absent on a CI runner. A
 # stub on PATH proves what argv assertions cannot -- that the relevance
 # expression still reaches qna's stdin *through* the extra exec.
-_FAKE_SUDO_SCRIPT = '''#!/usr/bin/env python3
+_FAKE_SUDO_SCRIPT = """#!/usr/bin/env python3
 import os
 import pathlib
 import sys
@@ -175,7 +175,7 @@ if not rest:
     sys.exit(1)
 # execv, not a subprocess: the command must inherit this process's stdin pipe.
 os.execv(rest[0], rest)
-'''
+"""
 
 
 @dataclass

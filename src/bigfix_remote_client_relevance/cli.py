@@ -193,7 +193,9 @@ def _update_inventory_platforms(
         try:
             update_inventory_platform(inventory, result.host, result.platform)
         except InventoryError as exc:
-            logger.warning("could not update platform for %s in %s: %s", result.host, inventory, exc)
+            logger.warning(
+                "could not update platform for %s in %s: %s", result.host, inventory, exc
+            )
         else:
             written.add(result.host)
 
@@ -204,8 +206,10 @@ def evaluate(
         list[str] | None,
         typer.Argument(
             metavar="[HOST] [CLIENT_RELEVANCE]",
-            help="SSH host followed by the client relevance; with --local, "
-            "--container or --inventory, just the client relevance.",
+            help=(
+                "SSH host followed by the client relevance; with --local, "
+                "--container or --inventory, just the client relevance."
+            ),
         ),
     ] = None,
     client_relevance_file: Annotated[
@@ -224,8 +228,7 @@ def evaluate(
         typer.Option(
             "--container",
             metavar="IMAGE",
-            help="Evaluate inside a container image. Repeatable, and composes "
-            "with --inventory.",
+            help="Evaluate inside a container image. Repeatable, and composes with --inventory.",
         ),
     ] = None,
     inventory: Annotated[
@@ -236,9 +239,11 @@ def evaluate(
         bool,
         typer.Option(
             "--update-inventory/--no-update-inventory",
-            help="Write a probed or corrected `platform` back into --inventory's "
-            "hosts.toml, so future runs skip the probe and a wrong entry stops "
-            "failing silently forever.",
+            help=(
+                "Write a probed or corrected `platform` back into --inventory's "
+                "hosts.toml, so future runs skip the probe and a wrong entry stops "
+                "failing silently forever."
+            ),
         ),
     ] = True,
     rebuild_image: Annotated[
@@ -252,8 +257,10 @@ def evaluate(
         bool,
         typer.Option(
             "--auto-setup/--no-auto-setup",
-            help="Install runtime libraries a container image is missing. "
-            "Turn off for air-gapped hosts.",
+            help=(
+                "Install runtime libraries a container image is missing. "
+                "Turn off for air-gapped hosts."
+            ),
         ),
     ] = True,
     qna_version: Annotated[
@@ -268,11 +275,13 @@ def evaluate(
         bool | None,
         typer.Option(
             "--become/--no-become",
-            help="Run qna under sudo (root-only inspectors). Applies to SSH and "
-            "--local; needs passwordless sudo, and has no effect on Windows. "
-            "Defaults on for --local when this machine is macOS, since qna "
-            "requires root there; pass --no-become to get the plain refusal "
-            "instead.",
+            help=(
+                "Run qna under sudo (root-only inspectors). Applies to SSH and "
+                "--local; needs passwordless sudo, and has no effect on Windows. "
+                "Defaults on for --local when this machine is macOS, since qna "
+                "requires root there; pass --no-become to get the plain refusal "
+                "instead."
+            ),
         ),
     ] = None,
     arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
@@ -281,16 +290,20 @@ def evaluate(
         typer.Option(
             "--platform",
             metavar="PLATFORM",
-            help="Force the bootstrap platform instead of probing the target. "
-            "Applies to targets named by flags, never to --inventory hosts.",
+            help=(
+                "Force the bootstrap platform instead of probing the target. "
+                "Applies to targets named by flags, never to --inventory hosts."
+            ),
         ),
     ] = None,
     insecure_skip_host_key_check: Annotated[
         bool,
         typer.Option(
             "--insecure-skip-host-key-check",
-            help="Do not verify the SSH host key. Removes protection against "
-            "interception; for throwaway lab endpoints only.",
+            help=(
+                "Do not verify the SSH host key. Removes protection against "
+                "interception; for throwaway lab endpoints only."
+            ),
         ),
     ] = False,
     max_parallel: Annotated[
@@ -300,8 +313,10 @@ def evaluate(
         int,
         typer.Option(
             "--pull-parallel",
-            help="Cap on concurrent image pulls and builds. Lower than "
-            "--max-parallel because pulls are far more expensive.",
+            help=(
+                "Cap on concurrent image pulls and builds. Lower than "
+                "--max-parallel because pulls are far more expensive."
+            ),
         ),
     ] = DEFAULT_PULL_PARALLEL,
     timeout: Annotated[
@@ -354,7 +369,7 @@ def evaluate(
         if len(args) < needed:
             _fail(
                 "expected a target and a client relevance, e.g. "
-                "`HOST \"name of operating system\"`; or choose a target with "
+                '`HOST "name of operating system"`; or choose a target with '
                 "--local, --container IMAGE, or --inventory hosts.toml"
             )
         host = args[0]

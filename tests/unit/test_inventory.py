@@ -178,9 +178,7 @@ def test_update_inventory_platform_adds_the_key_when_absent(tmp_path):
 
 def test_update_inventory_platform_overwrites_a_wrong_value(tmp_path):
     path = tmp_path / "hosts.toml"
-    path.write_text(
-        '[hosts.win-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8"
-    )
+    path.write_text('[hosts.win-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8")
 
     update_inventory_platform(path, "win-box", "windows")
 

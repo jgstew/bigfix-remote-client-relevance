@@ -60,7 +60,7 @@ class ParsedQnaOutput:
         """True when qna spoke on any known channel.
 
         Distinguishes a relevance that legitimately answered nothing (valid
-        transcript, zero answers) from qna emitting something unparseable.
+        transcript, zero answers) from qna emitting something unparsable.
         """
         return bool(self.answers or self.answer_types or self.errors or self.qna_time)
 

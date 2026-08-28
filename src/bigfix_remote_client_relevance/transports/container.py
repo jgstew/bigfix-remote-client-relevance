@@ -91,8 +91,7 @@ PLATFORM_PROBE_COMMAND = 'uname -s; . /etc/os-release 2>/dev/null && echo "$ID $
 # Which package manager does the image actually carry? Cheap cross-check for
 # an explicit (human-supplied) platform; ends in true so absence is not an error.
 FAMILY_SANITY_COMMAND = (
-    "command -v dpkg >/dev/null 2>&1 && echo dpkg; "
-    "command -v rpm >/dev/null 2>&1 && echo rpm; true"
+    "command -v dpkg >/dev/null 2>&1 && echo dpkg; command -v rpm >/dev/null 2>&1 && echo rpm; true"
 )
 
 _SPEC_FAMILIES = {"ubuntu": "deb", "debian": "deb", "rhel": "rpm", "suse": "rpm"}
@@ -291,8 +290,7 @@ class DockerEngine:
             return client
 
         raise ContainerEngineError(
-            f"cannot connect to the Docker daemon; {self._setup.hint()}. tried: "
-            + ", ".join(tried)
+            f"cannot connect to the Docker daemon; {self._setup.hint()}. tried: " + ", ".join(tried)
         )
 
     def _start_engine_and_wait(self, tried: list[str]) -> object | None:
@@ -592,7 +590,10 @@ class TransportContainer:
         if qna is None:
             return
         spec = spec_for(await self.resolve_platform(timeout_s=timeout_s))
-        self._prepared = (qna.version, await self._prepare_qna_image(qna, spec, timeout_s=timeout_s))
+        self._prepared = (
+            qna.version,
+            await self._prepare_qna_image(qna, spec, timeout_s=timeout_s),
+        )
 
     async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
         """The :data:`KNOWN_TARGETS` key for this image.
@@ -693,9 +694,7 @@ class TransportContainer:
                     platform=self.platform,
                     timeout=timeout_s,
                 )
-        except UnknownTargetError as exc:
-            return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
-        except (BootstrapFailure, LocalExtractionError) as exc:
+        except (UnknownTargetError, BootstrapFailure, LocalExtractionError) as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
         except (ContainerEngineError, OSError, TimeoutError) as exc:
             return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
@@ -888,9 +887,7 @@ class TransportContainer:
                 return False
 
             if needs_index_refresh(manager) and not refreshed:
-                await self._engine.exec_in(
-                    container_id, INDEX_REFRESH_COMMAND, timeout=timeout_s
-                )
+                await self._engine.exec_in(container_id, INDEX_REFRESH_COMMAND, timeout=timeout_s)
                 refreshed = True
 
             logger.info("installing %s in %s to provide %s", package, self.image, soname)

@@ -150,9 +150,7 @@ class FakeEngine:
 
     # helpers
     def commands(self) -> list[str]:
-        return [c.command for c in self.execs] + [
-            str(s["command"]) for s in self.one_shots
-        ]
+        return [c.command for c in self.execs] + [str(s["command"]) for s in self.one_shots]
 
 
 QNA_OUT = "A: Ubuntu 22.04.3 LTS\nI: singular string\nT: 0.2 ms\n"
@@ -283,9 +281,9 @@ async def test_timeout_maps_to_transport():
         async def run_one_shot(self, *a, **k):
             raise TimeoutError("container timed out")
 
-    result = await TransportContainer("ubuntu:22.04", engine=SlowEngine()).evaluate_client_relevance(
-        "true", timeout_s=0.1
-    )
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=SlowEngine()
+    ).evaluate_client_relevance("true", timeout_s=0.1)
 
     assert result.error_kind == ERROR_KIND_TRANSPORT
 
@@ -487,6 +485,7 @@ async def test_probed_platform_skips_the_sanity_check(resolved, extracted):
 # prerequisite of every image. The engine is local, so the artifact is unpacked
 # on the controller and the resulting tree bind-mounted read-only instead.
 
+
 @pytest.fixture
 def extracted(tmp_path):
     """A stand-in for a controller-side extracted tree, plus a call counter."""
@@ -643,6 +642,7 @@ async def test_exit_126_still_reads_as_a_missing_qna():
 # already baked in; later runs against the same (image digest, version, arch)
 # start it directly, no mount, no unpack, sub-second start.
 
+
 async def test_prepared_image_tag_scheme():
     from bigfix_remote_client_relevance.transports.container import prepared_image_tag
 
@@ -732,6 +732,7 @@ async def test_build_failure_falls_back_to_the_mount_flow(resolved, extracted):
 # image is being built, so it is committed once and every later run gets it
 # free. Gated by --no-auto-setup for air-gapped hosts.
 
+
 async def test_a_missing_library_is_installed_into_the_prepared_image(resolved, extracted):
     engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"])
 
@@ -780,9 +781,7 @@ async def test_the_install_loop_is_bounded(resolved, extracted):
                 return ("", "", 0)
             return super()._answer(command)
 
-    engine = NeverFixedEngine(
-        responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"]
-    )
+    engine = NeverFixedEngine(responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"])
 
     result = await TransportContainer(
         "rockylinux:9", engine=engine, extractor=extracted
@@ -840,7 +839,7 @@ async def test_the_build_gets_a_longer_timeout_than_the_evaluation(resolved, ext
     """A package install routinely outlasts a 30s evaluation budget."""
 
     class TimeoutRecordingEngine(FakeEngine):
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             super().__init__(**kwargs)
             self.exec_timeouts: list[float | None] = []
 
@@ -882,6 +881,7 @@ async def test_a_linkable_image_installs_nothing(resolved, extracted):
 # so on Apple Silicon every container run is emulated. That is the only thing
 # available, but it is slow and can behave differently from native — and it
 # used to happen with no indication at all.
+
 
 async def test_running_a_foreign_architecture_says_so(caplog, monkeypatch):
     import bigfix_remote_client_relevance.transports.container as container_module
@@ -932,9 +932,7 @@ async def test_aarch64_selects_the_arm64_docker_platform():
     """uname says aarch64; Docker only understands linux/arm64."""
     engine = FakeEngine(responses=[EVAL_OK], default=("", "", 0))
 
-    transport = TransportContainer(
-        "ubuntu:22.04", engine=engine, arch="aarch64", keep_alive=True
-    )
+    transport = TransportContainer("ubuntu:22.04", engine=engine, arch="aarch64", keep_alive=True)
     await transport.evaluate_client_relevance("true")
 
     assert engine.started[0]["platform"] == "linux/arm64"
@@ -944,9 +942,7 @@ async def test_aarch64_selects_the_arm64_docker_platform():
 async def test_x86_64_still_selects_the_amd64_docker_platform():
     engine = FakeEngine(responses=[EVAL_OK], default=("", "", 0))
 
-    transport = TransportContainer(
-        "ubuntu:22.04", engine=engine, arch="x86_64", keep_alive=True
-    )
+    transport = TransportContainer("ubuntu:22.04", engine=engine, arch="x86_64", keep_alive=True)
     await transport.evaluate_client_relevance("true")
 
     assert engine.started[0]["platform"] == "linux/amd64"
@@ -957,6 +953,7 @@ async def test_x86_64_still_selects_the_amd64_docker_platform():
 #
 # A transport is built per (target, version) pair, so two versions of one image
 # would otherwise pull it twice and build the same prepared image twice.
+
 
 def coordinator():
     from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
@@ -1220,6 +1217,7 @@ def test_docker_host_env_takes_precedence(monkeypatch):
 # "is Docker running?" is a question the tool can answer for itself. Nothing
 # here launches anything: detection, starting and sleeping are all injected.
 
+
 @dataclass
 class FakeSetup:
     """Stands in for the machine: what is installed, and what we did to it."""
@@ -1303,9 +1301,7 @@ async def test_nothing_installed_names_the_install_command():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
     setup = FakeSetup(starter=None)
-    engine = DockerEngine(
-        socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup
-    )
+    engine = DockerEngine(socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup)
 
     with pytest.raises(ContainerEngineError) as excinfo:
         engine._get_client()
@@ -1320,9 +1316,7 @@ async def test_an_engine_we_must_not_start_reports_its_command():
     setup = FakeSetup(
         starter=starter(name="Docker", argv=None, note="start it with: sudo systemctl start docker")
     )
-    engine = DockerEngine(
-        socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup
-    )
+    engine = DockerEngine(socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup)
 
     with pytest.raises(ContainerEngineError) as excinfo:
         engine._get_client()
@@ -1373,9 +1367,7 @@ def test_a_context_duplicating_a_hardcoded_path_is_not_listed_twice(monkeypatch)
     from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
 
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    candidates = candidate_docker_sockets(
-        endpoint_lookup=lambda: "unix:///var/run/docker.sock"
-    )
+    candidates = candidate_docker_sockets(endpoint_lookup=lambda: "unix:///var/run/docker.sock")
 
     assert candidates.count("unix:///var/run/docker.sock") == 1
 
@@ -1385,9 +1377,7 @@ async def test_engine_error_names_the_sockets_it_tried():
 
     # auto_setup=False so this asserts the error, not whatever engine happens
     # to be installed on the machine running the tests.
-    engine = DockerEngine(
-        socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False
-    )
+    engine = DockerEngine(socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False)
 
     with pytest.raises(ContainerEngineError) as excinfo:
         await engine.ensure_image("ubuntu:22.04")

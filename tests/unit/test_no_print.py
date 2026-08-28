@@ -73,7 +73,9 @@ def test_library_module_does_not_configure_logging(module):
     assert not offenders, f"{module.name} configures logging: {offenders}"
 
 
-async def test_evaluate_writes_nothing_to_stdout(fake_qna, qna_output, capsys, allow_non_root_macos):
+async def test_evaluate_writes_nothing_to_stdout(
+    fake_qna, qna_output, capsys, allow_non_root_macos
+):
     stub = fake_qna(stdout=qna_output("multi_answer"))
 
     await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)

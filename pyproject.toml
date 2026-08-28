@@ -1,15 +1,17 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-remote-client-relevance"
+version = "0.0.1"
 description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [{ name = "James Stewart" }]
+authors = [
+    { name = "JGStew", email = "admin@jgstew.com" },
+]
 requires-python = ">=3.11"
-dynamic = ["version"]
 keywords = ["bigfix", "qna", "client-relevance", "ssh", "docker"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -55,9 +57,6 @@ Issues   = "https://github.com/jgstew/bigfix_remote_client_relevance/issues"
 Source   = "https://github.com/jgstew/bigfix_remote_client_relevance"
 
 # --- Build backend ---------------------------------------------------------
-
-[tool.hatch.version]
-source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bigfix_remote_client_relevance"]

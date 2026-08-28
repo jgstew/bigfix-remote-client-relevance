@@ -112,7 +112,7 @@ results = await evaluate_client_relevance(
 One `ClientRelevanceResult` comes back per (target × version), carrying
 `answers`, `answer_types`, `error` / `error_kind`, the resolved `qna_version`,
 and the full `raw_qna_output` for debugging. Failures are reported inside
-results rather than raised, so one unreachable host never derails a fan-out.
+results rather than raised, so one unreachable host never breaks a fan-out.
 
 The library logs through `logging` and never writes to stdout — that channel
 belongs to the CLI's payload, and later to a stdio MCP server's JSON-RPC.

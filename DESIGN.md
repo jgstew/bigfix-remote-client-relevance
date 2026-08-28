@@ -180,8 +180,9 @@ Repo: **`jgstew/bigfix_remote_client_relevance`**.
 ## Packaging & Python versions
 Files in the repo are the source of truth; this section explains *why*.
 
-- **Build backend:** `hatchling` + `hatch-vcs`. Pure-Python, PEP 517/518/621
-  native, git-tag-driven versioning. See `pyproject.toml`.
+- **Build backend:** `hatchling`. Pure-Python, PEP 517/518/621 native.
+  `version` is a static field in `pyproject.toml` `[project]`, bumped by
+  hand as part of cutting a release.
 - **Primary dev tool:** [`uv`](https://docs.astral.sh/uv/). One tool for
   venvs, Python versions, install, lock, build, publish, and `uvx`
   no-install runs. Consumers can still `pip install
@@ -253,9 +254,9 @@ pip install bigfix-remote-client-relevance
 
 ## Release flow (planned, not wired yet)
 Cut a release in three steps:
-1. **Edit the draft** — [Release Drafter](https://github.com/release-drafter/release-drafter) keeps a draft GitHub Release open, auto-populated from merged PR titles/labels with a proposed next version. Bump the version if needed and tidy the notes.
-2. **Publish** the draft. GitHub creates the `v*` tag.
-3. **CI does the rest** — a `push: tags: ['v*']` workflow runs `uv build` + `uv publish` (via PyPI Trusted Publishing / OIDC, no long-lived token) and attaches the wheel to the release. `hatch-vcs` bakes the tag into the version automatically.
+1. **Bump the version** — edit `version` in `pyproject.toml` `[project]` by hand (no `hatch-vcs`/tag-derived versioning). [Release Drafter](https://github.com/release-drafter/release-drafter) keeps a draft GitHub Release open, auto-populated from merged PR titles/labels with a proposed next version, to guide the bump and tidy the notes.
+2. **Publish** the draft. GitHub creates the `v*` tag, matching the version just committed.
+3. **CI does the rest** — a `push: tags: ['v*']` workflow runs `uv build` + `uv publish` (via PyPI Trusted Publishing / OIDC, no long-lived token) and attaches the wheel to the release.
 
 Not implemented yet — added when the project is closer to a first release.
 
@@ -368,7 +369,7 @@ class ClientRelevanceResult:
                                  # exception / stderr summary
     error_kind: str | None       # None on success; else "relevance"
                                  # (E: line) | "qna" (nonzero exit /
-                                 # unparseable output) | "bootstrap"
+                                 # unparsable output) | "bootstrap"
                                  # (push/extract/prereq failure) |
                                  # "transport" (connect/auth/timeout) |
                                  # "resolve" (version spec resolution)
@@ -516,7 +517,7 @@ that into fetch-on-controller + push.
   `11.0/patch6/`).
 - A patch page lists per-OS/arch agent installers named
   `BESAgent-<full-version>-<platform>.<rpm|deb|pkg|exe>` (e.g.
-  `BESAgent-11.0.6.137-rhe7.x86_64.rpm`), plus `QNA<full-version>.zip`
+  `BESAgent-11.0.6.137-the7.x86_64.rpm`), plus `QNA<full-version>.zip`
   (standalone QnA, Windows) and published checksums.
 - `bootstrap/release_site.py` scrapes this: resolve a version spec to a
   full version, then map (full version, target platform/arch) to a

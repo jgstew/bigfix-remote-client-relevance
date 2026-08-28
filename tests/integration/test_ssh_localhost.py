@@ -32,7 +32,7 @@ async def test_evaluates_over_a_real_ssh_connection(stub_qna_on_disk):
     transport = TransportSSH("localhost", target="macos")
     try:
         result = await transport.evaluate_client_relevance(
-            "names of folders of folder \"/tmp\"", qna_path=stub_qna_on_disk.path
+            'names of folders of folder "/tmp"', qna_path=stub_qna_on_disk.path
         )
     finally:
         await transport.aclose()

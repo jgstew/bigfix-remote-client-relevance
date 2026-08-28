@@ -17,7 +17,7 @@ class FakeBesapiClient:
 
 
 async def test_constructor_signature_is_fixed():
-    transport = TransportFastQuery(FakeBesapiClient(), computer_query="name of it = \"lab-1\"")
+    transport = TransportFastQuery(FakeBesapiClient(), computer_query='name of it = "lab-1"')
 
     assert transport is not None
 

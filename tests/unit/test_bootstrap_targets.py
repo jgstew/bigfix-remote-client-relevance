@@ -155,6 +155,7 @@ def test_classify_unrecognized_linux_defaults_to_deb_family():
 # is fully controlled, so a guess would fabricate data (issue #1): strict mode
 # refuses instead.
 
+
 def test_strict_mode_refuses_unrecognized_linux():
     with pytest.raises(UnknownTargetError):
         classify_uname("Linux\nsomething-exotic", strict=True)
@@ -204,6 +205,7 @@ def test_default_mode_still_guesses_deb_family_for_ssh():
 # The same architecture goes by several names depending on who is asking:
 # uname says aarch64, macOS says arm64, Docker says linux/arm64, and the
 # release site's rpm builds say aarch64 while its deb builds say arm64.
+
 
 @pytest.mark.parametrize(
     ("machine", "expected"),

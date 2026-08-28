@@ -148,6 +148,7 @@ def test_inventory_supplies_targets(captured, tmp_path):
 # Issue #1: four images used to require writing a hosts.toml, and forcing a
 # platform for a one-shot query was impossible from the CLI at all.
 
+
 def test_container_flag_is_repeatable(captured):
     result = invoke("--container", "almalinux:9", "--container", "ubuntu:22.04", "true")
 
@@ -260,7 +261,9 @@ def test_update_inventory_skips_a_host_whose_platform_already_matches(
 ):
     calls = _spy_on_update_inventory_platform(monkeypatch)
     inventory = tmp_path / "hosts.toml"
-    inventory.write_text('[hosts.deb-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8")
+    inventory.write_text(
+        '[hosts.deb-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8"
+    )
     captured["results"] = [
         ClientRelevanceResult(
             host="deb-box", transport="ssh", client_relevance="true", platform="ubuntu"
@@ -541,6 +544,7 @@ def test_errors_are_reported_on_stderr_not_stdout(monkeypatch):
 # differ. The issue that prompted this was verifying byte-identity across ten
 # images by hand with a pile of md5 calls.
 
+
 def test_diff_collapses_identical_answers(captured):
     captured["results"] = [result_for(f"h{i}", ["2134"]) for i in range(3)]
 
@@ -595,8 +599,7 @@ def test_diff_gives_errors_their_own_group(captured):
 
 def test_diff_collapses_identical_errors(captured):
     captured["results"] = [
-        result_for(f"h{i}", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT)
-        for i in range(2)
+        result_for(f"h{i}", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT) for i in range(2)
     ]
 
     result = invoke("--container", "a", "--diff", "true")
@@ -639,9 +642,7 @@ def test_diff_and_json_together_is_a_usage_error(captured):
     [(None, 0), (ERROR_KIND_RELEVANCE, 1), (ERROR_KIND_TRANSPORT, 3)],
 )
 def test_diff_does_not_change_the_exit_code(captured, kind, expected):
-    captured["results"] = [
-        result_for("h", ["2134"], error="boom" if kind else None, kind=kind)
-    ]
+    captured["results"] = [result_for("h", ["2134"], error="boom" if kind else None, kind=kind)]
 
     assert invoke("--container", "a", "--diff", "true").exit_code == expected
 
