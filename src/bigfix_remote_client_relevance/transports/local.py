@@ -90,6 +90,15 @@ class TransportLocal:
 
     Used for tests and for a fast syntax check before paying for an SSH or
     container round-trip.
+
+    Once ``become`` proves unable to elevate (no passwordless sudo, or no
+    ``sudo`` binary at all), that verdict is cached for the life of this
+    instance rather than retried on every call -- see ``_sudo_broken``. There
+    is no reset method: this instance has no connection or other state worth
+    preserving, so after fixing sudo config the way to retry is to construct
+    a new ``TransportLocal``. The CLI already does this on every invocation;
+    a long-lived embedder (e.g. a future MCP server) wanting a retry should
+    do the same.
     """
 
     def __init__(
@@ -110,6 +119,8 @@ class TransportLocal:
         self._target = target
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
+        # Set once a `become` run proves sudo cannot elevate; see class docstring.
+        self._sudo_broken: str | None = None
 
     def _local_target(self) -> str:
         if self._target is not None:
@@ -144,6 +155,9 @@ class TransportLocal:
         root_problem = self._macos_root_problem()
         if root_problem is not None:
             return _result(error=root_problem, error_kind=ERROR_KIND_BOOTSTRAP)
+
+        if self._sudo_broken is not None:
+            return _result(error=self._sudo_broken, error_kind=ERROR_KIND_BOOTSTRAP)
 
         if qna is not None:
             try:
@@ -184,6 +198,8 @@ class TransportLocal:
                 if argv[0] == "sudo"
                 else f"could not start qna at {resolved_path}: {exc}"
             )
+            if argv[0] == "sudo":
+                self._sudo_broken = detail
             return _result(
                 qna_path=resolved_path,
                 error=detail,
@@ -218,6 +234,7 @@ class TransportLocal:
             privilege = sudo_privilege_problem(stderr)
             if privilege is not None:
                 error, error_kind = privilege, ERROR_KIND_BOOTSTRAP
+                self._sudo_broken = privilege
 
         return _result(
             answers=parsed.answers,
@@ -248,6 +265,12 @@ class TransportLocal:
                 "become has no effect on Windows: there is no sudo, and elevation "
                 "is a per-process UAC decision rather than a command prefix"
             )
+            return argv
+
+        if os.geteuid() == 0:
+            # Already root: sudo would be a redundant extra exec, and this
+            # sidesteps needing to reason about how sudo's own PAM stack
+            # treats a root-owned parent, which varies by platform.
             return argv
 
         # -n never prompts: sudo either has a cached or NOPASSWD credential or

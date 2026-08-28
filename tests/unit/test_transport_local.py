@@ -311,7 +311,9 @@ async def test_root_check_does_not_apply_off_macos(fake_qna, monkeypatch):
 # --- privilege escalation --------------------------------------------------
 
 
-def test_become_prefixes_the_argv_with_sudo_n():
+def test_become_prefixes_the_argv_with_sudo_n(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
     argv = TransportLocal(become=True)._eval_argv("/opt/qna")
 
     assert argv == ["sudo", "-n", "/opt/qna", "-t", "-showtypes"]
@@ -319,6 +321,11 @@ def test_become_prefixes_the_argv_with_sudo_n():
 
 def test_without_become_the_argv_has_no_sudo():
     assert TransportLocal()._eval_argv("/opt/qna") == ["/opt/qna", "-t", "-showtypes"]
+
+
+def test_eval_argv_skips_sudo_when_already_root():
+    """Already root: sudo would be a redundant extra exec."""
+    assert TransportLocal(become=True)._eval_argv("/opt/qna") == ["/opt/qna", "-t", "-showtypes"]
 
 
 def test_become_is_ignored_on_windows_with_a_warning(monkeypatch, caplog):
@@ -335,11 +342,13 @@ def test_become_is_ignored_on_windows_with_a_warning(monkeypatch, caplog):
 def test_become_applies_on_linux_not_just_macos(monkeypatch):
     """Root-only inspectors are not a macOS peculiarity."""
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
 
     assert TransportLocal(become=True)._eval_argv("/opt/qna")[:2] == ["sudo", "-n"]
 
 
-async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo):
+async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
     sudo = fake_sudo()
 
@@ -353,8 +362,9 @@ async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo):
     assert result.error_kind is None
 
 
-async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo):
+async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo, monkeypatch):
     """`sudo -n` never reads stdin, so the expression survives the extra exec."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\n")
     fake_sudo()
 
@@ -363,7 +373,8 @@ async def test_become_still_pipes_the_relevance_to_stdin(fake_qna, fake_sudo):
     assert stub.stdin_text == "true\n"
 
 
-async def test_become_strips_the_q_prefix_through_sudo(fake_qna, fake_sudo):
+async def test_become_strips_the_q_prefix_through_sudo(fake_qna, fake_sudo, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\n")
     fake_sudo()
 
@@ -408,8 +419,8 @@ async def test_become_suppresses_the_non_root_warning(fake_qna, fake_sudo, monke
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
-async def test_become_as_root_on_macos_still_uses_sudo(fake_qna, fake_sudo, monkeypatch):
-    """Predictable argv beats saving an exec; TransportSSH does not check uid either."""
+async def test_become_skips_sudo_entirely_when_already_root(fake_qna, fake_sudo, monkeypatch):
+    """No point wrapping an already-root process in sudo."""
     stub = fake_qna(stdout="A: yes\n")
     sudo = fake_sudo()
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -417,7 +428,8 @@ async def test_become_as_root_on_macos_still_uses_sudo(fake_qna, fake_sudo, monk
 
     await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
 
-    assert sudo.was_invoked
+    assert not sudo.was_invoked
+    assert stub.was_invoked
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
@@ -435,8 +447,9 @@ async def test_macos_root_refusal_survives_without_become(fake_qna, monkeypatch)
     assert not stub.was_invoked
 
 
-async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo):
+async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, monkeypatch):
     """A privilege problem is not the relevance engine failing."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: unreachable\n")
     fake_sudo(deny="sudo: a password is required\n")
 
@@ -450,7 +463,8 @@ async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo):
     assert not stub.was_invoked
 
 
-async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo):
+async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="")
     fake_sudo(deny="sudo: someone is not in the sudoers file.\n")
 
@@ -461,7 +475,8 @@ async def test_sudo_refusal_keeps_the_original_sudo_line(fake_qna, fake_sudo):
     assert "not in the sudoers file" in (result.error or "")
 
 
-async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo):
+async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="", stderr="qna: bad expression\n", exit_code=3)
     fake_sudo()
 
@@ -473,8 +488,9 @@ async def test_qna_failure_under_become_is_still_a_qna_error(fake_qna, fake_sudo
 
 
 async def test_relevance_error_under_become_stays_a_relevance_error(
-    fake_qna, fake_sudo, qna_output
+    fake_qna, fake_sudo, qna_output, monkeypatch
 ):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout=qna_output("relevance_error"))
     fake_sudo()
 
@@ -487,6 +503,7 @@ async def test_relevance_error_under_become_stays_a_relevance_error(
 
 async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, tmp_path):
     """Blaming the qna path for a failed `sudo` exec sends the user the wrong way."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
     stub = fake_qna(stdout="A: yes\n")
     empty = tmp_path / "empty_path"
     empty.mkdir()
@@ -499,6 +516,62 @@ async def test_missing_sudo_binary_is_a_bootstrap_error(fake_qna, monkeypatch, t
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
     assert "sudo" in (result.error or "").lower()
     assert stub.path not in (result.error or "")
+
+
+# --- caching a known-broken elevation ---------------------------------------
+
+
+async def test_sudo_broken_state_is_cached_after_first_failure(fake_qna, fake_sudo, monkeypatch):
+    """A second call must not spawn and fail sudo all over again."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout="A: unreachable\n")
+    sudo = fake_sudo(deny="sudo: a password is required\n")
+    transport = TransportLocal(become=True)
+
+    first = await transport.evaluate_client_relevance("true", qna_path=stub.path)
+    second = await transport.evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert sudo.call_count == 1, "the second call should use the cached verdict"
+    assert first.error_kind == ERROR_KIND_BOOTSTRAP
+    assert second.error_kind == ERROR_KIND_BOOTSTRAP
+    assert first.error == second.error
+    assert not stub.was_invoked
+
+
+async def test_missing_sudo_binary_is_cached_too(fake_qna, monkeypatch, tmp_path):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout="A: yes\n")
+    empty = tmp_path / "empty_path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    transport = TransportLocal(become=True)
+
+    first = await transport.evaluate_client_relevance("true", qna_path=stub.path)
+    second = await transport.evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert first.error_kind == ERROR_KIND_BOOTSTRAP
+    assert second.error_kind == ERROR_KIND_BOOTSTRAP
+    assert first.error == second.error
+
+
+async def test_broken_elevation_cache_is_per_instance(fake_qna, fake_sudo, monkeypatch):
+    """A fresh instance must retry rather than inherit another instance's verdict."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout="A: yes\n")
+    sudo = fake_sudo(deny="sudo: a password is required\n")
+
+    broken = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+    assert broken.error_kind == ERROR_KIND_BOOTSTRAP
+    assert sudo.call_count == 1
+
+    fresh = await TransportLocal(become=True).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert fresh.error_kind == ERROR_KIND_BOOTSTRAP
+    assert sudo.call_count == 2, "a new instance must attempt sudo again, not reuse the cache"
 
 
 async def test_sudo_stderr_is_ignored_without_become(fake_qna):

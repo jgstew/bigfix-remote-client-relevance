@@ -785,6 +785,14 @@ answers cross an untrusted network.
   POSIX platform, not just macOS; on Windows it warns and runs unelevated,
   as it does over SSH. One caveat: a timeout kills sudo, and the root-owned
   qna child outlives it, because an unprivileged parent cannot signal it.
+  When this process is already root, `sudo` is skipped entirely rather than
+  invoked as a no-op — simpler than depending on how `sudo`'s own PAM stack
+  treats a root-owned caller, which differs by platform. Once a `become` run
+  proves sudo cannot elevate (missing binary, no usable credential), that
+  verdict is cached for the life of the `TransportLocal` instance rather than
+  retried on every call; there is deliberately no reset method; a fresh
+  instance is the way to retry after fixing sudoers, which the CLI already
+  does on every invocation.
 - **Windows shell.** Every Windows command this package builds is PowerShell
   (`Test-Path`, `New-Item`, `Expand-Archive`, the `&` call operator), but
   Windows OpenSSH hands commands to `cmd.exe` unless the `DefaultShell`

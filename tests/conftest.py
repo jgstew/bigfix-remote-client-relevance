@@ -143,7 +143,10 @@ import pathlib
 import sys
 
 here = pathlib.Path(__file__).resolve().parent
-(here / "argv.txt").write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+# Appended, not overwritten: a caching test needs to prove a *second* call
+# never re-invoked sudo, which an overwritten record could not show.
+with open(here / "calls.log", "a", encoding="utf-8") as log:
+    log.write("\\t".join(sys.argv[1:]) + "\\n")
 
 deny = here / "deny.bin"
 if deny.exists():
@@ -170,13 +173,25 @@ class FakeSudo:
     directory: Path
 
     @property
+    def _calls(self) -> list[str]:
+        log = self.directory / "calls.log"
+        if not log.exists():
+            return []
+        return [line for line in log.read_text(encoding="utf-8").splitlines() if line]
+
+    @property
     def argv(self) -> list[str]:
-        text = (self.directory / "argv.txt").read_text(encoding="utf-8")
-        return text.split("\n") if text else []
+        """The most recent invocation's argv."""
+        calls = self._calls
+        return calls[-1].split("\t") if calls else []
 
     @property
     def was_invoked(self) -> bool:
-        return (self.directory / "argv.txt").exists()
+        return bool(self._calls)
+
+    @property
+    def call_count(self) -> int:
+        return len(self._calls)
 
 
 @pytest.fixture
