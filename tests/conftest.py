@@ -159,7 +159,7 @@ def _docker_available() -> bool:
         client = docker.from_env()
         client.ping()
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure at all means no usable daemon
         return False
 
 
@@ -170,6 +170,7 @@ def _ssh_localhost_available() -> bool:
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "localhost", "true"],
             capture_output=True,
             timeout=10,
+            check=False,
         )
         return completed.returncode == 0
     except (OSError, subprocess.SubprocessError):

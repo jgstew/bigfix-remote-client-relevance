@@ -197,27 +197,61 @@ async def test_resolved_qna_not_supported_until_m3(fake_qna, tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
-async def test_macos_non_root_warns_but_proceeds(fake_qna, qna_output, monkeypatch, caplog):
-    """qna needs root for *some* inspectors on macOS, so warn rather than block."""
-    stub = fake_qna(stdout=qna_output("single_answer"))
+async def test_macos_non_root_fails_fast_with_bootstrap_error(fake_qna, monkeypatch):
+    """Refuse before spawning: non-root qna on macOS aborts with a C++ crash.
+
+    Observed against BESAgent 11.x on macOS 15 — even `TRUE` dies with an
+    uncaught FileIOError rather than answering or reporting an E: line, so a
+    clear pre-flight error beats surfacing that crash dump to the user.
+    """
+    stub = fake_qna(stdout="A: unreachable\n")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
+    result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "root" in (result.error or "").lower()
+    assert "sudo" in (result.error or "").lower()
+    assert not stub.was_invoked, "qna should not be spawned when it cannot work"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_macos_root_check_can_be_waived(fake_qna, monkeypatch, caplog):
+    """Escape hatch for setups where non-root qna does work."""
+    stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
 
     with caplog.at_level(logging.WARNING):
-        result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+        result = await TransportLocal(require_root_on_macos=False).evaluate_client_relevance(
+            "true", qna_path=stub.path
+        )
 
     assert result.error_kind is None
-    assert result.answers == ["Mac OS 15.5"]
+    assert result.answers == ["yes"]
     assert any("root" in record.message.lower() for record in caplog.records)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
-async def test_macos_as_root_does_not_warn(fake_qna, monkeypatch, caplog):
+async def test_macos_as_root_proceeds_without_warning(fake_qna, monkeypatch, caplog):
     stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
 
     with caplog.at_level(logging.WARNING):
-        await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+        result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
 
+    assert result.error_kind is None
     assert not [r for r in caplog.records if "root" in r.message.lower()]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_root_check_does_not_apply_off_macos(fake_qna, monkeypatch):
+    stub = fake_qna(stdout="A: yes\nT: 0.1 ms\n")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+
+    result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert result.error_kind is None
