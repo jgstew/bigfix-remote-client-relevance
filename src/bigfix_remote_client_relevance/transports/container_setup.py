@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -77,4 +78,44 @@ def docker_context_endpoint(
     return endpoint
 
 
-__all__ = ["docker_context_endpoint"]
+@dataclass(frozen=True)
+class EngineStarter:
+    """An engine found on this machine, and how (or whether) to start it."""
+
+    name: str
+    argv: list[str] | None
+    """``None`` means detected but not ours to start — see ``note``."""
+
+    note: str = ""
+
+
+def detect_engine_starter(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    exists: Callable[[str], bool] | None = None,
+) -> EngineStarter | None:
+    """The engine installed here that could be started, if any.
+
+    Linux and Windows are detected but never started: starting a system
+    service needs privileges this tool should not be exercising on the user's
+    behalf, so they are reported with the command to run instead.
+    """
+    raise NotImplementedError
+
+
+def install_hint(system: str | None = None) -> str:
+    """How to install a container engine on this platform.
+
+    Only commands that are actually right for the platform — a wrong install
+    command is worse than none.
+    """
+    raise NotImplementedError
+
+
+__all__ = [
+    "EngineStarter",
+    "detect_engine_starter",
+    "docker_context_endpoint",
+    "install_hint",
+]

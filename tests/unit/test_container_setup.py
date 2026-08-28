@@ -92,3 +92,75 @@ def test_the_probe_asks_for_the_docker_endpoint():
     argv, _timeout = run.calls[0]
     assert argv[:2] == ["context", "inspect"]
     assert "{{.Endpoints.docker.Host}}" in argv
+
+
+# --- an engine that is installed but not running ------------------------------
+#
+# "is Docker running?" is a question the tool can answer for itself. Detection
+# is injectable so no test ever launches anything.
+
+_M19 = pytest.mark.xfail(strict=True, reason="M19: a stopped engine is not detected")
+
+
+def fake_host(*, installed: tuple[str, ...] = (), apps: tuple[str, ...] = ()):
+    """A machine with the named binaries on PATH and the named apps installed."""
+    return {
+        "which": lambda name: f"/usr/local/bin/{name}" if name in installed else None,
+        "exists": lambda path: any(app in path for app in apps),
+    }
+
+
+@_M19
+def test_docker_desktop_is_detected_on_macos():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_engine_starter
+
+    starter = detect_engine_starter(system="darwin", **fake_host(apps=("Docker.app",)))
+
+    assert starter is not None
+    assert starter.argv == ["open", "-a", "Docker"]
+
+
+@_M19
+def test_colima_is_detected_when_docker_desktop_is_absent():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_engine_starter
+
+    starter = detect_engine_starter(system="darwin", **fake_host(installed=("colima",)))
+
+    assert starter is not None
+    assert starter.argv == ["colima", "start"]
+
+
+@_M19
+def test_nothing_installed_is_detected_as_nothing():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_engine_starter
+
+    assert detect_engine_starter(system="darwin", **fake_host()) is None
+
+
+@_M19
+def test_linux_reports_the_command_rather_than_running_it():
+    """Starting a system service needs privileges this tool should not exercise."""
+    from bigfix_remote_client_relevance.transports.container_setup import detect_engine_starter
+
+    starter = detect_engine_starter(system="linux", **fake_host(installed=("docker",)))
+
+    assert starter is not None
+    assert starter.argv is None, "a system daemon is not ours to start"
+    assert "systemctl" in starter.note
+
+
+@_M19
+def test_the_macos_install_hint_names_a_real_command():
+    from bigfix_remote_client_relevance.transports.container_setup import install_hint
+
+    assert "brew install" in install_hint("darwin")
+
+
+@_M19
+def test_the_linux_install_hint_points_at_the_docs():
+    """No invented distro commands — the docs are the honest answer."""
+    from bigfix_remote_client_relevance.transports.container_setup import install_hint
+
+    hint = install_hint("linux")
+
+    assert "docs.docker.com" in hint

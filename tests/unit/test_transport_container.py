@@ -1068,6 +1068,143 @@ def test_docker_host_env_takes_precedence(monkeypatch):
     assert candidate_docker_sockets(endpoint_lookup=lambda: None)[0] == "unix:///custom/docker.sock"
 
 
+# --- starting an engine that is installed but stopped -------------------------
+#
+# "is Docker running?" is a question the tool can answer for itself. Nothing
+# here launches anything: detection, starting and sleeping are all injected.
+
+_M19 = pytest.mark.xfail(strict=True, reason="M19: a stopped engine is not started")
+
+
+@dataclass
+class FakeSetup:
+    """Stands in for the machine: what is installed, and what we did to it."""
+
+    starter: object = None
+    started: list[str] = field(default_factory=list)
+    slept: list[float] = field(default_factory=list)
+
+    def detect(self):
+        return self.starter
+
+    def start(self, starter) -> None:
+        self.started.append(starter.name)
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+
+    def hint(self) -> str:
+        return "brew install --cask docker"
+
+
+def starter(name="Docker Desktop", argv=("open", "-a", "Docker"), note=""):
+    from bigfix_remote_client_relevance.transports.container_setup import EngineStarter
+
+    return EngineStarter(name=name, argv=list(argv) if argv else None, note=note)
+
+
+def engine_that_answers_after(attempts: int, setup):
+    """A DockerEngine whose socket starts working only after N connect attempts."""
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    state = {"tries": 0}
+
+    class LateEngine(DockerEngine):
+        def _connect(self, urls, tried):
+            state["tries"] += 1
+            tried.extend(urls)
+            return FakeDockerClient() if state["tries"] > attempts else None
+
+    engine = LateEngine(socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup)
+    engine.tries = state
+    return engine
+
+
+@_M19
+async def test_a_stopped_engine_is_started_and_awaited():
+    setup = FakeSetup(starter=starter())
+    engine = engine_that_answers_after(1, setup)
+
+    engine._get_client()
+
+    assert setup.started == ["Docker Desktop"]
+
+
+@_M19
+async def test_auto_setup_off_starts_nothing():
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    setup = FakeSetup(starter=starter())
+    engine = DockerEngine(
+        socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False, setup=setup
+    )
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        engine._get_client()
+
+    assert setup.started == []
+    assert "not/here.sock" in str(excinfo.value), "it must still name what it tried"
+
+
+@_M19
+async def test_the_wait_for_the_engine_is_bounded():
+    setup = FakeSetup(starter=starter())
+    engine = engine_that_answers_after(10_000, setup)  # never comes up
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        engine._get_client()
+
+    assert sum(setup.slept) <= 120, "a stopped engine must not hang the run"
+    assert "Docker Desktop" in str(excinfo.value)
+
+
+@_M19
+async def test_nothing_installed_names_the_install_command():
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    setup = FakeSetup(starter=None)
+    engine = DockerEngine(
+        socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup
+    )
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        engine._get_client()
+
+    assert "brew install" in str(excinfo.value)
+    assert "nope.sock" in str(excinfo.value)
+
+
+@_M19
+async def test_an_engine_we_must_not_start_reports_its_command():
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    setup = FakeSetup(
+        starter=starter(name="Docker", argv=None, note="start it with: sudo systemctl start docker")
+    )
+    engine = DockerEngine(
+        socket_candidates=["unix:///nope.sock"], auto_setup=True, setup=setup
+    )
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        engine._get_client()
+
+    assert setup.started == [], "a system daemon is not ours to start"
+    assert "systemctl start docker" in str(excinfo.value)
+
+
+@_M19
+async def test_an_injected_client_never_triggers_setup():
+    """Tests and callers that supply a client must never launch anything."""
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    setup = FakeSetup(starter=starter())
+    engine = DockerEngine(client=FakeDockerClient(), auto_setup=True, setup=setup)
+
+    engine._get_client()
+
+    assert setup.started == []
+
+
 # --- the docker context, which the SDK does not read --------------------------
 
 
