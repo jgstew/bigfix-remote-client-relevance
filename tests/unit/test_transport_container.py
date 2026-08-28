@@ -327,10 +327,6 @@ async def test_provisioning_container_is_stopped_when_not_keep_alive(resolved):
 # images the Debian agent. With no explicit target it must probe the image the
 # way TransportSSH probes a host, and refuse rather than guess.
 
-_M7 = pytest.mark.xfail(strict=True, reason="M7: container platform probe not implemented")
-
-
-@_M7
 async def test_unspecified_target_probes_the_image_before_provisioning(resolved):
     engine = FakeEngine(
         responses=[PROBE_ALMA, (r"bfrcr-complete", ("", "", 1)), RPM_PREREQS_OK, EVAL_OK]
@@ -345,7 +341,6 @@ async def test_unspecified_target_probes_the_image_before_provisioning(resolved)
     assert "dpkg-deb -x" not in joined, "the Debian agent path is the issue #1 bug"
 
 
-@_M7
 async def test_probe_output_feeds_resolve_platform():
     engine = FakeEngine(responses=[PROBE_ALMA])
 
@@ -354,7 +349,6 @@ async def test_probe_output_feeds_resolve_platform():
     assert platform == "rhel"
 
 
-@_M7
 async def test_probe_runs_once_per_transport_instance(resolved):
     engine = FakeEngine(
         responses=[PROBE_ALMA, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK]
@@ -368,7 +362,6 @@ async def test_probe_runs_once_per_transport_instance(resolved):
     assert len(probes) == 1, "probe result must be cached on the transport"
 
 
-@_M7
 async def test_unclassifiable_probe_maps_to_bootstrap(resolved):
     engine = FakeEngine(responses=[(r"os-release", ("Linux\nsomething-exotic", "", 0))])
 
@@ -380,7 +373,6 @@ async def test_unclassifiable_probe_maps_to_bootstrap(resolved):
     assert "platform" in (result.error or "").lower(), "error must point at the escape hatch"
 
 
-@_M7
 async def test_probe_failure_maps_to_transport(resolved):
     class ProbeBrokenEngine(FakeEngine):
         async def run_one_shot(self, image, command, **kwargs):
@@ -395,7 +387,6 @@ async def test_probe_failure_maps_to_transport(resolved):
     assert result.error_kind == ERROR_KIND_TRANSPORT
 
 
-@_M7
 async def test_keep_alive_probe_reuses_the_running_container_flow(resolved):
     engine = FakeEngine(
         responses=[PROBE_ALMA, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK]

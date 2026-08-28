@@ -30,7 +30,12 @@ from bigfix_remote_client_relevance.bootstrap.provision import (
     provision_qna,
     qna_path_for,
 )
-from bigfix_remote_client_relevance.bootstrap.targets import TargetSpec, spec_for
+from bigfix_remote_client_relevance.bootstrap.targets import (
+    TargetSpec,
+    UnknownTargetError,
+    classify_uname,
+    spec_for,
+)
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_TRANSPORT,
@@ -57,6 +62,10 @@ DEFAULT_QNA_COMMAND = "qna"
 
 # A container that must stay alive between commands needs a foreground process.
 KEEP_ALIVE_COMMAND = "sleep infinity"
+
+# Same probe TransportSSH runs: kernel on line one, os-release tokens on line
+# two. The container's answer is authoritative, so it is classified strictly.
+PLATFORM_PROBE_COMMAND = 'uname -s; . /etc/os-release 2>/dev/null && echo "$ID $ID_LIKE"'
 
 
 class ContainerEngineError(Exception):
@@ -318,7 +327,7 @@ class TransportContainer:
         engine: ContainerEngine | None = None,
         arch: str = "x86_64",
         keep_alive: bool = False,
-        target: str = "ubuntu",
+        target: str | None = None,
         state_dir: Path | None = None,
         recheck_prereqs: bool = False,
     ) -> None:
@@ -327,6 +336,7 @@ class TransportContainer:
         self._engine = engine or DockerEngine()
         self._keep_alive = keep_alive
         self._target = target
+        self._probed: str | None = None
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
         self._container_id: str | None = None
@@ -346,6 +356,30 @@ class TransportContainer:
             await self._engine.stop(self._container_id)
             self._container_id = None
 
+    async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
+        """The :data:`KNOWN_TARGETS` key for this image.
+
+        An explicit ``target`` wins; otherwise the image is probed once and the
+        answer cached, the way :class:`TransportSSH` probes a host. The probe
+        is classified strictly — the container's answer is authoritative, so a
+        guess here would fabricate data (issue #1).
+        """
+        if self._target is not None:
+            return self._target
+        if self._probed is None:
+            await self._engine.ensure_image(self.image, platform=self.platform)
+            if self._container_id is not None:
+                stdout, _stderr, _code = await self._engine.exec_in(
+                    self._container_id, PLATFORM_PROBE_COMMAND, timeout=timeout_s
+                )
+            else:
+                stdout, _stderr, _code = await self._engine.run_one_shot(
+                    self.image, PLATFORM_PROBE_COMMAND, platform=self.platform, timeout=timeout_s
+                )
+            self._probed = classify_uname(stdout, strict=True)
+            logger.debug("probed %s as platform %r", self.image, self._probed)
+        return self._probed
+
     async def evaluate_client_relevance(
         self,
         client_relevance: str,
@@ -355,7 +389,6 @@ class TransportContainer:
         timeout_s: float = 30.0,
     ) -> ClientRelevanceResult:
         started = time.monotonic()
-        spec = spec_for(self._target)
 
         def _result(**overrides: object) -> ClientRelevanceResult:
             base: dict[str, object] = {
@@ -377,6 +410,13 @@ class TransportContainer:
         transient_container: str | None = None
         try:
             await self._engine.ensure_image(self.image, platform=self.platform)
+
+            # Provisioning needs the real platform (deb vs rpm agent); without
+            # provisioning the spec is cosmetic, so the cheap path never probes.
+            if qna is not None:
+                spec = spec_for(await self.resolve_platform(timeout_s=timeout_s))
+            else:
+                spec = spec_for(self._target or "ubuntu")
 
             needs_container = qna is not None or self._keep_alive
             if needs_container:
@@ -410,6 +450,8 @@ class TransportContainer:
                     platform=self.platform,
                     timeout=timeout_s,
                 )
+        except UnknownTargetError as exc:
+            return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
         except BootstrapFailure as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
         except (ContainerEngineError, OSError, TimeoutError) as exc:
@@ -461,7 +503,7 @@ class TransportContainer:
 
     def resolved_qna_path(self, version: str) -> str:
         """Where a provisioned version lands inside the container."""
-        return qna_path_for(spec_for(self._target), version)
+        return qna_path_for(spec_for(self._target or self._probed or "ubuntu"), version)
 
 
 def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
