@@ -175,17 +175,39 @@ def _docker_available() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def _ssh_localhost_available() -> bool:
-    try:
-        completed = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "localhost", "true"],
-            capture_output=True,
-            timeout=10,
-            check=False,
+def _ssh_localhost_status() -> tuple[bool, str]:
+    """Can the SSH transport actually log into localhost?
+
+    Reports *why* not, because the three failure modes need different fixes:
+    sshd not running, the host key not trusted, or — much the most common on a
+    dev box — sshd running fine with no key authorized for this user.
+    """
+    completed = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "localhost", "true"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return True, ""
+
+    stderr = completed.stderr.strip()
+    lowered = stderr.lower()
+    if "permission denied" in lowered:
+        return False, (
+            "sshd on localhost is running but no key is authorized for this user. "
+            "To enable: ssh-keygen -t ed25519 (if needed), then "
+            "cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys"
         )
-        return completed.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    if "host key verification" in lowered:
+        return False, (
+            "localhost's host key is not trusted; add it with "
+            "ssh-keyscan -H localhost >> ~/.ssh/known_hosts"
+        )
+    if "connection refused" in lowered or "connect to host" in lowered:
+        return False, "sshd is not accepting connections on localhost (enable Remote Login)"
+    return False, f"cannot ssh to localhost: {stderr or 'unknown failure'}"
 
 
 def pytest_collection_modifyitems(config, items):
@@ -196,10 +218,10 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(pytest.mark.skip(reason=reason))
         if "docker" in item.keywords and not _docker_available():
             item.add_marker(pytest.mark.skip(reason="no reachable Docker daemon"))
-        if "ssh_localhost" in item.keywords and not _ssh_localhost_available():
-            item.add_marker(
-                pytest.mark.skip(reason="sshd on localhost with key auth is not available")
-            )
+        if "ssh_localhost" in item.keywords:
+            ok, reason = _ssh_localhost_status()
+            if not ok:
+                item.add_marker(pytest.mark.skip(reason=reason))
         if "network" in item.keywords and os.environ.get("BFRCR_NETWORK_TESTS") != "1":
             item.add_marker(
                 pytest.mark.skip(reason="network tests are opt-in: set BFRCR_NETWORK_TESTS=1")

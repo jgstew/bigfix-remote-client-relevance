@@ -77,6 +77,9 @@ class Target:
     """Per-target override of the run-wide version spec."""
 
     keep_alive: bool = False
+    verify_host_key: bool = True
+    """SSH only. Off removes protection against interception; lab hosts only."""
+
     extra: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -104,6 +107,7 @@ def default_transport_factory(target: Target) -> Transport:
             user=target.user,
             become=target.become,
             target=target.platform,
+            verify_host_key=target.verify_host_key,
         )
     if target.kind == "container":
         from bigfix_remote_client_relevance.transports.container import TransportContainer

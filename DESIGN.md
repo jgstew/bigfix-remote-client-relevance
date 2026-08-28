@@ -743,7 +743,19 @@ Discovery order matches the ported `find_qna_path()` plus `$PATH`.
   stdin/UTF-8:
   `New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force`.
 
-### 3. Key-based auth
+### 3. Host key verification
+`TransportSSH` verifies the target against `~/.ssh/known_hosts`, exactly as
+the `ssh` CLI does. A first connection to a new endpoint therefore fails
+until its key is trusted — `ssh-keyscan -H <host> >> ~/.ssh/known_hosts`, or
+just connect once with `ssh` and accept the key.
+
+`verify_host_key=False` (CLI: `--insecure-skip-host-key-check`) turns this
+off for throwaway lab endpoints whose keys are regenerated often. It logs a
+warning every time, because it removes the connection's protection against
+interception — a real exposure when a client-relevance expression and its
+answers cross an untrusted network.
+
+### 4. Key-based auth
 - One ed25519 key on the workstation.
 - Push with `ssh-copy-id` on Mac; on Windows append to
   `C:\Users\<user>\.ssh\authorized_keys`, or
@@ -753,7 +765,7 @@ Discovery order matches the ported `find_qna_path()` plus `$PATH`.
 - Named entries in `~/.ssh/config` so the CLI can just say
   `bigfix-remote-client-relevance mac-test ...`.
 
-### 4. Permissions & gotchas
+### 5. Permissions & gotchas
 - On macOS, `qna` needs root — `TransportSSH(become=True)` uses sudo, and
   `TransportLocal` refuses to run without it by default. Observed against
   BESAgent 11.x on macOS 15: a non-root qna aborts with an uncaught

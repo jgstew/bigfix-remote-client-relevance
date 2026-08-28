@@ -94,28 +94,58 @@ class _AsyncsshRunner:
         await self._connection.wait_closed()  # type: ignore[attr-defined]
 
 
-def connect_kwargs(user: str | None, key: str | None, port: int) -> dict[str, object]:
+def connect_kwargs(
+    user: str | None,
+    key: str | None,
+    port: int,
+    *,
+    verify_host_key: bool = True,
+) -> dict[str, object]:
     """Build asyncssh.connect options, omitting anything not set.
 
-    Passing ``username=None`` is not equivalent to omitting it: asyncssh's
-    option construction raises a bare ``TypeError`` before it ever tries to
-    connect, which turns a mistyped hostname into an opaque internal error
-    instead of a DNS failure. Unset options are left out entirely so asyncssh
-    applies its own defaults (~/.ssh/config, the agent, the usual key names).
+    Two asyncssh quirks shape this:
+
+    * ``username=None`` is not the same as omitting it — option construction
+      raises a bare ``TypeError`` before it ever tries to connect, turning a
+      mistyped hostname into an opaque internal error instead of a DNS failure.
+    * ``known_hosts=None`` means *accept any host key*, disabling verification
+      entirely. It is only passed when the caller explicitly opts out;
+      otherwise it is omitted so asyncssh verifies against ``~/.ssh/known_hosts``
+      the way the ssh CLI does.
+
+    Everything unset is left out so asyncssh applies its own defaults
+    (``~/.ssh/config``, the agent, the usual key names).
     """
-    kwargs: dict[str, object] = {"port": port, "known_hosts": None}
+    kwargs: dict[str, object] = {"port": port}
     if user:
         kwargs["username"] = user
     if key:
         kwargs["client_keys"] = [key]
+    if not verify_host_key:
+        kwargs["known_hosts"] = None
     return kwargs
 
 
-async def _connect(host: str, user: str | None, key: str | None, port: int) -> SSHRunner:
+async def _connect(
+    host: str,
+    user: str | None,
+    key: str | None,
+    port: int,
+    *,
+    verify_host_key: bool = True,
+) -> SSHRunner:
     import asyncssh
 
+    if not verify_host_key:
+        logger.warning(
+            "host key verification is disabled for %s; the connection is not "
+            "protected against interception",
+            host,
+        )
     try:
-        connection = await asyncssh.connect(host, **connect_kwargs(user, key, port))
+        connection = await asyncssh.connect(
+            host, **connect_kwargs(user, key, port, verify_host_key=verify_host_key)
+        )
     except (OSError, asyncssh.Error) as exc:
         raise SSHConnectionError(f"could not connect to {host}: {exc}") from exc
     return _AsyncsshRunner(connection)
@@ -137,7 +167,15 @@ class TransportSSH:
         connection_factory: Callable[[], Awaitable[SSHRunner]] | None = None,
         state_dir: Path | None = None,
         recheck_prereqs: bool = False,
+        verify_host_key: bool = True,
     ) -> None:
+        """
+        Args:
+            verify_host_key: Check the target against ``~/.ssh/known_hosts``,
+                as the ssh CLI does. Turn it off only for throwaway lab
+                endpoints whose keys change; doing so removes the connection's
+                protection against interception.
+        """
         self.host = host
         self._become = become
         # `target` and `platform` both name a bootstrap spec; `target` wins.
@@ -145,7 +183,7 @@ class TransportSSH:
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
         self._connection_factory = connection_factory or (
-            lambda: _connect(host, user, key, port)
+            lambda: _connect(host, user, key, port, verify_host_key=verify_host_key)
         )
         self._runner: SSHRunner | None = None
         self._spec: TargetSpec | None = None

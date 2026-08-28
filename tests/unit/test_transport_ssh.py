@@ -438,6 +438,29 @@ async def test_aclose_closes_the_connection():
     assert runner.closed
 
 
+def test_host_keys_are_verified_by_default():
+    """Disabling host key checking silently exposes every session to MITM.
+
+    asyncssh treats known_hosts=None as "accept any host key", so it must not
+    be passed unless the caller explicitly opts out. Omitting it entirely makes
+    asyncssh verify against ~/.ssh/known_hosts, matching the ssh CLI.
+    """
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user=None, key=None, port=22)
+
+    assert "known_hosts" not in kwargs, "host key verification must stay on by default"
+
+
+def test_host_key_verification_can_be_disabled_explicitly():
+    """Throwaway lab endpoints and CI containers need an opt-out."""
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user=None, key=None, port=22, verify_host_key=False)
+
+    assert kwargs["known_hosts"] is None
+
+
 def test_connect_kwargs_omit_unset_values_rather_than_passing_none():
     """asyncssh rejects an explicit username=None with a bare TypeError.
 

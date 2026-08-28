@@ -127,6 +127,11 @@ out of the agent package without installing it.
 - Docker for `--container`; SSH access for remote hosts
 - On macOS, `qna` needs root — use `sudo`, or `--become` over SSH
 
+SSH host keys are verified against `~/.ssh/known_hosts` like the `ssh` CLI,
+so a brand-new endpoint needs its key trusted first. For throwaway lab hosts,
+`--insecure-skip-host-key-check` skips that at the cost of the connection's
+protection against interception.
+
 ## Development
 
 ```bash

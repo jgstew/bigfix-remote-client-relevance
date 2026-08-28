@@ -147,6 +147,14 @@ def evaluate(
         bool, typer.Option("--become", help="Use sudo on the target (root-only inspectors).")
     ] = False,
     arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
+    insecure_skip_host_key_check: Annotated[
+        bool,
+        typer.Option(
+            "--insecure-skip-host-key-check",
+            help="Do not verify the SSH host key. Removes protection against "
+            "interception; for throwaway lab endpoints only.",
+        ),
+    ] = False,
     max_parallel: Annotated[
         int, typer.Option("--max-parallel", help="Cap on concurrent evaluations.")
     ] = DEFAULT_MAX_PARALLEL,
@@ -199,7 +207,15 @@ def evaluate(
         targets = [Target(kind="container", name=container, image=container, arch=arch)]
     else:
         assert host is not None
-        targets = [Target(kind="ssh", name=host, user=user, become=become)]
+        targets = [
+            Target(
+                kind="ssh",
+                name=host,
+                user=user,
+                become=become,
+                verify_host_key=not insecure_skip_host_key_check,
+            )
+        ]
 
     results = asyncio.run(
         evaluate_client_relevance(
