@@ -177,6 +177,36 @@ KNOWN_TARGETS: dict[str, TargetSpec] = {
 }
 
 
+# One architecture, several spellings: uname says aarch64, macOS says arm64,
+# Docker wants linux/arm64, and the release site's rpm builds say aarch64 while
+# its deb builds say arm64.
+_ARCH_ALIASES = {
+    "arm64": "arm64",
+    "aarch64": "arm64",
+    "arm64e": "arm64",
+    "x86_64": "x86_64",
+    "amd64": "x86_64",
+    "x64": "x86_64",
+}
+
+
+def normalize_arch(machine: str) -> str:
+    """Canonical internal spelling of an architecture name.
+
+    Anything unrecognized passes through unchanged rather than defaulting: a
+    lookup that fails by name is far better than one silently retargeted at
+    the wrong architecture.
+    """
+    return _ARCH_ALIASES.get(machine.strip().lower(), machine.strip().lower())
+
+
+def host_arch() -> str:
+    """The architecture of the machine running this tool."""
+    import platform
+
+    return normalize_arch(platform.machine())
+
+
 def spec_for(target: str) -> TargetSpec:
     try:
         return KNOWN_TARGETS[target]
@@ -246,5 +276,7 @@ __all__ = [
     "TargetSpec",
     "UnknownTargetError",
     "classify_uname",
+    "host_arch",
+    "normalize_arch",
     "spec_for",
 ]

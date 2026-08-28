@@ -205,10 +205,6 @@ def test_default_mode_still_guesses_deb_family_for_ssh():
 # uname says aarch64, macOS says arm64, Docker says linux/arm64, and the
 # release site's rpm builds say aarch64 while its deb builds say arm64.
 
-_M17 = pytest.mark.xfail(strict=True, reason="M17: architecture normalization not implemented")
-
-
-@_M17
 @pytest.mark.parametrize(
     ("machine", "expected"),
     [
@@ -225,7 +221,6 @@ def test_normalize_arch_collapses_the_spellings(machine, expected):
     assert normalize_arch(machine) == expected
 
 
-@_M17
 def test_an_unrecognized_machine_passes_through():
     """Better a lookup that fails by name than one silently retargeted."""
     from bigfix_remote_client_relevance.bootstrap.targets import normalize_arch
@@ -233,7 +228,6 @@ def test_an_unrecognized_machine_passes_through():
     assert normalize_arch("riscv64") == "riscv64"
 
 
-@_M17
 def test_host_arch_reports_this_machine(monkeypatch):
     import platform as platform_module
 

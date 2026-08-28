@@ -160,6 +160,10 @@ EVAL_OK = (r"-showtypes", (QNA_OUT, "", 0))
 PROBE_UBUNTU = (r"os-release", ("Linux\nubuntu debian", "", 0))
 PROBE_ALMA = (r"os-release", ("Linux\nalmalinux rhel fedora centos", "", 0))
 
+# The CLI tests raise the package logger to WARNING, so log assertions must
+# name the logger they care about rather than relying on the root level.
+CONTAINER_LOGGER = "bigfix_remote_client_relevance.transports.container"
+
 
 @pytest.fixture(autouse=True)
 def isolated_state_dir(tmp_path, monkeypatch):
@@ -879,17 +883,13 @@ async def test_a_linkable_image_installs_nothing(resolved, extracted):
 # available, but it is slow and can behave differently from native — and it
 # used to happen with no indication at all.
 
-_M17 = pytest.mark.xfail(strict=True, reason="M17: emulation is not reported")
-
-
-@_M17
 async def test_running_a_foreign_architecture_says_so(caplog, monkeypatch):
     import bigfix_remote_client_relevance.transports.container as container_module
 
     monkeypatch.setattr(container_module, "host_arch", lambda: "arm64")
     engine = FakeEngine(responses=[EVAL_OK])
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
         await TransportContainer(
             "ubuntu:22.04", engine=engine, arch="x86_64"
         ).evaluate_client_relevance("true")
@@ -899,14 +899,13 @@ async def test_running_a_foreign_architecture_says_so(caplog, monkeypatch):
     )
 
 
-@_M17
 async def test_a_native_architecture_says_nothing(caplog, monkeypatch):
     import bigfix_remote_client_relevance.transports.container as container_module
 
     monkeypatch.setattr(container_module, "host_arch", lambda: "arm64")
     engine = FakeEngine(responses=[EVAL_OK])
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
         await TransportContainer(
             "ubuntu:22.04", engine=engine, arch="arm64"
         ).evaluate_client_relevance("true")
@@ -914,7 +913,6 @@ async def test_a_native_architecture_says_nothing(caplog, monkeypatch):
     assert not any("emulat" in r.message.lower() for r in caplog.records)
 
 
-@_M17
 async def test_the_emulation_notice_is_logged_once_per_transport(caplog, monkeypatch):
     import bigfix_remote_client_relevance.transports.container as container_module
 
@@ -922,7 +920,7 @@ async def test_the_emulation_notice_is_logged_once_per_transport(caplog, monkeyp
     engine = FakeEngine(responses=[EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, arch="x86_64")
 
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
         await transport.evaluate_client_relevance("true")
         await transport.evaluate_client_relevance("true")
 
@@ -930,7 +928,6 @@ async def test_the_emulation_notice_is_logged_once_per_transport(caplog, monkeyp
     assert len(notices) == 1, "one notice per target, not one per evaluation"
 
 
-@_M17
 async def test_aarch64_selects_the_arm64_docker_platform():
     """uname says aarch64; Docker only understands linux/arm64."""
     engine = FakeEngine(responses=[EVAL_OK], default=("", "", 0))

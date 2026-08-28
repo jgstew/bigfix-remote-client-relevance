@@ -36,6 +36,8 @@ from bigfix_remote_client_relevance.bootstrap.targets import (
     TargetSpec,
     UnknownTargetError,
     classify_uname,
+    host_arch,
+    normalize_arch,
     spec_for,
 )
 from bigfix_remote_client_relevance.results import (
@@ -427,6 +429,7 @@ class TransportContainer:
         self._rebuild_image = rebuild_image
         self._auto_setup = auto_setup
         self._container_id: str | None = None
+        self._warned_about_emulation = False
 
     @property
     def host(self) -> str:
@@ -435,8 +438,31 @@ class TransportContainer:
     @property
     def platform(self) -> str | None:
         """Docker platform string, so one host can answer for both arches."""
-        mapping = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "arm64": "linux/arm64"}
-        return mapping.get(self.arch)
+        mapping = {"x86_64": "linux/amd64", "arm64": "linux/arm64"}
+        return mapping.get(normalize_arch(self.arch))
+
+    def _note_emulation(self) -> None:
+        """Say when the container's architecture is not this machine's.
+
+        BigFix publishes no arm64 agent for any platform this tool targets, so
+        on Apple Silicon this is every run — emulated, slower, and occasionally
+        behaving differently from native. Worth knowing about; not worth
+        repeating per evaluation.
+        """
+        if self._warned_about_emulation:
+            return
+        self._warned_about_emulation = True
+        target_arch = normalize_arch(self.arch)
+        if target_arch != host_arch():
+            logger.info(
+                "running %s as %s while this machine is %s: emulated, so slower than "
+                "native and occasionally different. BigFix publishes no %s agent, so "
+                "this is the only option.",
+                self.image,
+                target_arch,
+                host_arch(),
+                host_arch(),
+            )
 
     async def aclose(self) -> None:
         if self._container_id is not None:
@@ -493,6 +519,7 @@ class TransportContainer:
 
         transient_container: str | None = None
         try:
+            self._note_emulation()
             await self._engine.ensure_image(self.image, platform=self.platform)
 
             # Provisioning needs the real platform (deb vs rpm agent); without
