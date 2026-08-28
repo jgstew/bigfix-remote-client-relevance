@@ -242,6 +242,177 @@ async def test_one_version_failing_does_not_block_the_other():
     assert kinds == ["ok", ERROR_KIND_RESOLVE]
 
 
+# --- container platform probing ---------------------------------------------
+#
+# Issue #1: the resolver picks the artifact (deb vs rpm) from target.platform,
+# so a container with no declared platform must be probed BEFORE resolution —
+# probing in the transport alone would still download the wrong agent.
+
+_M9 = pytest.mark.xfail(strict=True, reason="M9: orchestrator does not probe before resolving")
+
+
+class FakeProbingTransport(FakeTransport):
+    """A container-style transport whose probe answers with a canned platform."""
+
+    def __init__(self, host: str, platform_key="rhel", **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self.platform_key = platform_key
+        self.probed = 0
+
+    async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
+        self.probed += 1
+        if isinstance(self.platform_key, Exception):
+            raise self.platform_key
+        return self.platform_key
+
+
+def platform_recording_resolver(seen: list[str | None]):
+    async def resolve(spec: str | None, target: Target) -> ResolvedQna:
+        seen.append(target.platform)
+        return ResolvedQna(version="11.0.6.137", artifact_path=Path("/cache/fake.rpm"))
+
+    return resolve
+
+
+@_M9
+async def test_container_platform_is_probed_before_resolution():
+    seen: list[str | None] = []
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="almalinux:9", image="almalinux:9")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(t.name, "rhel"),
+        resolver=platform_recording_resolver(seen),
+    )
+
+    assert seen == ["rhel"], "the resolver must see the probed platform, not None"
+
+
+@_M9
+async def test_probed_platforms_split_the_resolution_dedupe():
+    seen: list[str | None] = []
+    platforms = {"almalinux:9": "rhel", "ubuntu:22.04": "ubuntu"}
+
+    await evaluate_client_relevance(
+        "true",
+        [
+            Target(kind="container", name=image, image=image)
+            for image in ("almalinux:9", "ubuntu:22.04")
+        ],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(t.name, platforms[t.name]),
+        resolver=platform_recording_resolver(seen),
+    )
+
+    assert sorted(seen, key=str) == ["rhel", "ubuntu"], "different platforms need distinct artifacts"
+
+
+@_M9
+async def test_matching_probed_platforms_share_one_resolution():
+    seen: list[str | None] = []
+
+    await evaluate_client_relevance(
+        "true",
+        [
+            Target(kind="container", name=image, image=image)
+            for image in ("almalinux:9", "rockylinux:9")
+        ],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(t.name, "rhel"),
+        resolver=platform_recording_resolver(seen),
+    )
+
+    assert seen == ["rhel"], "same probed platform must share one download"
+
+
+@_M9
+async def test_probe_failure_becomes_a_bootstrap_result():
+    from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="weird:latest", image="weird:latest")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(
+            t.name, UnknownTargetError("cannot classify; pass --platform")
+        ),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 1
+    assert results[0].error_kind == ERROR_KIND_BOOTSTRAP
+    assert "platform" in (results[0].error or "").lower()
+
+
+@_M9
+async def test_probe_engine_failure_becomes_a_transport_result():
+    from bigfix_remote_client_relevance.transports.container import ContainerEngineError
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="weird:latest", image="weird:latest")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(
+            t.name, ContainerEngineError("cannot connect to the Docker daemon")
+        ),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 1
+    assert results[0].error_kind == ERROR_KIND_TRANSPORT
+
+
+@_M9
+def test_default_factory_no_longer_defaults_containers_to_ubuntu():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    transport = default_transport_factory(
+        Target(kind="container", name="almalinux:9", image="almalinux:9")
+    )
+
+    assert transport._target is None, "an unset platform must be probed, never assumed"
+
+
+async def test_explicit_platform_skips_the_orchestrator_probe():
+    seen: list[str | None] = []
+    made: list[FakeProbingTransport] = []
+
+    def factory(target):
+        transport = FakeProbingTransport(target.name, "ubuntu")
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="alma", image="almalinux:9", platform="rhel")],
+        qna_version="11.0",
+        transport_factory=factory,
+        resolver=platform_recording_resolver(seen),
+    )
+
+    assert seen == ["rhel"]
+    assert made[0].probed == 0
+
+
+async def test_no_probe_when_no_version_is_pinned():
+    """Without provisioning the platform never selects an artifact; skip the probe."""
+    made: list[FakeProbingTransport] = []
+
+    def factory(target):
+        transport = FakeProbingTransport(target.name, "rhel")
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="almalinux:9", image="almalinux:9")],
+        transport_factory=factory,
+    )
+
+    assert made[0].probed == 0
+
+
 # --- failure isolation -----------------------------------------------------
 
 
