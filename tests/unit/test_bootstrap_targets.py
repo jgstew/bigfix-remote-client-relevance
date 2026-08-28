@@ -147,3 +147,61 @@ def test_classify_uname(probe, expected):
 def test_classify_unrecognized_linux_defaults_to_deb_family():
     """Better to guess the more common family than to refuse outright."""
     assert classify_uname("Linux\nsomething-exotic") in {"ubuntu", "debian"}
+
+
+# --- strict classification (containers control their probe) -----------------
+#
+# SSH probes an unknown box, where guessing beats refusing. A container probe
+# is fully controlled, so a guess would fabricate data (issue #1): strict mode
+# refuses instead.
+
+_M6 = pytest.mark.xfail(strict=True, reason="M6: strict classification not implemented")
+
+
+@_M6
+def test_strict_mode_refuses_unrecognized_linux():
+    with pytest.raises(UnknownTargetError):
+        classify_uname("Linux\nsomething-exotic", strict=True)
+
+
+@_M6
+def test_strict_mode_refuses_empty_probe_output():
+    """Empty output means Windows over SSH, but 'probe failed' in a container."""
+    with pytest.raises(UnknownTargetError):
+        classify_uname("", strict=True)
+
+
+@_M6
+def test_strict_mode_refuses_a_non_linux_non_darwin_kernel():
+    with pytest.raises(UnknownTargetError):
+        classify_uname("FreeBSD 14", strict=True)
+
+
+@_M6
+def test_strict_mode_error_names_the_probe_and_the_fix():
+    with pytest.raises(UnknownTargetError) as excinfo:
+        classify_uname("Linux\nsomething-exotic", strict=True)
+
+    message = str(excinfo.value)
+    assert "something-exotic" in message, "error must show what the probe saw"
+    assert "platform" in message.lower(), "error must point at the explicit-platform escape hatch"
+
+
+@_M6
+@pytest.mark.parametrize(
+    ("probe", "expected"),
+    [
+        ("Linux\nubuntu debian", "ubuntu"),
+        ("Linux\ndebian", "debian"),
+        ("Linux\nalmalinux rhel fedora centos", "rhel"),
+        ("Linux\nsles suse", "suse"),
+        ("Darwin", "macos"),
+    ],
+)
+def test_strict_mode_still_classifies_known_families(probe, expected):
+    assert classify_uname(probe, strict=True) == expected
+
+
+def test_default_mode_still_guesses_deb_family_for_ssh():
+    """SSH keeps the guess: an unknown Unix is more likely deb than anything else."""
+    assert classify_uname("Linux\nsomething-exotic") == "ubuntu"
