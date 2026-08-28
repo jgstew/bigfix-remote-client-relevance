@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # lets tag_and_release.yaml gate the release on this same job via `uses:`
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
