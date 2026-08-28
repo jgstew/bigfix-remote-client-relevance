@@ -25,7 +25,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 
 from bigfix_remote_client_relevance.bootstrap.extract_local import (
     LocalExtractionError,
@@ -56,7 +56,10 @@ from bigfix_remote_client_relevance.transports.container_libs import (
     package_for_soname,
     package_manager_from,
 )
-from bigfix_remote_client_relevance.transports.container_setup import docker_context_endpoint
+from bigfix_remote_client_relevance.transports.container_setup import (
+    EngineSetup,
+    docker_context_endpoint,
+)
 from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
@@ -105,6 +108,11 @@ _MAX_LIBRARY_FIXES = 3
 # network, which routinely outlasts an evaluation's budget. It is paid once per
 # (image, version, arch), so a generous floor costs nothing on the happy path.
 _BUILD_TIMEOUT_S = 600.0
+
+# Docker Desktop routinely takes half a minute to accept connections after
+# launch; the poll is bounded so a stopped engine cannot hang the run.
+_ENGINE_START_TIMEOUT_S = 90.0
+_ENGINE_POLL_INTERVAL_S = 2.0
 
 
 def prepared_image_tag(base_digest: str, version: str, arch: str) -> str:
@@ -219,19 +227,23 @@ class DockerEngine:
     """
 
     def __init__(
-        self, client: object | None = None, *, socket_candidates: list[str] | None = None
+        self,
+        client: object | None = None,
+        *,
+        socket_candidates: list[str] | None = None,
+        auto_setup: bool = True,
+        setup: EngineSetup | None = None,
     ) -> None:
         self._client = client
         self._socket_candidates = socket_candidates
+        self._auto_setup = auto_setup
+        self._setup = setup or EngineSetup()
 
-    def _get_client(self) -> object:
-        if self._client is not None:
-            return self._client
-
+    def _connect(self, urls: list[str], tried: list[str]) -> object | None:
+        """The first URL that answers, or ``None``."""
         import docker
 
-        tried: list[str] = []
-        for url in self._socket_candidates or candidate_docker_sockets():
+        for url in urls:
             tried.append(url)
             try:
                 client = docker.DockerClient(base_url=url)
@@ -240,11 +252,69 @@ class DockerEngine:
                 logger.debug("no container engine at %s: %s", url, exc)
                 continue
             logger.debug("connected to the container engine at %s", url)
+            return cast(object, client)
+        return None
+
+    def _candidates(self) -> list[str]:
+        return self._socket_candidates or candidate_docker_sockets()
+
+    def _get_client(self) -> object:
+        if self._client is not None:
+            return self._client
+
+        tried: list[str] = []
+        client = self._connect(self._candidates(), tried)
+
+        if client is None and self._auto_setup:
+            client = self._start_engine_and_wait(tried)
+
+        if client is not None:
             self._client = client
             return client
 
         raise ContainerEngineError(
-            "cannot connect to the Docker daemon; is it running? tried: " + ", ".join(tried)
+            f"cannot connect to the Docker daemon; {self._setup.hint()}. tried: "
+            + ", ".join(tried)
+        )
+
+    def _start_engine_and_wait(self, tried: list[str]) -> object | None:
+        """Start an installed-but-stopped engine, then wait for it to answer."""
+        starter = self._setup.detect()
+        if starter is None:
+            return None
+        if starter.argv is None:
+            # Detected, but starting it needs privileges that are not ours to
+            # take — say what to run instead.
+            raise ContainerEngineError(
+                f"{starter.name} is installed but not running; {starter.note}. tried: "
+                + ", ".join(tried)
+            )
+
+        logger.info("no container engine answered; starting %s", starter.name)
+        self._setup.start(starter)
+
+        waited = 0.0
+        while waited < _ENGINE_START_TIMEOUT_S:
+            self._setup.sleep(_ENGINE_POLL_INTERVAL_S)
+            waited += _ENGINE_POLL_INTERVAL_S
+            # Re-derived every pass: the socket path, and the docker context
+            # naming it, often only appear once the engine is up.
+            client = self._connect(self._candidates(), [])
+            if client is not None:
+                logger.info("%s is ready after %.0fs", starter.name, waited)
+                return client
+            if waited % 10 < _ENGINE_POLL_INTERVAL_S:
+                logger.info(
+                    "waiting for %s (%.0fs/%.0fs)...",
+                    starter.name,
+                    waited,
+                    _ENGINE_START_TIMEOUT_S,
+                )
+
+        raise ContainerEngineError(
+            f"{starter.name} did not become ready within "
+            f"{_ENGINE_START_TIMEOUT_S:.0f}s; start it manually and re-run. tried: "
+            + ", ".join(tried)
         )
 
     async def ensure_image(self, image: str, *, platform: str | None = None) -> None:
@@ -431,7 +501,7 @@ class TransportContainer:
     ) -> None:
         self.image = image
         self.arch = arch
-        self._engine = engine or DockerEngine()
+        self._engine = engine or DockerEngine(auto_setup=auto_setup)
         self._keep_alive = keep_alive
         self._target = target
         self._probed: str | None = None

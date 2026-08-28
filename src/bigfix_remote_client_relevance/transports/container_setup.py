@@ -89,6 +89,12 @@ class EngineStarter:
     note: str = ""
 
 
+_MACOS_APPS = (
+    ("Docker Desktop", "/Applications/Docker.app", ["open", "-a", "Docker"]),
+    ("Rancher Desktop", "/Applications/Rancher Desktop.app", ["open", "-a", "Rancher Desktop"]),
+)
+
+
 def detect_engine_starter(
     *,
     system: str | None = None,
@@ -101,19 +107,103 @@ def detect_engine_starter(
     service needs privileges this tool should not be exercising on the user's
     behalf, so they are reported with the command to run instead.
     """
-    raise NotImplementedError
+    import os.path
+    import shutil
+    import sys
+
+    system = system if system is not None else sys.platform
+    which = which if which is not None else shutil.which
+    exists = exists if exists is not None else os.path.exists
+
+    if system == "darwin":
+        for name, app, argv in _MACOS_APPS:
+            if exists(app):
+                return EngineStarter(name=name, argv=argv)
+        if which("colima"):
+            return EngineStarter(name="Colima", argv=["colima", "start"])
+        # Ordered last: podman only helps here when its machine exposes a
+        # docker-compatible socket that DOCKER_HOST or a context names.
+        if which("podman"):
+            return EngineStarter(name="podman machine", argv=["podman", "machine", "start"])
+        return None
+
+    if system.startswith("linux"):
+        if which("docker"):
+            return EngineStarter(
+                name="Docker",
+                argv=None,
+                note="start it with: sudo systemctl start docker",
+            )
+        if which("podman"):
+            return EngineStarter(
+                name="podman",
+                argv=None,
+                note="start it with: systemctl --user start podman.socket",
+            )
+        return None
+
+    if system.startswith("win"):
+        for app in (
+            r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
+            r"C:\Program Files\Rancher Desktop\Rancher Desktop.exe",
+        ):
+            if exists(app):
+                return EngineStarter(
+                    name="Docker Desktop",
+                    argv=None,
+                    note="start Docker Desktop from the Start menu",
+                )
+        return None
+
+    return None
 
 
 def install_hint(system: str | None = None) -> str:
     """How to install a container engine on this platform.
 
     Only commands that are actually right for the platform — a wrong install
-    command is worse than none.
+    command is worse than none, which is why Linux and Windows get the docs
+    rather than a guessed package manager.
     """
-    raise NotImplementedError
+    import sys
+
+    system = system if system is not None else sys.platform
+    if system == "darwin":
+        return (
+            "install one with: brew install --cask docker  (Docker Desktop), "
+            "or: brew install colima docker  (Colima)"
+        )
+    if system.startswith("win"):
+        return "install Docker Desktop: https://docs.docker.com/desktop/install/windows-install/"
+    return "install Docker Engine: https://docs.docker.com/engine/install/"
+
+
+class EngineSetup:
+    """Everything that touches the machine, behind one injectable seam.
+
+    Real implementations launch applications and block; tests substitute this
+    wholesale so nothing is ever started or waited for.
+    """
+
+    def detect(self) -> EngineStarter | None:
+        return detect_engine_starter()
+
+    def start(self, starter: EngineStarter) -> None:
+        if starter.argv is None:  # pragma: no cover - callers check first
+            raise ValueError(f"{starter.name} is not ours to start")
+        subprocess.run(starter.argv, capture_output=True, text=True, check=False)
+
+    def sleep(self, seconds: float) -> None:
+        import time
+
+        time.sleep(seconds)
+
+    def hint(self) -> str:
+        return install_hint()
 
 
 __all__ = [
+    "EngineSetup",
     "EngineStarter",
     "detect_engine_starter",
     "docker_context_endpoint",

@@ -168,7 +168,10 @@ def _docker_available() -> bool:
     except ImportError:  # pragma: no cover - only before the package exists
         return False
     try:
-        DockerEngine()._get_client()
+        # auto_setup=False is load-bearing: this runs at collection time, and
+        # a dev box with Docker stopped would otherwise launch Docker Desktop
+        # and block the whole suite for the start timeout.
+        DockerEngine(auto_setup=False)._get_client()
         return True
     except Exception:  # noqa: BLE001 - any failure at all means no usable daemon
         return False

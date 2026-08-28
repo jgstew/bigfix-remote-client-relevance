@@ -1073,9 +1073,6 @@ def test_docker_host_env_takes_precedence(monkeypatch):
 # "is Docker running?" is a question the tool can answer for itself. Nothing
 # here launches anything: detection, starting and sleeping are all injected.
 
-_M19 = pytest.mark.xfail(strict=True, reason="M19: a stopped engine is not started")
-
-
 @dataclass
 class FakeSetup:
     """Stands in for the machine: what is installed, and what we did to it."""
@@ -1120,7 +1117,6 @@ def engine_that_answers_after(attempts: int, setup):
     return engine
 
 
-@_M19
 async def test_a_stopped_engine_is_started_and_awaited():
     setup = FakeSetup(starter=starter())
     engine = engine_that_answers_after(1, setup)
@@ -1130,7 +1126,6 @@ async def test_a_stopped_engine_is_started_and_awaited():
     assert setup.started == ["Docker Desktop"]
 
 
-@_M19
 async def test_auto_setup_off_starts_nothing():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
@@ -1146,7 +1141,6 @@ async def test_auto_setup_off_starts_nothing():
     assert "not/here.sock" in str(excinfo.value), "it must still name what it tried"
 
 
-@_M19
 async def test_the_wait_for_the_engine_is_bounded():
     setup = FakeSetup(starter=starter())
     engine = engine_that_answers_after(10_000, setup)  # never comes up
@@ -1158,7 +1152,6 @@ async def test_the_wait_for_the_engine_is_bounded():
     assert "Docker Desktop" in str(excinfo.value)
 
 
-@_M19
 async def test_nothing_installed_names_the_install_command():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
@@ -1174,7 +1167,6 @@ async def test_nothing_installed_names_the_install_command():
     assert "nope.sock" in str(excinfo.value)
 
 
-@_M19
 async def test_an_engine_we_must_not_start_reports_its_command():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
@@ -1192,7 +1184,6 @@ async def test_an_engine_we_must_not_start_reports_its_command():
     assert "systemctl start docker" in str(excinfo.value)
 
 
-@_M19
 async def test_an_injected_client_never_triggers_setup():
     """Tests and callers that supply a client must never launch anything."""
     from bigfix_remote_client_relevance.transports.container import DockerEngine
@@ -1243,7 +1234,11 @@ def test_a_context_duplicating_a_hardcoded_path_is_not_listed_twice(monkeypatch)
 async def test_engine_error_names_the_sockets_it_tried():
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
-    engine = DockerEngine(socket_candidates=["unix:///definitely/not/here.sock"])
+    # auto_setup=False so this asserts the error, not whatever engine happens
+    # to be installed on the machine running the tests.
+    engine = DockerEngine(
+        socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False
+    )
 
     with pytest.raises(ContainerEngineError) as excinfo:
         await engine.ensure_image("ubuntu:22.04")
