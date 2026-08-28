@@ -82,6 +82,9 @@ class Target:
     rebuild_image: bool = False
     """Container only. Force a fresh prepared image instead of reusing a cached one."""
 
+    auto_setup: bool = True
+    """Container only. Install runtime libraries the image is missing. Off for air-gapped hosts."""
+
     verify_host_key: bool = True
     """SSH only. Off removes protection against interception; lab hosts only."""
 
@@ -123,6 +126,7 @@ def default_transport_factory(target: Target) -> Transport:
             keep_alive=target.keep_alive,
             target=target.platform,
             rebuild_image=target.rebuild_image,
+            auto_setup=target.auto_setup,
         )
     if target.kind == "fastquery":
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery

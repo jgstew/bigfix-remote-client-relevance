@@ -8,6 +8,8 @@ the real message captured from that image.
 
 from __future__ import annotations
 
+import pytest
+
 from bigfix_remote_client_relevance.transports.container_libs import missing_shared_library
 
 ROCKY_STDERR = (
@@ -58,3 +60,98 @@ def test_the_first_missing_library_is_reported():
     )
 
     assert missing_shared_library(stderr) == "libdbus-1.so.3"
+
+
+# --- choosing what to install -------------------------------------------------
+
+def test_the_package_manager_probe_prefers_dnf_over_yum():
+    """A dnf image usually also has yum; dnf's transactions are smaller."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_manager_from
+
+    assert package_manager_from("dnf\nyum\n") == "dnf"
+
+
+def test_an_image_with_no_package_manager_reports_none():
+    from bigfix_remote_client_relevance.transports.container_libs import package_manager_from
+
+    assert package_manager_from("") is None
+
+
+@pytest.mark.parametrize(
+    ("family", "manager", "expected"),
+    [("rpm", "dnf", "dbus-libs"), ("deb", "apt-get", "libdbus-1-3")],
+)
+def test_dbus_maps_to_the_right_package_per_family(family, manager, expected):
+    """The one mapping confirmed against real images."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_for_soname
+
+    assert package_for_soname("libdbus-1.so.3", family=family, manager=manager) == expected
+
+
+def test_an_unmapped_rpm_soname_falls_back_to_the_provides_name():
+    """rpm packages carry virtual Provides for their sonames, so dnf can resolve it."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_for_soname
+
+    package = package_for_soname("libfoo.so.9", family="rpm", manager="dnf")
+
+    assert package == "libfoo.so.9()(64bit)"
+
+
+def test_an_unmapped_deb_soname_has_no_package():
+    """dpkg has no offline soname lookup, so this must be reported, not guessed."""
+    from bigfix_remote_client_relevance.transports.container_libs import package_for_soname
+
+    assert package_for_soname("libfoo.so.9", family="deb", manager="apt-get") is None
+
+
+def test_the_provides_name_is_shell_quoted():
+    """Bare parentheses would be shell metacharacters."""
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        install_command,
+        package_for_soname,
+    )
+
+    package = package_for_soname("libfoo.so.9", family="rpm", manager="dnf")
+    command = install_command("dnf", package)
+
+    assert "'libfoo.so.9()(64bit)'" in command
+
+
+@pytest.mark.parametrize(
+    ("manager", "fragment"),
+    [
+        ("dnf", "dnf install -y"),
+        ("microdnf", "microdnf install -y"),
+        ("yum", "yum install -y"),
+        ("apt-get", "apt-get install -y"),
+        ("zypper", "zypper --non-interactive install"),
+        ("apk", "apk add --no-cache"),
+    ],
+)
+def test_each_manager_gets_a_noninteractive_install(manager, fragment):
+    from bigfix_remote_client_relevance.transports.container_libs import install_command
+
+    assert fragment in install_command(manager, "dbus-libs")
+
+
+def test_installs_clean_up_after_themselves():
+    """Whatever the install downloads is committed into the image otherwise."""
+    from bigfix_remote_client_relevance.transports.container_libs import install_command
+
+    assert "clean all" in install_command("dnf", "dbus-libs")
+    assert "rm -rf /var/lib/apt/lists" in install_command("apt-get", "libdbus-1-3")
+
+
+def test_only_apt_needs_an_index_refresh():
+    """Debian images ship no package lists; rpm images do."""
+    from bigfix_remote_client_relevance.transports.container_libs import needs_index_refresh
+
+    assert needs_index_refresh("apt-get") is True
+    assert needs_index_refresh("dnf") is False
+
+
+def test_an_unknown_manager_is_an_error_not_a_guess():
+    from bigfix_remote_client_relevance.transports.container_libs import install_command
+
+    with pytest.raises(ValueError, match="brew"):
+        install_command("brew", "dbus-libs")

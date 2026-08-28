@@ -45,7 +45,15 @@ from bigfix_remote_client_relevance.results import (
     ResolvedQna,
     parse_qna_output,
 )
-from bigfix_remote_client_relevance.transports.container_libs import missing_shared_library
+from bigfix_remote_client_relevance.transports.container_libs import (
+    INDEX_REFRESH_COMMAND,
+    PACKAGE_MANAGER_PROBE_COMMAND,
+    install_command,
+    missing_shared_library,
+    needs_index_refresh,
+    package_for_soname,
+    package_manager_from,
+)
 from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
@@ -85,6 +93,15 @@ _SPEC_FAMILIES = {"ubuntu": "deb", "debian": "deb", "rhel": "rpm", "suse": "rpm"
 # built; distinct from QNA_MOUNT so a build-in-progress container never
 # confuses the two.
 _BUILD_STAGING_MOUNT = "/opt/.bfrcr_qna_src"
+
+# Installing one library commonly reveals the next, so the build re-probes —
+# but a bound keeps a hopeless image from looping.
+_MAX_LIBRARY_FIXES = 3
+
+# Building a prepared image copies a tree and may fetch packages over the
+# network, which routinely outlasts an evaluation's budget. It is paid once per
+# (image, version, arch), so a generous floor costs nothing on the happy path.
+_BUILD_TIMEOUT_S = 600.0
 
 
 def prepared_image_tag(base_digest: str, version: str, arch: str) -> str:
@@ -398,6 +415,7 @@ class TransportContainer:
         target: str | None = None,
         extractor: Extractor | None = None,
         rebuild_image: bool = False,
+        auto_setup: bool = True,
     ) -> None:
         self.image = image
         self.arch = arch
@@ -407,6 +425,7 @@ class TransportContainer:
         self._probed: str | None = None
         self._extractor = extractor or ensure_extracted
         self._rebuild_image = rebuild_image
+        self._auto_setup = auto_setup
         self._container_id: str | None = None
 
     @property
@@ -484,7 +503,9 @@ class TransportContainer:
                 spec = spec_for(self._target or "ubuntu")
 
             if qna is not None:
-                image_to_run, mounts = await self._prepare_qna_image(qna, timeout_s=timeout_s)
+                image_to_run, mounts = await self._prepare_qna_image(
+                    qna, spec, timeout_s=timeout_s
+                )
                 qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
 
             # A probed platform came from the image itself; only a
@@ -585,7 +606,7 @@ class TransportContainer:
         return container_id
 
     async def _prepare_qna_image(
-        self, qna: ResolvedQna, *, timeout_s: float
+        self, qna: ResolvedQna, spec: TargetSpec, *, timeout_s: float
     ) -> tuple[str, dict[str, str]]:
         """Return ``(image, mounts)`` to run the eval against.
 
@@ -602,12 +623,15 @@ class TransportContainer:
             # Only pay for extraction when a build (or its fallback) needs the
             # tree; a cache hit skips both.
             tree = await self._extractor(qna)
-            if await self._build_prepared_image(tree, tag, timeout_s=timeout_s):
+            if await self._build_prepared_image(tree, tag, spec, timeout_s=timeout_s):
                 return tag, {}
             return self.image, {str(tree): f"{QNA_MOUNT}:ro"}
         return tag, {}
 
-    async def _build_prepared_image(self, tree: Path, tag: str, *, timeout_s: float) -> bool:
+    async def _build_prepared_image(
+        self, tree: Path, tag: str, spec: TargetSpec, *, timeout_s: float
+    ) -> bool:
+        timeout_s = max(timeout_s, _BUILD_TIMEOUT_S)
         container_id = await self._engine.start(
             self.image,
             mounts={str(tree): f"{_BUILD_STAGING_MOUNT}:ro"},
@@ -626,10 +650,100 @@ class TransportContainer:
                     stderr.strip(),
                 )
                 return False
+
+            if not await self._make_qna_runnable(container_id, spec, timeout_s=timeout_s):
+                return False
+
             await self._engine.commit(container_id, tag)
             return True
         finally:
             await self._engine.stop(container_id)
+
+    async def _make_qna_runnable(
+        self, container_id: str, spec: TargetSpec, *, timeout_s: float
+    ) -> bool:
+        """Install whatever the image is missing, until qna links or we give up.
+
+        Returns whether the image is worth committing. Anything short of a
+        clean link returns False, which drops the caller back to mounting the
+        extracted tree: the evaluation then fails loudly naming the library,
+        and nothing broken is cached, so a later run with network access (or
+        without ``--no-auto-setup``) retries from scratch.
+        """
+        qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
+        probe = f"{shlex.quote(qna_path)} {' '.join(QNA_EVAL_FLAGS)} < /dev/null"
+        family = _SPEC_FAMILIES.get(spec.name)
+        manager: str | None = None
+        refreshed = False
+        attempted: set[str] = set()
+
+        for _attempt in range(_MAX_LIBRARY_FIXES):
+            _stdout, stderr, _code = await self._engine.exec_in(
+                container_id, probe, timeout=timeout_s
+            )
+            soname = missing_shared_library(stderr)
+            if soname is None:
+                # Either it links, or it failed for a reason no install fixes;
+                # an image whose probe cannot run at all lands here too and is
+                # committed exactly as it was before this check existed.
+                return True
+            if not self._auto_setup:
+                logger.info(
+                    "%s is missing %s and auto-setup is off; not installing it",
+                    self.image,
+                    soname,
+                )
+                return False
+            if soname in attempted:
+                logger.warning(
+                    "installing for %s did not make qna runnable in %s", soname, self.image
+                )
+                return False
+            attempted.add(soname)
+
+            if manager is None:
+                stdout, _stderr, _code = await self._engine.exec_in(
+                    container_id, PACKAGE_MANAGER_PROBE_COMMAND, timeout=timeout_s
+                )
+                manager = package_manager_from(stdout)
+            if manager is None:
+                logger.warning(
+                    "%s needs %s but has no package manager to install it with",
+                    self.image,
+                    soname,
+                )
+                return False
+
+            package = package_for_soname(soname, family=family, manager=manager)
+            if package is None:
+                logger.warning(
+                    "no known package provides %s on the %s family; add a mapping or "
+                    "install it in the image yourself",
+                    soname,
+                    family,
+                )
+                return False
+
+            if needs_index_refresh(manager) and not refreshed:
+                await self._engine.exec_in(
+                    container_id, INDEX_REFRESH_COMMAND, timeout=timeout_s
+                )
+                refreshed = True
+
+            logger.info("installing %s in %s to provide %s", package, self.image, soname)
+            _stdout, stderr, exit_code = await self._engine.exec_in(
+                container_id, install_command(manager, package), timeout=timeout_s
+            )
+            if exit_code != 0:
+                logger.warning(
+                    "could not install %s in %s: %s", package, self.image, stderr.strip()
+                )
+                return False
+
+        logger.warning(
+            "gave up making qna runnable in %s after %d attempts", self.image, _MAX_LIBRARY_FIXES
+        )
+        return False
 
     def _eval_command(self, spec: TargetSpec, qna_path: str | None) -> str:
         # API boundary: qna's CLI vocabulary uses "relevance"; internal name

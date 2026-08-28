@@ -148,6 +148,14 @@ def evaluate(
             help="Force a fresh prepared container image instead of reusing a cached one.",
         ),
     ] = False,
+    auto_setup: Annotated[
+        bool,
+        typer.Option(
+            "--auto-setup/--no-auto-setup",
+            help="Install runtime libraries a container image is missing. "
+            "Turn off for air-gapped hosts.",
+        ),
+    ] = True,
     qna_version: Annotated[
         list[str] | None,
         typer.Option(
@@ -242,6 +250,7 @@ def evaluate(
             arch=arch,
             platform=platform,
             rebuild_image=rebuild_image,
+            auto_setup=auto_setup,
         )
         for image in container
     )

@@ -92,6 +92,7 @@ def _target_from_entry(
         platform=str(platform) if platform is not None else None,
         qna_version=version if isinstance(version, (str, list)) else None,
         keep_alive=bool(setting("keep_alive", False)),
+        auto_setup=bool(setting("auto_setup", True)),
         verify_host_key=bool(setting("verify_host_key", True)),
     )
 

@@ -33,6 +33,14 @@ class ExecCall:
     input: str | None
 
 
+def link_failure(soname: str) -> str:
+    """The dynamic linker's message, as captured from rockylinux:9."""
+    return (
+        f"/opt/bigfix_qna/opt/BESClient/bin/qna: error while loading shared libraries: "
+        f"{soname}: cannot open shared object file: No such file or directory"
+    )
+
+
 @dataclass
 class FakeEngine:
     """Records container lifecycle and answers commands by regex."""
@@ -48,10 +56,34 @@ class FakeEngine:
     existing_tags: set = field(default_factory=set)
     committed: list[tuple[str, str]] = field(default_factory=list)
     cp_exit_code: int = 0
+    # Sonames the image is missing; a successful install consumes one, so a
+    # list of two models "fixing one library reveals the next".
+    missing_libs: list[str] = field(default_factory=list)
+    package_manager: str = "dnf"
+    install_exit_code: int = 0
+    installs: list[str] = field(default_factory=list)
 
     def _answer(self, command: str) -> tuple[str, str, int]:
         if "cp -a" in command:
             return ("", "" if self.cp_exit_code == 0 else "cp: no such shell", self.cp_exit_code)
+        if "command -v dnf" in command:
+            return (self.package_manager, "", 0)
+        if " install " in command or "apt-get update" in command:
+            self.installs.append(command)
+            if self.install_exit_code == 0 and "update" not in command and self.missing_libs:
+                self.missing_libs.pop(0)
+            return (
+                "",
+                "" if self.install_exit_code == 0 else "No match for argument",
+                self.install_exit_code,
+            )
+        # Any attempt to run qna fails while a library is missing — the build's
+        # link probe and the evaluation alike. Must precede the regex table,
+        # since both carry -showtypes and would otherwise match EVAL_OK.
+        if "-showtypes" in command and self.missing_libs:
+            return ("", link_failure(self.missing_libs[0]), 127)
+        if "< /dev/null" in command:
+            return ("", "", 0)
         for pattern, response in self.responses:
             if re.search(pattern, command):
                 return response
@@ -686,6 +718,157 @@ async def test_build_failure_falls_back_to_the_mount_flow(resolved, extracted):
     assert result.error_kind is None, "a distroless base without cp/coreutils still works"
     assert engine.committed == []
     assert engine.one_shots[-1]["mounts"] == {str(extracted.tree): f"{QNA_MOUNT}:ro"}
+
+
+# --- installing what the image is missing --------------------------------------
+#
+# rockylinux:9 and amazonlinux:2023 have no libdbus-1.so.3, so a correctly
+# extracted qna still cannot start. The fix is installed while the prepared
+# image is being built, so it is committed once and every later run gets it
+# free. Gated by --no-auto-setup for air-gapped hosts.
+
+async def test_a_missing_library_is_installed_into_the_prepared_image(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"])
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert any("dbus-libs" in c for c in engine.installs), "the library must be installed"
+    assert len(engine.committed) == 1, "and baked into the prepared image"
+    assert result.error_kind is None
+
+
+async def test_the_link_probe_runs_the_binary_from_the_prepared_tree(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK])
+
+    await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    probes = [c for c in engine.commands() if "< /dev/null" in c]
+    assert probes, "the build must check the binary actually links"
+    assert QNA_MOUNT in probes[0]
+
+
+async def test_installs_repeat_until_the_binary_links(resolved, extracted):
+    """Installing one library commonly reveals the next."""
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3", "libnsl.so.1"]
+    )
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.installs) == 2
+    assert len(engine.committed) == 1
+    assert result.error_kind is None
+
+
+async def test_the_install_loop_is_bounded(resolved, extracted):
+    class NeverFixedEngine(FakeEngine):
+        def _answer(self, command):
+            # An install that reports success but changes nothing.
+            if " install " in command:
+                self.installs.append(command)
+                return ("", "", 0)
+            return super()._answer(command)
+
+    engine = NeverFixedEngine(
+        responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"]
+    )
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.installs) <= 3, "a broken image must not loop forever"
+    assert engine.committed == [], "and must not be cached in a broken state"
+    assert "libdbus-1.so.3" in (result.error or "")
+
+
+async def test_the_deb_family_refreshes_the_index_before_installing(resolved, extracted):
+    """Debian images ship no package lists at all."""
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, EVAL_OK],
+        missing_libs=["libdbus-1.so.3"],
+        package_manager="apt-get",
+    )
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs[0].startswith("apt-get update")
+    assert "libdbus-1-3" in engine.installs[1]
+    assert sum("apt-get update" in c for c in engine.installs) == 1, "refresh once per build"
+
+
+async def test_no_auto_setup_installs_nothing_and_names_the_library(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"])
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted, auto_setup=False
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs == []
+    assert engine.committed == []
+    assert "libdbus-1.so.3" in (result.error or "")
+
+
+async def test_a_failed_install_does_not_commit_a_broken_image(resolved, extracted):
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"], install_exit_code=1
+    )
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.committed == [], "a broken image must never be cached"
+    assert engine.one_shots[-1]["mounts"] == {str(extracted.tree): f"{QNA_MOUNT}:ro"}
+    assert "libdbus-1.so.3" in (result.error or "")
+
+
+async def test_the_build_gets_a_longer_timeout_than_the_evaluation(resolved, extracted):
+    """A package install routinely outlasts a 30s evaluation budget."""
+
+    class TimeoutRecordingEngine(FakeEngine):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.exec_timeouts: list[float | None] = []
+
+        async def exec_in(self, container_id, command, *, input=None, timeout=None):
+            self.exec_timeouts.append(timeout)
+            return await super().exec_in(container_id, command, input=input, timeout=timeout)
+
+    engine = TimeoutRecordingEngine(
+        responses=[PROBE_ALMA, EVAL_OK], missing_libs=["libdbus-1.so.3"]
+    )
+
+    await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved, timeout_s=30.0)
+
+    install_timeouts = [
+        t
+        for call, t in zip(engine.execs, engine.exec_timeouts, strict=True)
+        if " install " in call.command
+    ]
+    assert install_timeouts, "an install must have run"
+    assert all(t is not None and t > 30.0 for t in install_timeouts)
+
+
+async def test_a_linkable_image_installs_nothing(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_ALMA, EVAL_OK])
+
+    await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs == []
+    assert len(engine.committed) == 1
 
 
 # --- image architecture ------------------------------------------------------

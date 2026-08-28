@@ -155,3 +155,90 @@ async def test_provisions_a_real_qna_version_into_ubuntu(tmp_path):
     assert result.qna_version == version
     assert result.answers, "a real qna should answer"
     assert "linux" in result.answers[0].lower()
+
+
+@pytest.mark.skipif(
+    os.environ.get("BFRCR_NETWORK_TESTS") != "1",
+    reason="needs a real qna artifact and package downloads; set BFRCR_NETWORK_TESTS=1",
+)
+async def test_a_minimal_rpm_image_gets_its_missing_library_installed(tmp_path):
+    """rockylinux:9 ships no libdbus-1.so.3, so qna cannot start without help.
+
+    The whole point of installing during the prepared-image build is that the
+    fix is committed once, so the second run does no work at all.
+    """
+    from functools import partial
+
+    from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        artifact_for,
+        resolve_version_spec,
+    )
+    from bigfix_remote_client_relevance.transports.container import prepared_image_tag
+
+    version = resolve_version_spec("11.0")
+    ref = artifact_for(version, platform="rhel", arch="x86_64")
+    resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
+
+    engine = DockerEngine()
+    extractor = partial(ensure_extracted, cache_dir=tmp_path / "cache")
+
+    def transport(**kwargs):
+        return TransportContainer(
+            "rockylinux:9", engine=engine, target="rhel", extractor=extractor, **kwargs
+        )
+
+    tag = prepared_image_tag(await engine.image_digest("rockylinux:9"), version, "x86_64")
+    try:
+        first = await transport(rebuild_image=True).evaluate_client_relevance(
+            "number of properties", qna=resolved, timeout_s=600.0
+        )
+        assert first.error_kind is None, first.error
+        assert first.answers
+
+        second = await transport().evaluate_client_relevance(
+            "number of properties", qna=resolved, timeout_s=600.0
+        )
+        assert second.answers == first.answers, "the cached image must answer identically"
+    finally:
+        import docker.errors
+
+        try:
+            engine._get_client().images.remove(tag, force=True)  # type: ignore[attr-defined]
+        except (docker.errors.ImageNotFound, docker.errors.APIError):
+            pass
+
+
+@pytest.mark.skipif(
+    os.environ.get("BFRCR_NETWORK_TESTS") != "1",
+    reason="needs a real qna artifact; set BFRCR_NETWORK_TESTS=1",
+)
+async def test_without_auto_setup_a_missing_library_is_reported_not_installed(tmp_path):
+    """The air-gapped path must fail loudly and name the library, never silently."""
+    from functools import partial
+
+    from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        artifact_for,
+        resolve_version_spec,
+    )
+    from bigfix_remote_client_relevance.results import ERROR_KIND_BOOTSTRAP
+
+    version = resolve_version_spec("11.0")
+    ref = artifact_for(version, platform="rhel", arch="x86_64")
+    resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
+
+    result = await TransportContainer(
+        "rockylinux:9",
+        engine=DockerEngine(),
+        target="rhel",
+        extractor=partial(ensure_extracted, cache_dir=tmp_path / "cache"),
+        auto_setup=False,
+        rebuild_image=True,
+    ).evaluate_client_relevance("number of properties", qna=resolved, timeout_s=600.0)
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "libdbus-1.so.3" in (result.error or "")
+    assert "no qna in image" not in (result.error or "")

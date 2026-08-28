@@ -134,8 +134,18 @@ an image needs no package manager of its own — `rpm2cpio`/`cpio` or
 against a given (image, qna version, arch) also builds a small derived image
 with the tree baked in and reuses it on every later run against the same
 combination — no mount, no extraction, sub-second start. Pass
-`--rebuild-image` to force a fresh one. These derived images are tagged
-`bfrcr/prepared:*` and are safe to remove at any time:
+`--rebuild-image` to force a fresh one.
+
+While building that image, qna is checked to see that it actually starts.
+Minimal images often lack a shared library it needs — `rockylinux:9` and
+`amazonlinux:2023` have no `libdbus-1.so.3` — so the missing package is
+installed and baked in, paid once rather than per run. `--no-auto-setup`
+turns that off for air-gapped hosts; the run then fails naming the library
+rather than installing anything. A failed or skipped install is never
+committed, so nothing broken is cached.
+
+These derived images are tagged `bfrcr/prepared:*` and are safe to remove at
+any time:
 
 ```bash
 docker rmi $(docker images 'bfrcr/prepared:*' -q)
