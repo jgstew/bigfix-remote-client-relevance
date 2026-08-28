@@ -1,0 +1,4 @@
+Q: "Zürich"
+A: Zürich
+I: singular string
+T: 0.050 ms

@@ -1,0 +1,4 @@
+Q: name of operating system
+A: Mac OS 15.5
+T: 0.163 ms
+I: singular string

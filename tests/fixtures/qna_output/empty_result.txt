@@ -1,0 +1,3 @@
+Q: names of files whose (name of it = "nope") of folder "/tmp"
+T: 1.200 ms
+I: plural string

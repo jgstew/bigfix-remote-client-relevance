@@ -30,7 +30,9 @@ dependencies = [
   "typer>=0.12",
 ]
 
-[project.optional-dependencies]
+# Dev tooling lives in a PEP 735 dependency group, which `uv sync` installs by
+# default — an optional-dependencies extra would need `--extra dev` every time.
+[dependency-groups]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
@@ -76,6 +78,14 @@ exclude-newer = "-P7D"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Everything unmarked runs offline on a bare machine. Marked tests need a real
+# prerequisite and are auto-skipped by tests/conftest.py when it is absent.
+markers = [
+  "live_qna: needs a real local qna binary (root on macOS: sudo -E uv run pytest -m live_qna)",
+  "docker: needs a reachable Docker daemon",
+  "ssh_localhost: needs sshd on localhost with key auth for the current user",
+  "network: reaches support.bigfix.com / software.bigfix.com (opt in with BFRCR_NETWORK_TESTS=1)",
+]
 
 [tool.ruff]
 line-length = 100

@@ -1,0 +1,4 @@
+Q: (name of operating system ; bogus of it)
+A: Mac OS 15.5
+E: The operator "bogus" is not defined.
+T: 0.300 ms

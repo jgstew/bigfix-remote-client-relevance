@@ -1,0 +1,3 @@
+Q: namez of operating system
+E: The operator "namez" is not defined.
+T: 0.052 ms

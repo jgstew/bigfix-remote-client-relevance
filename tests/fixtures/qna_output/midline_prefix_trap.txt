@@ -1,0 +1,5 @@
+Q: concatenation of ("A: fake" ; "E: also fake")
+A: A: fake and E: also fake
+this line mentions A: but is not an answer
+I: singular string
+T: 0.111 ms

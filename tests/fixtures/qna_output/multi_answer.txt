@@ -1,0 +1,6 @@
+Q: names of folders of folder "/tmp"
+A: alpha
+A: beta
+A: gamma
+T: 2.410 ms
+I: plural string

@@ -1,0 +1,4 @@
+Q: version of client
+A: 11.0.6.137
+T: 0.075 ms
+I: singular version

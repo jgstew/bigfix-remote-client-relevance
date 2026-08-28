@@ -1,0 +1,4 @@
+Q: (name of it, version of it) of operating system
+A: Ubuntu
+A: 22.04
+T: 0.900 ms
