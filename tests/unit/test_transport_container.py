@@ -103,6 +103,9 @@ class FakeEngine:
 QNA_OUT = "A: Ubuntu 22.04.3 LTS\nI: singular string\nT: 0.2 ms\n"
 EVAL_OK = (r"-showtypes", (QNA_OUT, "", 0))
 PREREQS_OK = (r"prereq-probe", ("dpkg-deb ar tar", "", 0))
+RPM_PREREQS_OK = (r"prereq-probe", ("rpm2cpio cpio", "", 0))
+PROBE_UBUNTU = (r"os-release", ("Linux\nubuntu debian", "", 0))
+PROBE_ALMA = (r"os-release", ("Linux\nalmalinux rhel fedora centos", "", 0))
 
 
 @pytest.fixture(autouse=True)
@@ -250,9 +253,9 @@ async def test_provisioning_mounts_the_artifact_read_only(resolved):
         responses=[(r"bfrcr-complete", ("", "", 1)), PREREQS_OK, EVAL_OK]
     )
 
-    await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
 
     assert engine.started, "provisioning needs a persistent container"
     mounts = engine.started[0]["mounts"]
@@ -263,9 +266,9 @@ async def test_provisioning_mounts_the_artifact_read_only(resolved):
 async def test_provisioning_extracts_from_the_mount(resolved):
     engine = FakeEngine(responses=[(r"bfrcr-complete", ("", "", 1)), PREREQS_OK, EVAL_OK])
 
-    result = await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
 
     joined = " ; ".join(engine.commands())
     assert ARTIFACT_MOUNT in joined, "artifact should be read from the mount, not copied in"
@@ -276,9 +279,9 @@ async def test_provisioning_extracts_from_the_mount(resolved):
 async def test_provisioned_qna_path_is_version_scoped(resolved):
     engine = FakeEngine(responses=[(r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
-    result = await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    result = await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
 
     assert "11.0.6.137" in result.qna_path
     assert result.qna_path.endswith("opt/BESClient/bin/qna")
@@ -288,9 +291,9 @@ async def test_baked_in_version_skips_extraction(resolved):
     """An image already carrying the version just runs it."""
     engine = FakeEngine(responses=[(r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
-    await TransportContainer("bigfix_ubuntu", engine=engine).evaluate_client_relevance(
-        "true", qna=resolved
-    )
+    await TransportContainer(
+        "bigfix_ubuntu", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
 
     assert not any("dpkg-deb -x" in c for c in engine.commands())
 
@@ -311,11 +314,120 @@ async def test_missing_prereq_in_image_maps_to_bootstrap(resolved):
 async def test_provisioning_container_is_stopped_when_not_keep_alive(resolved):
     engine = FakeEngine(responses=[(r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
-    await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, target="ubuntu"
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert len(engine.stopped) == 1
+
+
+# --- platform probing --------------------------------------------------------
+#
+# Issue #1: the transport used to assume "ubuntu" and silently hand rpm-family
+# images the Debian agent. With no explicit target it must probe the image the
+# way TransportSSH probes a host, and refuse rather than guess.
+
+_M7 = pytest.mark.xfail(strict=True, reason="M7: container platform probe not implemented")
+
+
+@_M7
+async def test_unspecified_target_probes_the_image_before_provisioning(resolved):
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, (r"bfrcr-complete", ("", "", 1)), RPM_PREREQS_OK, EVAL_OK]
+    )
+
+    await TransportContainer("almalinux:9", engine=engine).evaluate_client_relevance(
         "true", qna=resolved
     )
 
-    assert len(engine.stopped) == 1
+    joined = " ; ".join(engine.commands())
+    assert "rpm2cpio" in joined, "probed rpm-family image must extract with rpm tools"
+    assert "dpkg-deb -x" not in joined, "the Debian agent path is the issue #1 bug"
+
+
+@_M7
+async def test_probe_output_feeds_resolve_platform():
+    engine = FakeEngine(responses=[PROBE_ALMA])
+
+    platform = await TransportContainer("almalinux:9", engine=engine).resolve_platform()
+
+    assert platform == "rhel"
+
+
+@_M7
+async def test_probe_runs_once_per_transport_instance(resolved):
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK]
+    )
+    transport = TransportContainer("almalinux:9", engine=engine)
+
+    await transport.evaluate_client_relevance("true", qna=resolved)
+    await transport.evaluate_client_relevance("true", qna=resolved)
+
+    probes = [c for c in engine.commands() if "os-release" in c]
+    assert len(probes) == 1, "probe result must be cached on the transport"
+
+
+@_M7
+async def test_unclassifiable_probe_maps_to_bootstrap(resolved):
+    engine = FakeEngine(responses=[(r"os-release", ("Linux\nsomething-exotic", "", 0))])
+
+    result = await TransportContainer("weird:latest", engine=engine).evaluate_client_relevance(
+        "true", qna=resolved
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "platform" in (result.error or "").lower(), "error must point at the escape hatch"
+
+
+@_M7
+async def test_probe_failure_maps_to_transport(resolved):
+    class ProbeBrokenEngine(FakeEngine):
+        async def run_one_shot(self, image, command, **kwargs):
+            if "os-release" in command:
+                raise ContainerEngineError("exec failed: no shell in image")
+            return await super().run_one_shot(image, command, **kwargs)
+
+    result = await TransportContainer(
+        "distroless:latest", engine=ProbeBrokenEngine()
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+
+
+@_M7
+async def test_keep_alive_probe_reuses_the_running_container_flow(resolved):
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK]
+    )
+    transport = TransportContainer("almalinux:9", engine=engine, keep_alive=True)
+
+    await transport.evaluate_client_relevance("true", qna=resolved)
+    await transport.evaluate_client_relevance("true", qna=resolved)
+
+    probes = [c for c in engine.commands() if "os-release" in c]
+    assert len(probes) == 1, "keep-alive evals share one probe"
+    await transport.aclose()
+
+
+async def test_explicit_target_skips_the_probe(resolved):
+    engine = FakeEngine(responses=[(r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
+
+    await TransportContainer("ubuntu:22.04", engine=engine, target="ubuntu").evaluate_client_relevance(
+        "true", qna=resolved
+    )
+
+    assert not any("uname -s" in c for c in engine.commands())
+
+
+async def test_one_shot_eval_without_qna_does_not_probe():
+    """Without provisioning the platform is cosmetic; keep the cheap path cheap."""
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer("almalinux:9", engine=engine).evaluate_client_relevance("true")
+
+    assert not any("uname -s" in c for c in engine.commands())
+    assert len(engine.one_shots) == 1
 
 
 # --- keep-alive ------------------------------------------------------------
