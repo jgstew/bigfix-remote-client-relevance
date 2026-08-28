@@ -1,0 +1,149 @@
+"""Tests for per-platform bootstrap specs: paths, prereqs, extract commands.
+
+These are pure string builders, so they are tested directly rather than through
+a transport.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from bigfix_remote_client_relevance.bootstrap.targets import (
+    KNOWN_TARGETS,
+    UnknownTargetError,
+    classify_uname,
+    spec_for,
+)
+
+
+def test_every_known_target_is_self_consistent():
+    for name, spec in KNOWN_TARGETS.items():
+        assert spec.name == name
+        assert spec.family in {"posix", "windows"}
+        assert spec.cache_root
+        assert spec.qna_relative_path
+        assert spec.release_platform
+        assert spec.prereqs, f"{name} declares no extraction prereqs"
+
+
+def test_unknown_target_raises():
+    with pytest.raises(UnknownTargetError):
+        spec_for("plan9")
+
+
+# --- macOS -----------------------------------------------------------------
+
+
+def test_macos_extracts_qna_from_the_agent_pkg():
+    spec = spec_for("macos")
+    commands = spec.extract_commands("/tmp/a.pkg", "/tmp/dest")
+    joined = " ; ".join(commands)
+
+    assert "/tmp/a.pkg" in joined
+    assert "Payload" in joined, "qna lives inside besagent.pkg/Payload"
+    assert "cpio" in joined
+    assert spec.qna_relative_path == "BESAgent.app/Contents/MacOS/QnA"
+    assert spec.cache_root == "/tmp/bigfix_qna"
+
+
+def test_macos_prereqs_are_stock_tools():
+    tools = {p.tool for p in spec_for("macos").prereqs}
+
+    assert {"xar", "cpio"} <= tools
+
+
+# --- Debian family ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["ubuntu", "debian"])
+def test_deb_family_extracts_with_dpkg_deb(target):
+    spec = spec_for(target)
+    joined = " ; ".join(spec.extract_commands("/tmp/a.deb", "/tmp/dest"))
+
+    assert "dpkg-deb" in joined
+    assert spec.qna_relative_path == "opt/BESClient/bin/qna"
+
+
+def test_deb_family_falls_back_to_ar_and_tar():
+    """Minimal images often lack dpkg-deb but have binutils."""
+    joined = " ; ".join(spec_for("ubuntu").extract_commands("/tmp/a.deb", "/tmp/dest"))
+
+    assert "ar x" in joined
+    assert "tar" in joined
+
+
+def test_deb_prereq_hint_names_a_package():
+    hints = {p.tool: p.install_hint for p in spec_for("ubuntu").prereqs}
+
+    assert "dpkg-deb" in hints
+    assert "apt" in " ".join(hints.values())
+
+
+# --- RPM family ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["rhel", "suse"])
+def test_rpm_family_extracts_with_rpm2cpio(target):
+    spec = spec_for(target)
+    joined = " ; ".join(spec.extract_commands("/tmp/a.rpm", "/tmp/dest"))
+
+    assert "rpm2cpio" in joined
+    assert "cpio" in joined
+    assert spec.qna_relative_path == "opt/BESClient/bin/qna"
+
+
+def test_rpm_prereqs_flag_the_commonly_missing_tools():
+    """rpm2cpio and cpio are frequently absent on minimal/container images."""
+    hints = {p.tool: p.install_hint for p in spec_for("rhel").prereqs}
+
+    assert "cpio" in hints
+    assert "install" in hints["cpio"]
+
+
+# --- Windows ---------------------------------------------------------------
+
+
+def test_windows_extracts_the_standalone_qna_zip():
+    spec = spec_for("windows")
+    joined = " ; ".join(spec.extract_commands(r"C:\tmp\QNA.zip", r"C:\tmp\dest"))
+
+    assert "Expand-Archive" in joined
+    assert spec.family == "windows"
+    assert spec.qna_relative_path == "QnA.exe"
+
+
+def test_windows_cache_root_is_under_windows_temp():
+    assert spec_for("windows").cache_root == r"\Windows\Temp\bigfix_qna"
+
+
+def test_windows_non_admin_root_is_under_user_temp():
+    """\\Windows\\Temp needs elevation; non-admin SSH users fall back to %TEMP%."""
+    spec = spec_for("windows")
+
+    assert "TEMP" in spec.fallback_cache_root
+    assert spec.fallback_cache_root != spec.cache_root
+
+
+# --- platform classification ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("probe", "expected"),
+    [
+        ("Darwin", "macos"),
+        ("Linux\nubuntu debian", "ubuntu"),
+        ("Linux\ndebian", "debian"),
+        ("Linux\nrhel fedora", "rhel"),
+        ("Linux\ncentos rhel fedora", "rhel"),
+        ("Linux\nopensuse-leap suse", "suse"),
+        ("Linux\namzn", "rhel"),
+        ("", "windows"),
+    ],
+)
+def test_classify_uname(probe, expected):
+    assert classify_uname(probe) == expected
+
+
+def test_classify_unrecognized_linux_defaults_to_deb_family():
+    """Better to guess the more common family than to refuse outright."""
+    assert classify_uname("Linux\nsomething-exotic") in {"ubuntu", "debian"}
