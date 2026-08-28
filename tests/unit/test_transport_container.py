@@ -1048,8 +1048,8 @@ async def test_platform_flag_passed_through_for_arch_emulation():
 
 
 def test_candidate_sockets_cover_engines_the_sdk_would_miss():
-    """The SDK assumes /var/run/docker.sock and ignores Docker contexts, so
-    Colima and Rancher Desktop need their own paths tried."""
+    """The SDK assumes /var/run/docker.sock, so Colima and Rancher Desktop
+    need their own paths tried even when no context names them."""
     from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
 
     candidates = candidate_docker_sockets()
@@ -1057,7 +1057,6 @@ def test_candidate_sockets_cover_engines_the_sdk_would_miss():
     assert any("/var/run/docker.sock" in c for c in candidates)
     assert any(".docker/run/docker.sock" in c for c in candidates)
     assert any(".colima" in c for c in candidates)
-    assert all(c.startswith("unix://") for c in candidates)
 
 
 def test_docker_host_env_takes_precedence(monkeypatch):
@@ -1066,6 +1065,46 @@ def test_docker_host_env_takes_precedence(monkeypatch):
     monkeypatch.setenv("DOCKER_HOST", "unix:///custom/docker.sock")
 
     assert candidate_docker_sockets()[0] == "unix:///custom/docker.sock"
+
+
+# --- the docker context, which the SDK does not read --------------------------
+
+_M18 = pytest.mark.xfail(strict=True, reason="M18: the docker context is not consulted")
+
+
+@_M18
+def test_the_context_endpoint_is_tried_before_the_hardcoded_paths(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    candidates = candidate_docker_sockets(endpoint_lookup=lambda: "tcp://10.0.0.5:2375")
+
+    assert candidates[0] == "tcp://10.0.0.5:2375"
+    assert "unix:///var/run/docker.sock" in candidates, "the fallbacks must survive"
+
+
+@_M18
+def test_docker_host_still_outranks_the_context(monkeypatch):
+    """An explicit environment variable is a stronger statement than a context."""
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    monkeypatch.setenv("DOCKER_HOST", "unix:///custom/docker.sock")
+    candidates = candidate_docker_sockets(endpoint_lookup=lambda: "tcp://10.0.0.5:2375")
+
+    assert candidates[0] == "unix:///custom/docker.sock"
+    assert "tcp://10.0.0.5:2375" in candidates
+
+
+@_M18
+def test_a_context_duplicating_a_hardcoded_path_is_not_listed_twice(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
+
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    candidates = candidate_docker_sockets(
+        endpoint_lookup=lambda: "unix:///var/run/docker.sock"
+    )
+
+    assert candidates.count("unix:///var/run/docker.sock") == 1
 
 
 async def test_engine_error_names_the_sockets_it_tried():
