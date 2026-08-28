@@ -428,14 +428,11 @@ async def test_one_shot_eval_without_qna_does_not_probe():
 # Before provisioning, an explicit deb/rpm platform is checked against which
 # package manager the image actually carries.
 
-_M8 = pytest.mark.xfail(strict=True, reason="M8: family sanity check not implemented")
-
 SANITY_RPM_ONLY = (r"command -v dpkg", ("rpm", "", 0))
 SANITY_DEB_ONLY = (r"command -v dpkg", ("dpkg", "", 0))
 SANITY_NEITHER = (r"command -v dpkg", ("", "", 0))
 
 
-@_M8
 async def test_explicit_deb_platform_on_an_rpm_image_fails_loudly(resolved):
     engine = FakeEngine(responses=[SANITY_RPM_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
@@ -448,7 +445,6 @@ async def test_explicit_deb_platform_on_an_rpm_image_fails_loudly(resolved):
     assert "platform" in (result.error or "").lower()
 
 
-@_M8
 async def test_explicit_rpm_platform_on_a_deb_image_fails_loudly(resolved):
     engine = FakeEngine(responses=[SANITY_DEB_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
@@ -460,7 +456,6 @@ async def test_explicit_rpm_platform_on_a_deb_image_fails_loudly(resolved):
     assert "dpkg" in (result.error or "") or "deb" in (result.error or "")
 
 
-@_M8
 async def test_matching_explicit_platform_passes_the_sanity_check(resolved):
     engine = FakeEngine(responses=[SANITY_DEB_ONLY, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])
 
@@ -472,7 +467,6 @@ async def test_matching_explicit_platform_passes_the_sanity_check(resolved):
     assert any("command -v rpm" in c for c in engine.commands()), "check must actually run"
 
 
-@_M8
 async def test_inconclusive_sanity_output_does_not_block(resolved):
     """No package manager found (busybox-ish): proceed, the prereq probe governs."""
     engine = FakeEngine(responses=[SANITY_NEITHER, (r"bfrcr-complete", ("ok", "", 0)), EVAL_OK])

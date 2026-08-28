@@ -67,6 +67,15 @@ KEEP_ALIVE_COMMAND = "sleep infinity"
 # two. The container's answer is authoritative, so it is classified strictly.
 PLATFORM_PROBE_COMMAND = 'uname -s; . /etc/os-release 2>/dev/null && echo "$ID $ID_LIKE"'
 
+# Which package manager does the image actually carry? Cheap cross-check for
+# an explicit (human-supplied) platform; ends in true so absence is not an error.
+FAMILY_SANITY_COMMAND = (
+    "command -v dpkg >/dev/null 2>&1 && echo dpkg; "
+    "command -v rpm >/dev/null 2>&1 && echo rpm; true"
+)
+
+_SPEC_FAMILIES = {"ubuntu": "deb", "debian": "deb", "rhel": "rpm", "suse": "rpm"}
+
 
 class ContainerEngineError(Exception):
     """The container engine is unreachable or refused an operation."""
@@ -425,6 +434,11 @@ class TransportContainer:
                     transient_container = container_id
                 runner = _ContainerRunner(self._engine, container_id)
 
+                if qna is not None and self._target is not None:
+                    # A probed platform came from the image itself; only a
+                    # human-supplied one can contradict what the image carries.
+                    await self._check_family(runner, spec)
+
                 if qna is not None:
                     qna_path = await provision_qna(
                         runner,
@@ -484,6 +498,21 @@ class TransportContainer:
             qna_time=parsed.qna_time,
             exit_code=exit_code,
         )
+
+    async def _check_family(self, runner: _ContainerRunner, spec: TargetSpec) -> None:
+        family = _SPEC_FAMILIES.get(spec.name)
+        if family is None:
+            return
+        stdout, _stderr, _code = await runner.run(FAMILY_SANITY_COMMAND)
+        tools = set(stdout.split())
+        opposite = {"deb": ("rpm", "dpkg"), "rpm": ("dpkg", "rpm")}[family]
+        wrong_tool, right_tool = opposite
+        if wrong_tool in tools and right_tool not in tools:
+            raise BootstrapFailure(
+                f"image {self.image} has {wrong_tool} but not {right_tool}, yet platform "
+                f"{spec.name!r} ({family} family) was selected; fix the platform or omit "
+                "it to let the image be probed"
+            )
 
     async def _acquire_container(self, mounts: dict[str, str]) -> str:
         if self._keep_alive and self._container_id is not None:
