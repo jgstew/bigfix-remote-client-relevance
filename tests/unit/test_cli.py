@@ -430,10 +430,6 @@ def test_errors_are_reported_on_stderr_not_stdout(monkeypatch):
 # differ. The issue that prompted this was verifying byte-identity across ten
 # images by hand with a pile of md5 calls.
 
-_M21 = pytest.mark.xfail(strict=True, reason="M21: --diff does not exist")
-
-
-@_M21
 def test_diff_collapses_identical_answers(captured):
     captured["results"] = [result_for(f"h{i}", ["2134"]) for i in range(3)]
 
@@ -446,7 +442,6 @@ def test_diff_collapses_identical_answers(captured):
         assert host in result.stdout, "every target is still named"
 
 
-@_M21
 def test_diff_separates_disagreeing_answers(captured):
     captured["results"] = [
         result_for("h0", ["2134"]),
@@ -462,7 +457,6 @@ def test_diff_separates_disagreeing_answers(captured):
     assert result.stdout.index("2134") < result.stdout.index("2151"), "majority first"
 
 
-@_M21
 def test_diff_treats_the_answer_type_as_part_of_the_answer(captured):
     """An inspector answering 1 as integer here and string there is a real difference."""
     captured["results"] = [
@@ -475,7 +469,6 @@ def test_diff_treats_the_answer_type_as_part_of_the_answer(captured):
     assert "group 1" in result.stdout and "group 2" in result.stdout
 
 
-@_M21
 def test_diff_gives_errors_their_own_group(captured):
     captured["results"] = [
         result_for("h0", ["2134"]),
@@ -489,7 +482,6 @@ def test_diff_gives_errors_their_own_group(captured):
     assert result.exit_code == 3, "an error still sets the exit code"
 
 
-@_M21
 def test_diff_collapses_identical_errors(captured):
     captured["results"] = [
         result_for(f"h{i}", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT)
@@ -502,7 +494,6 @@ def test_diff_collapses_identical_errors(captured):
     assert result.stdout.count("cannot connect") == 1
 
 
-@_M21
 def test_diff_ignores_the_qna_version_when_grouping(captured):
     """Comparing across versions is the point; agreeing across them is the payoff."""
     captured["results"] = [
@@ -516,7 +507,6 @@ def test_diff_ignores_the_qna_version_when_grouping(captured):
     assert "11.0.6.137" in result.stdout and "10.0.16.61" in result.stdout
 
 
-@_M21
 def test_diff_with_a_single_result_still_renders_a_group(captured):
     result = invoke("--container", "a", "--diff", "true")
 
@@ -525,7 +515,6 @@ def test_diff_with_a_single_result_still_renders_a_group(captured):
     assert "Mac OS 15.5" in result.stdout
 
 
-@_M21
 def test_diff_and_json_together_is_a_usage_error(captured):
     result = invoke("--container", "a", "--diff", "--json", "true")
 
@@ -534,7 +523,6 @@ def test_diff_and_json_together_is_a_usage_error(captured):
     assert "text summary" in result.output
 
 
-@_M21
 @pytest.mark.parametrize(
     ("kind", "expected"),
     [(None, 0), (ERROR_KIND_RELEVANCE, 1), (ERROR_KIND_TRANSPORT, 3)],
@@ -547,7 +535,6 @@ def test_diff_does_not_change_the_exit_code(captured, kind, expected):
     assert invoke("--container", "a", "--diff", "true").exit_code == expected
 
 
-@_M21
 def test_diff_with_no_results_prints_nothing(captured):
     captured["results"] = []
 

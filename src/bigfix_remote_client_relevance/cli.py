@@ -102,6 +102,62 @@ def _render_plain(results: list[ClientRelevanceResult]) -> str:
     return "\n".join(lines)
 
 
+def _diff_key(result: ClientRelevanceResult) -> tuple[object, ...]:
+    """What makes two results the same answer.
+
+    The answer *type* counts: an inspector returning 1 as an integer on one
+    platform and a string on another is exactly the difference this tool
+    exists to find. ``raw_qna_output`` deliberately does not — it carries
+    timings and paths that differ between identical answers and would defeat
+    the collapse. Neither does the qna version, which identifies a member
+    rather than an answer.
+    """
+    return (
+        result.error_kind,
+        result.error,
+        tuple(result.answers),
+        tuple(result.answer_types),
+    )
+
+
+def _label(result: ClientRelevanceResult) -> str:
+    if result.qna_version:
+        return f"{result.host} (qna {result.qna_version})"
+    return result.host
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _render_diff(results: list[ClientRelevanceResult]) -> str:
+    """Group results by answer, so disagreement is what stands out."""
+    groups: dict[tuple[object, ...], list[ClientRelevanceResult]] = {}
+    for result in results:
+        groups.setdefault(_diff_key(result), []).append(result)
+
+    # Majority first, ties broken by first appearance so the output is stable.
+    order = sorted(
+        groups.items(),
+        key=lambda item: (-len(item[1]), results.index(item[1][0])),
+    )
+
+    lines: list[str] = []
+    for index, (_key, members) in enumerate(order, start=1):
+        if lines:
+            lines.append("")
+        if len(order) == 1:
+            lines.append(f"== all targets agree ({len(members)})")
+        else:
+            lines.append(f"== group {index} ({_plural(len(members), 'target')})")
+        lines.extend(f"-- {_label(member)}" for member in members)
+        first = members[0]
+        lines.extend(first.answers)
+        if first.error:
+            lines.append(f"!! {first.error_kind}: {first.error}")
+    return "\n".join(lines)
+
+
 def _summarize_failures(results: list[ClientRelevanceResult]) -> None:
     for result in results:
         if result.error_kind is not None:
@@ -203,6 +259,13 @@ def evaluate(
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit one JSON document per (target x version).")
     ] = False,
+    diff: Annotated[
+        bool,
+        typer.Option(
+            "--diff",
+            help="Collapse identical answers and show where targets disagree.",
+        ),
+    ] = False,
     verbose: Annotated[
         int, typer.Option("--verbose", "-v", count=True, help="-v for info, -vv for debug.")
     ] = 0,
@@ -224,6 +287,11 @@ def evaluate(
 
     if rebuild_image and not container:
         _fail("--rebuild-image only applies to --container targets")
+
+    if diff and as_json:
+        # --json is one schema, a flat array of results, and it is the future
+        # MCP tool's contract; `jq 'group_by(.answers)'` covers this case.
+        _fail("--diff renders a text summary; use --json on its own for machine-readable results")
 
     # With an explicit target mode every positional is client relevance;
     # otherwise the first positional is the SSH host.
@@ -290,11 +358,12 @@ def evaluate(
 
     _summarize_failures(results)
 
-    payload = (
-        json.dumps([dataclasses.asdict(r) for r in results], indent=2)
-        if as_json
-        else _render_plain(results)
-    )
+    if as_json:
+        payload = json.dumps([dataclasses.asdict(r) for r in results], indent=2)
+    elif diff and results:
+        payload = _render_diff(results)
+    else:
+        payload = _render_plain(results)
     if payload:
         typer.echo(payload)
 

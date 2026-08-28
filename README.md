@@ -121,6 +121,36 @@ it crosses the wire once ever rather than once per run.
 Only Windows has a standalone QnA download; every other platform extracts qna
 out of the agent package without installing it.
 
+### Comparing across targets
+
+Across several targets the useful answer is usually not one block per target,
+it is where they disagree. `--diff` collapses identical answers:
+
+```bash
+bigfix-remote-client-relevance \
+  --container ubuntu:22.04 --container debian:12 \
+  --container almalinux:9 --container rockylinux:9 \
+  --qna-version 11.0 --diff "number of properties"
+```
+
+```
+== group 1 (2 targets)
+-- container:ubuntu:22.04@x86_64 (qna 11.0.6.137)
+-- container:debian:12@x86_64 (qna 11.0.6.137)
+2134
+
+== group 2 (2 targets)
+-- container:almalinux:9@x86_64 (qna 11.0.6.137)
+-- container:rockylinux:9@x86_64 (qna 11.0.6.137)
+2151
+```
+
+When everything agrees it says so once, which is the quickest way to check
+that a set of platforms answers identically. Answer *types* count as part of
+the answer; the qna version does not, so `--qna-version 11.0 --qna-version
+10.0 --diff` tells you whether the two versions agree. `--diff` is a text
+summary — for machine consumption use `--json` on its own.
+
 ### Containers
 
 With `--container`, an unspecified platform is **probed**, not assumed — the
