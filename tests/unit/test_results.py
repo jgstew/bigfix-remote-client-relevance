@@ -136,6 +136,7 @@ def test_result_has_every_designed_field():
         "qna_time",
         "elapsed_ms",
         "exit_code",
+        "platform",
     }
 
 

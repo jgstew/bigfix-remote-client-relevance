@@ -257,6 +257,32 @@ async def test_resolve_platform_shares_the_eval_connection():
     assert connects == 1
 
 
+async def test_reprobe_platform_ignores_the_explicit_target():
+    """The whole point: ``resolve_platform`` trusts an explicit target, this must not."""
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("", "", 0))])  # empty output = windows
+
+    # make_transport defaults platform="ubuntu" -- exactly the wrong,
+    # explicit value this method must see past.
+    platform = await make_transport(runner).reprobe_platform()
+
+    assert platform == "windows"
+
+
+async def test_reprobe_platform_reuses_the_connection():
+    runner = FakeSSHRunner(responses=[(r"uname -s", ("Linux\nubuntu debian", "", 0))])
+    connects = 0
+
+    async def factory() -> FakeSSHRunner:
+        nonlocal connects
+        connects += 1
+        return runner
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+    await transport.reprobe_platform()
+
+    assert connects == 1
+
+
 # --- connection failures ---------------------------------------------------
 
 

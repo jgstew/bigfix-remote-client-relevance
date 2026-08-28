@@ -20,6 +20,8 @@ import logging
 import tomllib
 from pathlib import Path
 
+import tomlkit
+
 from bigfix_remote_client_relevance.orchestrate import Target
 
 logger = logging.getLogger(__name__)
@@ -101,4 +103,39 @@ def _target_from_entry(
     )
 
 
-__all__ = ["DEFAULT_TRANSPORT", "KNOWN_TRANSPORTS", "InventoryError", "load_inventory"]
+def update_inventory_platform(path: str | Path, host: str, platform: str) -> None:
+    """Write a probed or corrected ``platform`` into one host's table.
+
+    Uses ``tomlkit`` rather than ``tomllib`` (read-only) plus a plain-dict
+    rewrite: a naive rewrite would silently drop every comment and could
+    reorder tables, and this is exactly the kind of file a person hand-edits
+    and keeps under version control. Only the one host's ``platform`` key
+    changes; everything else in the file is untouched byte-for-byte.
+    """
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise InventoryError(f"could not read inventory {path}: {exc}") from exc
+
+    try:
+        document = tomlkit.parse(raw.decode("utf-8"))
+    except tomlkit.exceptions.ParseError as exc:
+        raise InventoryError(f"could not parse inventory {path}: {exc}") from exc
+
+    hosts = document.get("hosts", {})
+    if host not in hosts:
+        raise InventoryError(f"no host {host!r} in inventory {path}")
+
+    hosts[host]["platform"] = platform
+    path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    logger.info("wrote platform = %r for %r to %s", platform, host, path)
+
+
+__all__ = [
+    "DEFAULT_TRANSPORT",
+    "KNOWN_TRANSPORTS",
+    "InventoryError",
+    "load_inventory",
+    "update_inventory_platform",
+]

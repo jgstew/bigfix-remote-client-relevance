@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
+from bigfix_remote_client_relevance.inventory import (
+    InventoryError,
+    load_inventory,
+    update_inventory_platform,
+)
 
 SAMPLE = """
 [defaults]
@@ -149,3 +153,59 @@ def test_transport_defaults_to_ssh(tmp_path):
     targets = load_inventory(path)
 
     assert targets[0].kind == "ssh"
+
+
+# --- writing a probed/corrected platform back ------------------------------
+#
+# tomlkit, not tomllib+dict, because a naive rewrite would silently drop
+# every comment and reorder every table -- and this file is exactly the kind
+# a person hand-edits and keeps under version control.
+
+
+def test_update_inventory_platform_adds_the_key_when_absent(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        '[hosts.win-box]  # a comment worth keeping\ntransport = "ssh"\n', encoding="utf-8"
+    )
+
+    update_inventory_platform(path, "win-box", "windows")
+
+    text = path.read_text(encoding="utf-8")
+    assert "# a comment worth keeping" in text, "tomlkit must preserve comments"
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["win-box"].platform == "windows"
+
+
+def test_update_inventory_platform_overwrites_a_wrong_value(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        '[hosts.win-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8"
+    )
+
+    update_inventory_platform(path, "win-box", "windows")
+
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["win-box"].platform == "windows"
+
+
+def test_update_inventory_platform_leaves_other_hosts_untouched(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        '[hosts.win-box]\ntransport = "ssh"\n\n[hosts.other]\ntransport = "ssh"\n',
+        encoding="utf-8",
+    )
+
+    update_inventory_platform(path, "win-box", "windows")
+
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["other"].platform is None
+
+
+def test_update_inventory_platform_unknown_host_raises(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
+
+    with pytest.raises(InventoryError) as excinfo:
+        update_inventory_platform(path, "nope", "windows")
+
+    assert "nope" in str(excinfo.value)

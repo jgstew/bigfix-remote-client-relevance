@@ -248,6 +248,10 @@ async def evaluate_client_relevance(
     async def _one(target: Target, spec: str | None) -> ClientRelevanceResult:
         started = time.monotonic()
         resolved: ResolvedQna | None = None
+        # Captured before any probe-before-resolve replaces target.platform,
+        # so the corrective reprobe below only fires for a platform the
+        # caller actually set (never for one this run just probed itself).
+        configured_platform = target.platform
 
         try:
             transport = transport_factory(target)
@@ -312,6 +316,34 @@ async def evaluate_client_relevance(
             except Exception as exc:  # noqa: BLE001 - one bad target never fails the run
                 logger.debug("transport failed for %s: %s", target.label, exc)
                 return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+
+        # Whatever platform this run actually used -- explicit, freshly
+        # probed, or (below) corrected -- so the CLI can write it back.
+        result.platform = target.platform
+
+        if spec is not None and configured_platform is not None:
+            # An explicit platform was trusted outright above and never
+            # probed. If it made the run fail, that's exactly the failure
+            # mode a wrong hosts.toml entry produces (issue: a stale or
+            # mistyped platform silently resolves the wrong artifact) --
+            # cheap to double-check now that it's failed, on the same live
+            # connection, rather than leaving it to fail identically forever.
+            reprobe = getattr(transport, "reprobe_platform", None)
+            if reprobe is not None and result.error_kind == ERROR_KIND_BOOTSTRAP:
+                try:
+                    actual = await reprobe(timeout_s=timeout_s)
+                except Exception as exc:  # noqa: BLE001 - a failed reprobe must not mask the real error
+                    logger.debug("corrective reprobe failed for %s: %s", target.label, exc)
+                else:
+                    if actual != configured_platform:
+                        logger.warning(
+                            "%s: configured platform %r looks wrong for this host -- "
+                            "probed %r instead",
+                            target.label,
+                            configured_platform,
+                            actual,
+                        )
+                        result.platform = actual
 
         # Transports that are version-agnostic still report which one ran.
         if resolved is not None and result.qna_version is None:
