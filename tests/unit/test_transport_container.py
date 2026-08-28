@@ -532,6 +532,77 @@ async def test_provisioning_timeout_is_not_inflated(resolved, extracted):
     assert engine.one_shots[-1]["timeout"] == 12.0
 
 
+# --- a qna that cannot link ---------------------------------------------------
+#
+# The dynamic linker's message ends in "No such file or directory", which the
+# missing-binary heuristic matches — so a present-but-unlinkable qna on
+# rockylinux:9 was reported as "no qna in image". Captured from that image.
+
+_M15 = pytest.mark.xfail(strict=True, reason="M15: link failures read as a missing binary")
+
+ROCKY_LINK_FAILURE = (
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: error while loading shared libraries: "
+    "libdbus-1.so.3: cannot open shared object file: No such file or directory"
+)
+
+
+@_M15
+async def test_an_unlinkable_qna_is_not_reported_as_missing():
+    engine = FakeEngine(responses=[(r"-showtypes", ("", ROCKY_LINK_FAILURE, 127))])
+
+    result = await TransportContainer("rockylinux:9", engine=engine).evaluate_client_relevance(
+        "true"
+    )
+
+    assert "no qna in image" not in (result.error or "")
+    assert "libdbus-1.so.3" in (result.error or ""), "the error must name the library"
+
+
+@_M15
+async def test_a_link_failure_says_what_to_do_about_it():
+    engine = FakeEngine(responses=[(r"-showtypes", ("", ROCKY_LINK_FAILURE, 127))])
+
+    result = await TransportContainer("rockylinux:9", engine=engine).evaluate_client_relevance(
+        "true"
+    )
+
+    error = (result.error or "").lower()
+    assert "shared library" in error, "the message should name the actual failure mode"
+    assert "install" in error, "and point at the fix"
+
+
+async def test_a_link_failure_is_still_a_bootstrap_problem():
+    """An image that cannot run the binary is a provisioning problem either way."""
+    engine = FakeEngine(responses=[(r"-showtypes", ("", ROCKY_LINK_FAILURE, 127))])
+
+    result = await TransportContainer("rockylinux:9", engine=engine).evaluate_client_relevance(
+        "true"
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+
+
+async def test_a_genuinely_missing_qna_still_reads_as_missing():
+    engine = FakeEngine(responses=[(r"-showtypes", ("", "qna: command not found", 127))])
+
+    result = await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
+        "true"
+    )
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "no qna in image" in (result.error or "")
+
+
+async def test_exit_126_still_reads_as_a_missing_qna():
+    engine = FakeEngine(responses=[(r"-showtypes", ("", "permission denied", 126))])
+
+    result = await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
+        "true"
+    )
+
+    assert "no qna in image" in (result.error or "")
+
+
 # --- prepared-image cache -----------------------------------------------------
 #
 # Issue #1: provisioning per run is the wrong unit of work for a matrix sweep.
