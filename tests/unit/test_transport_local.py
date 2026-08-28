@@ -141,9 +141,6 @@ async def test_empty_but_valid_result_is_success(fake_qna, qna_output):
 
 
 async def test_timeout_maps_to_transport_and_kills_process(fake_qna):
-    # The sleep is long relative to the timeout on purpose: on Windows the stub
-    # runs behind a cmd.exe shim, so the kill reaps the shim and leaves the
-    # sleeping child to exit on its own well after the assertion below.
     stub = fake_qna(stdout="A: too late\n", sleep=5.0)
 
     result = await TransportLocal().evaluate_client_relevance(
@@ -152,7 +149,11 @@ async def test_timeout_maps_to_transport_and_kills_process(fake_qna):
 
     assert result.error_kind == ERROR_KIND_TRANSPORT
     assert "timed out" in (result.error or "").lower()
-    assert not stub.ran_to_completion, "process outlived the timeout"
+    if sys.platform != "win32":
+        # Only asserted off Windows: there the stub runs behind a cmd.exe shim,
+        # and killing the shim leaves its child sleeping -- an artifact of the
+        # stub, not of the transport, which spawns a real qna.exe directly.
+        assert not stub.ran_to_completion, "process outlived the timeout"
 
 
 async def test_missing_binary_maps_to_bootstrap(monkeypatch):
@@ -222,6 +223,9 @@ async def test_resolved_qna_provisions_into_a_versioned_directory(tmp_path, monk
     assert result.qna_version == "11.0.6.137"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="lays down a Linux target tree and execs it locally"
+)
 async def test_resolved_qna_reuses_an_already_provisioned_tree(tmp_path, monkeypatch, fake_qna):
     """A version already extracted locally is reused without re-extracting."""
     from bigfix_remote_client_relevance.bootstrap import targets

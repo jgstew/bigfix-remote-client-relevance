@@ -201,6 +201,26 @@ def test_update_inventory_platform_leaves_other_hosts_untouched(tmp_path):
     assert targets["other"].platform is None
 
 
+def test_update_inventory_platform_keeps_crlf_line_endings(tmp_path):
+    """A CRLF file must survive the rewrite unchanged.
+
+    Text-mode writing would translate tomlkit's reproduced CRLFs a second time,
+    leaving \r\r\n behind -- which tomllib then refuses to read back.
+    """
+    path = tmp_path / "hosts.toml"
+    path.write_bytes(b'[hosts.win-box]  # kept\r\ntransport = "ssh"\r\n')
+
+    update_inventory_platform(path, "win-box", "windows")
+
+    raw = path.read_bytes()
+    assert b"\r\r\n" not in raw
+    assert b'transport = "ssh"\r\n' in raw, "the existing lines keep their CRLFs"
+    # tomlkit ends the key it appends with a plain \n; a mixed-ending file is
+    # still valid TOML, so the round-trip below is what has to hold.
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["win-box"].platform == "windows"
+
+
 def test_update_inventory_platform_unknown_host_raises(tmp_path):
     path = tmp_path / "hosts.toml"
     path.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")

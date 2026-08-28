@@ -227,11 +227,14 @@ def candidate_docker_sockets(
         candidates.append("npipe:////./pipe/docker_engine")
         return list(dict.fromkeys(candidates))
 
-    candidates.append(f"unix://{Path.home() / '.docker/run/docker.sock'}")
+    # as_posix(), not str(): a socket URL is always slash-separated, even when
+    # this runs on a host whose Path renders with backslashes.
+    home = Path.home()
+    candidates.append(f"unix://{(home / '.docker/run/docker.sock').as_posix()}")
     candidates.append("unix:///var/run/docker.sock")
     # Colima and Rancher Desktop keep their sockets elsewhere again.
-    candidates.append(f"unix://{Path.home() / '.colima/default/docker.sock'}")
-    candidates.append(f"unix://{Path.home() / '.rd/docker.sock'}")
+    candidates.append(f"unix://{(home / '.colima/default/docker.sock').as_posix()}")
+    candidates.append(f"unix://{(home / '.rd/docker.sock').as_posix()}")
     return list(dict.fromkeys(candidates))
 
 

@@ -1350,7 +1350,9 @@ def test_the_context_endpoint_is_tried_before_the_hardcoded_paths(monkeypatch):
     from bigfix_remote_client_relevance.transports.container import candidate_docker_sockets
 
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    candidates = candidate_docker_sockets(endpoint_lookup=lambda: "tcp://10.0.0.5:2375")
+    candidates = candidate_docker_sockets(
+        endpoint_lookup=lambda: "tcp://10.0.0.5:2375", platform="linux"
+    )
 
     assert candidates[0] == "tcp://10.0.0.5:2375"
     assert "unix:///var/run/docker.sock" in candidates, "the fallbacks must survive"

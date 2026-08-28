@@ -128,7 +128,10 @@ def update_inventory_platform(path: str | Path, host: str, platform: str) -> Non
         raise InventoryError(f"no host {host!r} in inventory {path}")
 
     hosts[host]["platform"] = platform
-    path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    # newline="" disables translation on write: tomlkit already reproduces the
+    # file's own line endings, and re-translating them would turn a CRLF file
+    # into a \r\r\n one that tomllib then refuses to read back.
+    path.write_text(tomlkit.dumps(document), encoding="utf-8", newline="")
     logger.info("wrote platform = %r for %r to %s", platform, host, path)
 
 
