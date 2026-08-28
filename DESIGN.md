@@ -57,6 +57,63 @@ Prior-art code we port (`jgstew/EvaluateRelevance/evaluate_relevance.py`,
 `bigfix_run_qna_*.sh`) is *renamed* on the way in, not preserved verbatim,
 so nothing internal reintroduces bare "relevance".
 
+## Output convention (project-wide rule): `logging`, never `print`
+
+**Rule:** no `print()` anywhere in the library — not in transports, not in
+`bootstrap/`, not in `orchestrate.py`, not even temporarily during
+debugging. Every diagnostic, progress, and debug message goes through the
+stdlib `logging` module.
+
+**Why:** stdout is a reserved channel. A future **stdio MCP server**
+speaks JSON-RPC over stdout, and a single stray `print` — or a library
+that helpfully echoes qna output — corrupts the protocol stream and
+produces a confusing, hard-to-trace client-side parse failure. Keeping
+stdout clean from the first commit costs nothing; retrofitting it later
+means auditing every module for writes it shouldn't be making. The same
+discipline is what makes the CLI safe to pipe into `jq` today.
+
+**Library convention:**
+- Module-level `logger = logging.getLogger(__name__)` in each module.
+- `__init__.py` attaches a `logging.NullHandler()` to the package's root
+  logger. The library never calls `basicConfig()`, never adds a real
+  handler, never sets a level, and never touches the root logger —
+  configuration belongs to the embedding application (CLI, MCP server,
+  or a consumer importing us as a dependency).
+- Level guidance: `DEBUG` for the qna command line, resolved paths, cache
+  hits/misses; `INFO` for phase transitions (resolve → fetch → push →
+  extract → run); `WARNING` for degraded-but-continuing behavior (e.g.
+  `-showtypes` unsupported on an old qna, falling back to plain `-t`);
+  `ERROR` only where the failure isn't already carried back to the caller
+  in `ClientRelevanceResult.error` / `error_kind`. Errors that *are*
+  carried in the result are the caller's to report — the library
+  shouldn't log and return the same failure twice.
+
+**`cli.py` is the one stdout writer.** It configures logging on startup —
+a `StreamHandler(sys.stderr)`, with `-v`/`-vv` mapping to `INFO`/`DEBUG`
+— and writes **only the final result payload** (the `--json` documents,
+or the plain-text answers) to stdout. Nothing else in the process writes
+to stdout. This is exactly the split the stdio MCP server needs later:
+swap the CLI's stdout writer for the JSON-RPC transport and every
+existing log call is already pointed somewhere safe.
+
+**`raw_qna_output` is a result field, not output.** The library captures
+qna's stdout/stderr into `ClientRelevanceResult.raw_qna_output` and
+returns it. It never relays it to the process's own stdout; a caller that
+wants to see it prints it themselves.
+
+**Ported code:** any `print` in code lifted from
+`jgstew/EvaluateRelevance` or the `bigfix_run_qna_*` scripts is converted
+to `logger.*` on the way in — the same treatment the `relevance` →
+`client_relevance` rename gets. Nothing is preserved verbatim.
+
+**Testability:** this rule is testable, so test it (see § Development
+methodology). Assert on log records with pytest's `caplog` where a
+message is part of the contract, and assert `capsys.readouterr().out ==
+""` around library-level calls so a reintroduced `print` fails a test
+rather than surfacing as a broken MCP session months later. A ruff rule
+banning `print` in `src/` (flake8-print, `T20`) is the cheap static
+backstop, with `cli.py` as the single documented exemption.
+
 ## Problem
 Iterate on BigFix **client relevance** against real endpoints (Mac +
 Windows primarily, plus the Linux family the `tools/bash/` scripts already
@@ -87,17 +144,54 @@ Files in the repo are the source of truth; this section explains *why*.
   no-install runs. Consumers can still `pip install
   bigfix-remote-client-relevance` from PyPI — `uv` writes standard
   artifacts.
-- **Interpreter support floor:** Python `>=3.10` (declared in
-  `pyproject.toml` `[project] requires-python`). Enough for `str | None`,
-  `match`, PEP 604; `tomli` covers 3.10's lack of `tomllib`.
+- **Interpreter support floor:** Python `>=3.11` (declared in
+  `pyproject.toml` `[project] requires-python`). Buys three things the
+  design leans on: stdlib `tomllib` (so `inventory.py` reads
+  `hosts.toml` with no `tomli` shim and zero conditional dependency),
+  `asyncio.TaskGroup` + `ExceptionGroup` / `except*` (the natural shape
+  for `orchestrate.py`'s targets × versions fan-out — structured
+  cancellation and *all* per-target failures surfaced together rather
+  than the first one winning), and `typing.Self`. PEP 604 `str | None`
+  and `match` come along from 3.10.
 - **Primary dev/test target:** Python `3.12` (declared in
   `.python-version`, single line, no patch pin). `uv sync` / `uv run`
   auto-fetch it via `[tool.uv] python-preference = "managed"` in
   `pyproject.toml` — no external Python setup required.
-- **CI matrix:** 3.10–3.13 on Ubuntu, plus 3.12 on macOS and Windows.
+- **CI matrix:** 3.11–3.13 on Ubuntu, plus 3.12 on macOS and Windows.
   Uses `astral-sh/setup-uv@v3` + `uv sync --frozen --python
   ${{ matrix.python-version }}` + `uv run pytest`. No
   `actions/setup-python` needed.
+- **Dependency quarantine — 7 days** (`[tool.uv] exclude-newer = "-P7D"`).
+  Resolution ignores any distribution uploaded in the last week. The
+  window is a supply-chain measure: the common failure modes of a fresh
+  PyPI release — a hijacked maintainer account, a malicious post-install
+  payload, a release yanked hours later as broken — are usually caught
+  and pulled within days, and waiting a week means this project's builds
+  never pick those up in the first place. The cost is that legitimate new
+  releases land here a week late, which for an alpha with four runtime
+  dependencies is nothing.
+
+  Mechanics and limits worth knowing:
+  - The value is **relative and rolling**, evaluated at resolution time,
+    not a pinned timestamp that rots. uv normalizes it into `uv.lock` as
+    `exclude-newer-span = "-P7D"` (alongside an inert
+    `exclude-newer = "0001-01-01T00:00:00Z"` that exists only for
+    backwards compatibility — it is not a real bound, do not "fix" it).
+  - It binds **this repo's own resolution only** — dev environments, CI,
+    and the lockfile. It is *not* inherited by anyone who
+    `pip install bigfix-remote-client-relevance`; their resolver never
+    sees it. This is hygiene for our builds, not a guarantee shipped to
+    consumers, and the README should not imply otherwise.
+  - **The delay must not block a security patch.** When an advisory lands
+    against a dependency, take the fix immediately rather than waiting
+    out the window: `--exclude-newer-package <name>=<date>` lifts the
+    quarantine for one package, and `--exclude-newer` overrides it
+    wholesale for a single run. Reach for the per-package form — it keeps
+    the window in force for everything else.
+  - Because resolution is time-dependent, CI must run `uv sync --frozen`
+    (as the matrix above does) so a build resolves from the committed
+    lockfile rather than re-resolving against a window that has moved
+    since the lock was written.
 
 Quick start (README-worthy):
 ```bash
@@ -568,6 +662,11 @@ image = "ubuntu:22.04"
 - `raw_qna_output` + `error` + `qna_version` in the result let an agent
   self-correct on syntax errors and know which OS/version the answer came
   from.
+- **Clean stdout is a hard prerequisite** for the stdio flavor of that
+  server, which owns stdout for JSON-RPC — see § Output convention. The
+  library logs to `logging` and returns data; only `cli.py` writes to
+  stdout, so the MCP server can claim the channel without auditing
+  anything.
 
 ## Setup guide (packaged as README)
 
