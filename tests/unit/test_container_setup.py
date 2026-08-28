@@ -15,8 +15,6 @@ import pytest
 
 from bigfix_remote_client_relevance.transports.container_setup import docker_context_endpoint
 
-pytestmark = pytest.mark.xfail(strict=True, reason="M18: docker context is not read")
-
 DESKTOP_SOCKET = "unix:///Users/someone/.docker/run/docker.sock"
 
 

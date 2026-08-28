@@ -54,7 +54,27 @@ def docker_context_endpoint(
     output, or a scheme we cannot dial all mean the same thing to the caller:
     fall back to the hardcoded socket list.
     """
-    raise NotImplementedError
+    run = runner or _run_docker
+    try:
+        completed = run(_CONTEXT_ARGV, timeout)
+    except Exception as exc:  # noqa: BLE001 - every failure is just "no answer"
+        logger.debug("could not read the docker context: %s", exc)
+        return None
+
+    if completed.returncode != 0:
+        logger.debug("docker context inspect exited %d", completed.returncode)
+        return None
+
+    endpoint = completed.stdout.strip().splitlines()[0].strip() if completed.stdout.strip() else ""
+    # Go templates render a missing field as this rather than failing.
+    if not endpoint or endpoint == "<no value>":
+        return None
+    if not endpoint.startswith(_SUPPORTED_SCHEMES):
+        logger.debug("ignoring docker context endpoint %r: unsupported scheme", endpoint)
+        return None
+
+    logger.debug("docker context endpoint: %s", endpoint)
+    return endpoint
 
 
 __all__ = ["docker_context_endpoint"]

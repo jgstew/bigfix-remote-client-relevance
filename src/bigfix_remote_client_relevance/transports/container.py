@@ -56,6 +56,7 @@ from bigfix_remote_client_relevance.transports.container_libs import (
     package_for_soname,
     package_manager_from,
 )
+from bigfix_remote_client_relevance.transports.container_setup import docker_context_endpoint
 from bigfix_remote_client_relevance.transports.local import (
     QNA_EVAL_FLAGS,
     classify_qna_outcome,
@@ -180,20 +181,29 @@ class ContainerEngine(Protocol):
     async def commit(self, container_id: str, tag: str) -> None: ...
 
 
-def candidate_docker_sockets() -> list[str]:
+def candidate_docker_sockets(
+    *, endpoint_lookup: Callable[[], str | None] = docker_context_endpoint
+) -> list[str]:
     """Socket URLs to try, most specific first.
 
     ``docker.from_env()`` honours ``DOCKER_HOST`` and otherwise assumes
     ``/var/run/docker.sock``. Docker Desktop does create that path, but Docker
     *contexts* are not read by the SDK, so setups that only listen elsewhere —
-    Colima, Rancher Desktop, or a Desktop install with the compatibility
-    symlink disabled — are unreachable through it. Trying each known location
-    covers those, and reports every path tried when none answers.
+    Colima, Rancher Desktop, a remote engine, or a Desktop install with the
+    compatibility symlink disabled — are unreachable through it. The current
+    context is asked first, then each known location is tried, and every path
+    tried is reported when none answers.
+
+    ``DOCKER_HOST`` still outranks the context: it is the more explicit
+    statement of the two.
     """
     candidates: list[str] = []
     from_env = os.environ.get("DOCKER_HOST")
     if from_env:
         candidates.append(from_env)
+    from_context = endpoint_lookup()
+    if from_context:
+        candidates.append(from_context)
     candidates.append(f"unix://{Path.home() / '.docker/run/docker.sock'}")
     candidates.append("unix:///var/run/docker.sock")
     # Colima and Rancher Desktop keep their sockets elsewhere again.
