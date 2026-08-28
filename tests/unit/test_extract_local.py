@@ -29,10 +29,6 @@ from bigfix_remote_client_relevance.bootstrap.extract_local import (
 from bigfix_remote_client_relevance.bootstrap.targets import MARKER_FILENAME
 from bigfix_remote_client_relevance.results import ResolvedQna
 
-pytestmark = pytest.mark.xfail(
-    strict=True, reason="M11: controller-side extraction not implemented"
-)
-
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "artifacts"
 
 QNA_MEMBER = "opt/BESClient/bin/qna"

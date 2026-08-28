@@ -11,14 +11,36 @@ per (version, platform, arch) and bind-mounting the tree removes the
 prerequisite entirely, works on images with no package manager at all, and
 pays the cost once for a whole fan-out rather than once per container.
 
+Extraction is pure Python so the controller needs no tooling of its own: the
+``.deb`` outer format is a plain ``ar`` archive read here, its payload is
+handled by stdlib :mod:`tarfile`, and ``.rpm`` goes through ``rpmfile``.
+
 SSH keeps its in-target extraction, where a remote unpack does earn its keep.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
+import io
+import logging
+import shutil
+import stat
+import tarfile
+from pathlib import Path, PurePosixPath
 
+from bigfix_remote_client_relevance.bootstrap.cache import default_cache_dir
+from bigfix_remote_client_relevance.bootstrap.targets import MARKER_FILENAME
 from bigfix_remote_client_relevance.results import ResolvedQna
+
+logger = logging.getLogger(__name__)
+
+AR_MAGIC = b"!<arch>\n"
+_AR_HEADER_SIZE = 60
+
+# One lock per destination, so a fan-out across many containers unpacks once.
+# Process-local; the staging-then-rename below makes a cross-process race
+# harmless rather than merely unlikely.
+_locks: dict[str, asyncio.Lock] = {}
 
 
 class LocalExtractionError(Exception):
@@ -29,13 +51,152 @@ class LocalExtractionError(Exception):
 
 
 def extraction_destination(cache_dir: Path, qna: ResolvedQna) -> Path:
-    """Where the extracted tree for this artifact lives."""
-    raise NotImplementedError
+    """Where the extracted tree for this artifact lives.
+
+    Keyed by the artifact's own ``<platform>-<arch>`` cache segment, so an
+    extracted tree can never be confused with one from another platform.
+    """
+    if qna.artifact_path is None:
+        raise LocalExtractionError(f"qna {qna.version} has no artifact to extract")
+    return cache_dir / "extracted" / qna.version / qna.artifact_path.parent.name
 
 
 async def ensure_extracted(qna: ResolvedQna, *, cache_dir: Path | None = None) -> Path:
     """Return the extracted qna tree, unpacking the artifact if needed."""
-    raise NotImplementedError
+    cache_dir = cache_dir or default_cache_dir()
+    destination = extraction_destination(cache_dir, qna)
+    artifact = qna.artifact_path
+    assert artifact is not None  # extraction_destination refuses otherwise
+
+    lock = _locks.setdefault(str(destination), asyncio.Lock())
+    async with lock:
+        if (destination / MARKER_FILENAME).is_file():
+            logger.debug("extraction cache hit: %s", destination)
+            return destination
+
+        # Unpack beside the target and rename on success, so neither a crash
+        # nor a concurrent run ever observes a half-extracted tree.
+        staging = destination.with_name(destination.name + ".partial")
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(destination, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        logger.info("extracting %s into %s", artifact.name, destination)
+        try:
+            await asyncio.to_thread(_extract, artifact, staging)
+            (staging / MARKER_FILENAME).write_text("", encoding="utf-8")
+        except LocalExtractionError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise LocalExtractionError(f"could not extract {artifact.name}: {exc}") from exc
+
+        staging.replace(destination)
+
+    return destination
+
+
+def _extract(artifact: Path, destination: Path) -> None:
+    suffix = artifact.suffix.lower()
+    if suffix == ".deb":
+        _extract_deb(artifact, destination)
+    elif suffix == ".rpm":
+        _extract_rpm(artifact, destination)
+    else:
+        raise LocalExtractionError(
+            f"cannot extract {suffix!r} artifacts on the controller "
+            f"({artifact.name}); only .deb and .rpm are supported, which is "
+            "every format a Linux container target can use"
+        )
+
+
+def _safe_destination(destination: Path, member_name: str) -> Path:
+    """Resolve a member path, refusing anything that escapes the destination."""
+    parts = [part for part in PurePosixPath(member_name).parts if part != "."]
+    if PurePosixPath(member_name).is_absolute() or ".." in parts:
+        raise LocalExtractionError(
+            f"refusing to extract {member_name!r}: it points outside the destination"
+        )
+    if not parts:
+        raise LocalExtractionError(f"refusing to extract {member_name!r}: empty member name")
+    return destination.joinpath(*parts)
+
+
+def _extract_deb(artifact: Path, destination: Path) -> None:
+    payload = _ar_member(artifact, prefix="data.tar")
+    with tarfile.open(fileobj=payload, mode="r:*") as tar:
+        _extract_tar(tar, destination)
+
+
+def _extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
+    for member in tar.getmembers():
+        target = _safe_destination(destination, member.name)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif member.isfile():
+            source = tar.extractfile(member)
+            if source is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+            target.chmod(stat.S_IMODE(member.mode))
+        # Links and devices are deliberately skipped: nothing qna needs is one,
+        # and following them is how an archive escapes its destination.
+
+
+def _ar_member(artifact: Path, *, prefix: str) -> io.BytesIO:
+    """Read the first `ar` member whose name starts with ``prefix``.
+
+    The .deb outer format is an `ar` archive: an 8-byte magic, then per member
+    a 60-byte ASCII header (16-byte name, then mtime/uid/gid/mode/size fields)
+    followed by the body, padded to an even length.
+    """
+    with artifact.open("rb") as handle:
+        if handle.read(len(AR_MAGIC)) != AR_MAGIC:
+            raise LocalExtractionError(f"{artifact.name} is not an ar archive (bad magic)")
+        while True:
+            header = handle.read(_AR_HEADER_SIZE)
+            if not header:
+                raise LocalExtractionError(
+                    f"{artifact.name} has no {prefix}* member; not a Debian package?"
+                )
+            if len(header) < _AR_HEADER_SIZE or not header.endswith(b"`\n"):
+                raise LocalExtractionError(f"{artifact.name} has a malformed ar header")
+            name = header[:16].decode("ascii", "replace").strip().rstrip("/")
+            try:
+                size = int(header[48:58].decode("ascii").strip())
+            except ValueError as exc:
+                raise LocalExtractionError(
+                    f"{artifact.name} has an unreadable ar member size"
+                ) from exc
+            body = handle.read(size)
+            if name.startswith(prefix):
+                return io.BytesIO(body)
+            if size % 2:
+                handle.read(1)
+
+
+def _extract_rpm(artifact: Path, destination: Path) -> None:
+    # rpmfile handles the lead, the tag headers, and every payload compressor
+    # in the wild — gzip on EL8-era packages, zstd on EL9-era ones.
+    import rpmfile
+
+    with rpmfile.open(str(artifact)) as archive:
+        for member in archive.getmembers():
+            # rpmfile reports permission bits only, with the file type split
+            # out into these flags. Symlinks are skipped for the same reason
+            # tar links are: nothing qna needs is one, and following them is
+            # how an archive escapes its destination.
+            if member.isdir or member.issymlink:
+                continue
+            target = _safe_destination(destination, member.name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            with target.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+            target.chmod(stat.S_IMODE(member.mode))
 
 
 __all__ = [
