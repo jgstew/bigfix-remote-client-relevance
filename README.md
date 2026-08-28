@@ -41,6 +41,14 @@ Compare the same expression across two qna versions on one target:
 bigfix-remote-client-relevance --container ubuntu:22.04 --qna-version 11.0 --qna-version 10.0 "version of client"
 ```
 
+Evaluate against the BigFix client on this machine. On macOS `qna` needs root,
+so `--become` runs just the qna invocation under `sudo -n` rather than making
+you run the whole CLI as root:
+
+```bash
+bigfix-remote-client-relevance --local --become "name of operating system"
+```
+
 Evaluate on a real endpoint over SSH (a `~/.ssh/config` alias works):
 
 ```bash
@@ -77,7 +85,7 @@ qna_version = "11.0"        # version spec; overridable per host
 
 [hosts.mac-test]            # table name is the ~/.ssh/config alias
 transport = "ssh"
-become = true               # sudo for root-only inspectors
+become = true               # sudo for root-only inspectors (ssh and local)
 
 [hosts.ubuntu-22]
 transport = "container"
@@ -185,7 +193,9 @@ docker rmi $(docker images 'bfrcr/prepared:*' -q)
 
 - Python 3.11+
 - Docker for `--container`; SSH access for remote hosts
-- On macOS, `qna` needs root — use `sudo`, or `--become` over SSH
+- On macOS, `qna` needs root — run the CLI under `sudo`, or pass `--become`
+  (works with `--local` and over SSH). `--become` uses `sudo -n`, so it needs
+  passwordless sudo or a cached credential; it never prompts.
 
 SSH host keys are verified against `~/.ssh/known_hosts` like the `ssh` CLI,
 so a brand-new endpoint needs its key trusted first. For throwaway lab hosts,

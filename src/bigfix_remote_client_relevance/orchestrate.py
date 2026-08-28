@@ -118,7 +118,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
     if target.kind == "local":
         from bigfix_remote_client_relevance.transports.local import TransportLocal
 
-        return TransportLocal(target=target.platform)
+        return TransportLocal(target=target.platform, become=target.become)
     if target.kind == "ssh":
         from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 

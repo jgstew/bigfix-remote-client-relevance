@@ -97,6 +97,7 @@ class TransportLocal:
         qna_path: str | None = None,
         *,
         candidates: Sequence[str] | None = None,
+        become: bool = False,
         require_root_on_macos: bool = True,
         target: str | None = None,
         state_dir: Path | None = None,
@@ -104,6 +105,7 @@ class TransportLocal:
     ) -> None:
         self._qna_path = qna_path
         self._candidates = candidates
+        self._become = become
         self._require_root_on_macos = require_root_on_macos
         self._target = target
         self._state_dir = state_dir
@@ -164,7 +166,7 @@ class TransportLocal:
                 error_kind=ERROR_KIND_BOOTSTRAP,
             )
 
-        argv = [resolved_path, *QNA_EVAL_FLAGS]
+        argv = self._eval_argv(resolved_path)
         logger.debug("running %s", " ".join(argv))
 
         try:
@@ -175,9 +177,16 @@ class TransportLocal:
                 stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
+            # Which binary failed to exec matters: blaming the qna path for a
+            # missing sudo would send the user looking in the wrong place.
+            detail = (
+                f"could not run sudo for become: {exc}"
+                if argv[0] == "sudo"
+                else f"could not start qna at {resolved_path}: {exc}"
+            )
             return _result(
                 qna_path=resolved_path,
-                error=f"could not start qna at {resolved_path}: {exc}",
+                error=detail,
                 error_kind=ERROR_KIND_BOOTSTRAP,
             )
 
@@ -201,6 +210,15 @@ class TransportLocal:
         parsed = parse_qna_output(stdout)
         error, error_kind = classify_qna_outcome(parsed, exit_code, stderr)
 
+        # Both gates are structural. ERROR_KIND_QNA means a relevance `E:` line
+        # -- proof that elevation worked -- can never be overridden, and a clean
+        # run is never touched; `self._become` means qna's own stderr can never
+        # be mistaken for sudo's.
+        if self._become and error_kind == ERROR_KIND_QNA:
+            privilege = sudo_privilege_problem(stderr)
+            if privilege is not None:
+                error, error_kind = privilege, ERROR_KIND_BOOTSTRAP
+
         return _result(
             answers=parsed.answers,
             answer_types=parsed.answer_types,
@@ -212,6 +230,31 @@ class TransportLocal:
             exit_code=exit_code,
         )
 
+    def _eval_argv(self, qna_path: str) -> list[str]:
+        """Build the qna command line, elevating it when ``become`` is set.
+
+        The mirror of :meth:`~...transports.ssh.TransportSSH._eval_command`, and
+        the one place the sudo prefix lives. No quoting is needed: this is an
+        argv list for ``create_subprocess_exec``, not a shell string.
+        """
+        # API boundary: qna's CLI vocabulary uses "relevance"; internal name
+        # stays `client_relevance`.
+        argv = [qna_path, *QNA_EVAL_FLAGS]
+        if not self._become:
+            return argv
+
+        if sys.platform.startswith("win"):
+            logger.warning(
+                "become has no effect on Windows: there is no sudo, and elevation "
+                "is a per-process UAC decision rather than a command prefix"
+            )
+            return argv
+
+        # -n never prompts: sudo either has a cached or NOPASSWD credential or
+        # it fails immediately. It reads passwords from /dev/tty, never stdin,
+        # so the relevance expression still reaches qna untouched.
+        return ["sudo", "-n", *argv]
+
     def _macos_root_problem(self) -> str | None:
         """Refuse to run qna as a non-root user on macOS.
 
@@ -221,6 +264,13 @@ class TransportLocal:
         here turns an opaque crash dump into an actionable message. Waivable via
         ``require_root_on_macos=False`` for setups where it does work.
         """
+        if self._become:
+            # sudo makes qna root whatever this process's euid is, so the
+            # pre-flight refusal would be a false negative — and so would the
+            # waiver's "running as non-root" warning below. A sudo that cannot
+            # actually elevate surfaces after the run, not as a guess before it.
+            return None
+
         if sys.platform != "darwin" or os.geteuid() == 0:
             return None
 
@@ -238,7 +288,13 @@ class TransportLocal:
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:
-    """Kill a process and reap it so no orphan outlives the timeout."""
+    """Kill a process and reap it so no orphan outlives the timeout.
+
+    Under ``become`` this kills sudo, and the root-owned qna child survives —
+    an unprivileged parent cannot signal it. The same hazard already exists
+    over SSH; fixing it needs a ``sudo -n kill`` or a pty, which is out of
+    proportion to a qna run that has already hit its timeout.
+    """
     if process.returncode is not None:
         return
     try:
@@ -273,4 +329,34 @@ def classify_qna_outcome(
     return None, None
 
 
-__all__ = ["TransportLocal", "classify_qna_outcome", "normalize_stdin_payload"]
+def sudo_privilege_problem(stderr: str) -> str | None:
+    """Recognize sudo's own refusal so it is not blamed on qna.
+
+    ``sudo -n`` exits 1 without running anything when it has no usable
+    credential, when the user is not a sudoer, or when the command is not
+    permitted. Left alone those all classify as :data:`ERROR_KIND_QNA`, which
+    reads as "the relevance engine failed".
+
+    Detection keys off the ``sudo: `` prefix sudo puts on its own diagnostics
+    in every locale — qna never emits one — rather than the English wording of
+    any particular message.
+    """
+    line = next(
+        (stripped for raw in stderr.splitlines() if (stripped := raw.strip()).startswith("sudo:")),
+        None,
+    )
+    if line is None:
+        return None
+    return (
+        f"sudo could not elevate qna: {line}; grant passwordless sudo for the qna "
+        "binary (a NOPASSWD sudoers rule), rerun the whole command under sudo, "
+        "or drop --become"
+    )
+
+
+__all__ = [
+    "TransportLocal",
+    "classify_qna_outcome",
+    "normalize_stdin_payload",
+    "sudo_privilege_problem",
+]

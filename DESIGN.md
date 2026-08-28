@@ -20,7 +20,8 @@ Corrections implementation forced, all applied below:
 3. `TransportLocal` refuses to run as non-root on macOS by default:
    BESAgent 11.x aborts there with an uncaught `FileIOError` even for
    `TRUE`, so a clear pre-flight message beats an opaque crash dump.
-   `require_root_on_macos=False` waives it.
+   `require_root_on_macos=False` waives it, and `become=True` makes the
+   check moot by running qna under `sudo -n` instead.
 4. Class names in the prose now follow the document's own `Transport<Kind>`
    rule.
 
@@ -414,10 +415,11 @@ class Transport(Protocol):
 
 Four concrete transports, all class-named `Transport<Kind>`:
 
-- `TransportLocal()` — subprocess against a local `qna` binary. Same code
-  path as `EvaluateRelevance` today, renamed. Used for tests and for AI
-  agents doing a fast syntax check on the developer's own box before an
-  SSH/container round-trip.
+- `TransportLocal(become=False, require_root_on_macos=True)` — subprocess
+  against a local `qna` binary. Same code path as `EvaluateRelevance` today,
+  renamed. Used for tests and for AI agents doing a fast syntax check on the
+  developer's own box before an SSH/container round-trip. As on SSH, `become`
+  wraps only the evaluation in `sudo -n`, never provisioning.
 - `TransportSSH(host, user=..., key=..., become=False)` — asyncssh-based.
   Pipes the client-relevance string to `qna -t -showtypes` on the remote.
   When a `ResolvedQna` is passed and that version isn't cached on the
@@ -688,7 +690,7 @@ qna_version = "11.0"        # version spec; overridable per host
 
 [hosts.mac-test]            # table name = ~/.ssh/config alias by default
 transport = "ssh"
-become = true               # sudo for root-only inspectors
+become = true               # sudo for root-only inspectors (ssh and local)
 
 [hosts.win11-lab]
 transport = "ssh"
@@ -774,6 +776,15 @@ answers cross an untrusted network.
   `FileIOError` before answering anything, even `TRUE`, so there is no
   partial-answer mode worth preserving. Pass
   `TransportLocal(require_root_on_macos=False)` to attempt it anyway.
+- `TransportLocal(become=True)` (CLI: `--local --become`) runs qna under
+  `sudo -n` and skips the refusal above — the qna process will be root
+  whatever this process's euid is, so the pre-flight check would be a false
+  negative. `-n` never prompts, so this needs passwordless sudo or a cached
+  credential; when it has neither, the `sudo:` line on stderr is reported as
+  a `bootstrap` error rather than blamed on qna. Elevation applies on every
+  POSIX platform, not just macOS; on Windows it warns and runs unelevated,
+  as it does over SSH. One caveat: a timeout kills sudo, and the root-owned
+  qna child outlives it, because an unprivileged parent cannot signal it.
 - **Windows shell.** Every Windows command this package builds is PowerShell
   (`Test-Path`, `New-Item`, `Expand-Archive`, the `&` call operator), but
   Windows OpenSSH hands commands to `cmd.exe` unless the `DefaultShell`

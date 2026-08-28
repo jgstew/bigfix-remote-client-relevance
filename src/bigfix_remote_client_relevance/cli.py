@@ -222,7 +222,12 @@ def evaluate(
     ] = None,
     user: Annotated[str | None, typer.Option("--user", help="SSH username.")] = None,
     become: Annotated[
-        bool, typer.Option("--become", help="Use sudo on the target (root-only inspectors).")
+        bool,
+        typer.Option(
+            "--become",
+            help="Run qna under sudo (root-only inspectors). Applies to SSH and "
+            "--local; needs passwordless sudo, and has no effect on Windows.",
+        ),
     ] = False,
     arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
     platform: Annotated[
@@ -332,7 +337,7 @@ def evaluate(
         for image in container
     )
     if local:
-        targets = [Target(kind="local", name="local", platform=platform)]
+        targets = [Target(kind="local", name="local", platform=platform, become=become)]
     elif host is not None:
         targets = [
             Target(
