@@ -495,7 +495,8 @@ Four concrete transports, all class-named `Transport<Kind>`:
   4. `keep_alive=True` reuses a long-lived container (via `docker exec`)
      for hot repeat evals against the same image; default is one-shot for
      hermetic answers.
-- **Arch coverage:** `--arch` defaults to the host's own architecture and is
+- **Arch coverage:** `--arch` defaults to `x86_64` — the common case for
+  BigFix clients, regardless of the controller's own architecture — and is
   repeatable, so `--container ubuntu:24.04 --arch amd64 --arch arm64`
   evaluates both in one run — the concrete case is Docker Desktop on Apple
   Silicon, which runs arm64 natively and amd64 via Rosetta/QEMU emulation

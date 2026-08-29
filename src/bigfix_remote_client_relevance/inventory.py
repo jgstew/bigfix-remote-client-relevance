@@ -85,6 +85,7 @@ def _target_from_entry(
     user = setting("user")
     version = setting("qna_version")
     platform = setting("platform")
+    arch = setting("arch")
     become_raw = setting("become")
 
     return Target(
@@ -96,7 +97,11 @@ def _target_from_entry(
         # a macOS controller -- the same default the CLI's --local gets.
         become=bool(become_raw) if become_raw is not None else None,
         image=str(image) if image is not None else None,
-        arch=str(setting("arch", "x86_64")),
+        # None (rather than a hardcoded default) when unset, same as
+        # `platform` below: ssh/local targets get it probed (see
+        # orchestrate._one()); a container needs an explicit one, which the
+        # CLI always supplies.
+        arch=str(arch) if arch is not None else None,
         platform=str(platform) if platform is not None else None,
         qna_version=version if isinstance(version, (str, list)) else None,
         keep_alive=bool(setting("keep_alive", False)),
@@ -105,14 +110,18 @@ def _target_from_entry(
     )
 
 
-def update_inventory_platform(path: str | Path, host: str, platform: str) -> None:
-    """Write a probed or corrected ``platform`` into one host's table.
+def _write_inventory_key(path: str | Path, host: str, key: str, value: str) -> None:
+    """Write a probed or corrected ``key`` into one host's table.
 
     Uses ``tomlkit`` rather than ``tomllib`` (read-only) plus a plain-dict
     rewrite: a naive rewrite would silently drop every comment and could
     reorder tables, and this is exactly the kind of file a person hand-edits
-    and keeps under version control. Only the one host's ``platform`` key
-    changes; everything else in the file is untouched byte-for-byte.
+    and keeps under version control. Only the one host's ``key`` changes;
+    everything else in the file is untouched byte-for-byte.
+
+    Shared by :func:`update_inventory_platform` and
+    :func:`update_inventory_arch` -- the only difference between them is
+    which key gets written.
     """
     path = Path(path)
     try:
@@ -129,12 +138,22 @@ def update_inventory_platform(path: str | Path, host: str, platform: str) -> Non
     if host not in hosts:
         raise InventoryError(f"no host {host!r} in inventory {path}")
 
-    hosts[host]["platform"] = platform
+    hosts[host][key] = value
     # newline="" disables translation on write: tomlkit already reproduces the
     # file's own line endings, and re-translating them would turn a CRLF file
     # into a \r\r\n one that tomllib then refuses to read back.
     path.write_text(tomlkit.dumps(document), encoding="utf-8", newline="")
-    logger.info("wrote platform = %r for %r to %s", platform, host, path)
+    logger.info("wrote %s = %r for %r to %s", key, value, host, path)
+
+
+def update_inventory_platform(path: str | Path, host: str, platform: str) -> None:
+    """Write a probed or corrected ``platform`` into one host's table."""
+    _write_inventory_key(path, host, "platform", platform)
+
+
+def update_inventory_arch(path: str | Path, host: str, arch: str) -> None:
+    """Write a probed ``arch`` into one host's table."""
+    _write_inventory_key(path, host, "arch", arch)
 
 
 __all__ = [
@@ -142,5 +161,6 @@ __all__ = [
     "KNOWN_TRANSPORTS",
     "InventoryError",
     "load_inventory",
+    "update_inventory_arch",
     "update_inventory_platform",
 ]

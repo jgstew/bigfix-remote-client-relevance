@@ -258,6 +258,54 @@ async def test_resolve_platform_shares_the_eval_connection():
     assert connects == 1
 
 
+# --- arch: a separate uname -m probe, deliberately independent of platform --
+
+
+async def test_probe_output_feeds_resolve_arch():
+    runner = FakeSSHRunner(responses=[(r"uname -m", ("aarch64\n", "", 0))])
+
+    arch = await make_transport(runner, arch=None).resolve_arch()
+
+    assert arch == "arm64", "normalize_arch must fold aarch64 into arm64"
+
+
+async def test_explicit_arch_skips_the_probe():
+    runner = FakeSSHRunner()
+
+    arch = await make_transport(runner, arch="x86_64").resolve_arch()
+
+    assert arch == "x86_64"
+    assert not runner.calls, "an explicit arch must never probe"
+
+
+async def test_resolve_arch_probes_once_per_transport():
+    runner = FakeSSHRunner(responses=[(r"uname -m", ("x86_64\n", "", 0))])
+    transport = make_transport(runner, arch=None)
+
+    await transport.resolve_arch()
+    await transport.resolve_arch()
+
+    probes = [c for c in runner.commands() if "uname -m" in c]
+    assert len(probes) == 1, "probe result must be cached on the transport"
+
+
+async def test_resolve_arch_is_independent_of_the_platform_probe():
+    """arch and platform are two separate round trips, not one merged probe."""
+    runner = FakeSSHRunner(
+        responses=[
+            (r"uname -s", ("Linux\nubuntu debian", "", 0)),
+            (r"uname -m", ("x86_64\n", "", 0)),
+        ]
+    )
+    transport = make_transport(runner, platform=None, arch=None)
+
+    await transport.resolve_platform()
+    await transport.resolve_arch()
+
+    assert runner.ran("uname -s"), "platform probe still ran"
+    assert runner.ran("uname -m"), "arch probe still ran, on its own command"
+
+
 async def test_reprobe_platform_ignores_the_explicit_target():
     """The whole point: ``resolve_platform`` trusts an explicit target, this must not."""
     runner = FakeSSHRunner(responses=[(r"uname -s", ("", "", 0))])  # empty output = windows

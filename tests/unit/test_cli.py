@@ -319,6 +319,87 @@ def test_update_inventory_is_never_attempted_without_inventory(captured, monkeyp
     assert calls == []
 
 
+# --- writing a probed arch back to hosts.toml (same contract as platform) --
+
+
+def _spy_on_update_inventory_arch(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cli_module,
+        "update_inventory_arch",
+        lambda path, host, arch: calls.append((path, host, arch)),
+    )
+    return calls
+
+
+def test_update_inventory_writes_the_probed_arch(captured, tmp_path, monkeypatch):
+    calls = _spy_on_update_inventory_arch(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="arm-box", transport="ssh", client_relevance="true", arch="arm64"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(inventory, "arm-box", "arm64")]
+
+
+def test_no_update_inventory_flag_skips_the_arch_write(captured, tmp_path, monkeypatch):
+    calls = _spy_on_update_inventory_arch(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="arm-box", transport="ssh", client_relevance="true", arch="arm64"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "--no-update-inventory", "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_update_inventory_skips_a_host_whose_arch_already_matches(captured, tmp_path, monkeypatch):
+    calls = _spy_on_update_inventory_arch(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.x86-box]\ntransport = "ssh"\narch = "x86_64"\n', encoding="utf-8")
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="x86-box", transport="ssh", client_relevance="true", arch="x86_64"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_update_inventory_never_rewrites_a_container_hosts_arch(captured, tmp_path, monkeypatch):
+    """Container arch is always an explicit, per-run choice, never probed."""
+    calls = _spy_on_update_inventory_arch(monkeypatch)
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text(
+        '[hosts.c]\ntransport = "container"\nimage = "ubuntu:22.04"\narch = "amd64"\n',
+        encoding="utf-8",
+    )
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="c", transport="container", client_relevance="true", arch="amd64"
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
 def test_local_still_excludes_container_and_inventory(captured, tmp_path):
     assert invoke("--local", "--container", "ubuntu:22.04", "true").exit_code != 0
 
@@ -364,16 +445,16 @@ def test_container_without_platform_leaves_it_unset(captured):
     assert captured["targets"][0].platform is None
 
 
-# --- arch: defaults to the host, repeatable for multi-arch fan-out ---------
+# --- arch: defaults to x86_64, repeatable for multi-arch fan-out -----------
 
 
-def test_arch_defaults_to_the_host_architecture(captured):
-    from bigfix_remote_client_relevance.bootstrap.targets import host_arch
-
+def test_arch_defaults_to_x86_64(captured):
+    """Not this host's own architecture -- x86_64 is the common case for
+    BigFix clients, Apple Silicon controllers included."""
     result = invoke("--container", "ubuntu:22.04", "true")
 
     assert result.exit_code == 0, result.output
-    assert captured["targets"][0].arch == host_arch()
+    assert captured["targets"][0].arch == "x86_64"
 
 
 def test_explicit_arch_overrides_the_default(captured):
@@ -609,7 +690,7 @@ def test_diff_headers_also_show_the_platform(captured):
 
 def test_json_host_field_is_unaffected_by_the_display_prefix(captured):
     """--json's `host` stays exactly result.host -- the prefix is display-only,
-    since _update_inventory_platforms matches it against inventory table names
+    since _update_inventory matches it against inventory table names
     verbatim."""
     captured["results"] = [result_for("192.168.4.115", ["yes"], transport="ssh")]
 

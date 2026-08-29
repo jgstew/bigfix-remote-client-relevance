@@ -21,7 +21,7 @@ from bigfix_remote_client_relevance.bootstrap.provision import (
     RunResult,
     provision_qna,
 )
-from bigfix_remote_client_relevance.bootstrap.targets import spec_for
+from bigfix_remote_client_relevance.bootstrap.targets import host_arch, spec_for
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
@@ -109,6 +109,7 @@ class TransportLocal:
         become: bool = False,
         require_root_on_macos: bool = True,
         target: str | None = None,
+        arch: str | None = None,
         state_dir: Path | None = None,
         recheck_prereqs: bool = False,
         host: str = TRANSPORT_NAME,
@@ -118,11 +119,12 @@ class TransportLocal:
         self._become = become
         self._require_root_on_macos = require_root_on_macos
         self._target = target
+        self._arch = arch
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
         # What this instance reports back as ClientRelevanceResult.host --
         # the inventory table name when it came from one, so write-back (see
-        # cli._update_inventory_platforms, which matches on host verbatim)
+        # cli._update_inventory, which matches on host verbatim)
         # and multi-local labelling (render.label) can tell entries apart.
         # Defaults to the bare "local" for a caller with no inventory name,
         # e.g. the CLI's ad hoc --local flag.
@@ -154,6 +156,17 @@ class TransportLocal:
         every other -- see qna_version fan-out in ``render.label``.
         """
         return self._local_target()
+
+    async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
+        """This machine's architecture -- an explicit ``arch`` wins, otherwise
+        :func:`~...bootstrap.targets.host_arch`.
+
+        No round trip, same reasoning as :meth:`resolve_platform`: this *is*
+        the controller, so ``platform.machine()`` already has the answer.
+        """
+        if self._arch is not None:
+            return self._arch
+        return host_arch()
 
     async def evaluate_client_relevance(
         self,

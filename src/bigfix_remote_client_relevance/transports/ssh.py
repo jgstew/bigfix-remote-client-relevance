@@ -34,6 +34,7 @@ from bigfix_remote_client_relevance.bootstrap.provision import (
 from bigfix_remote_client_relevance.bootstrap.targets import (
     TargetSpec,
     classify_uname,
+    normalize_arch,
     spec_for,
 )
 from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
@@ -220,6 +221,7 @@ class TransportSSH:
         become: bool = False,
         platform: str | None = None,
         target: str | None = None,
+        arch: str | None = None,
         connection_factory: Callable[[], Awaitable[SSHRunner]] | None = None,
         state_dir: Path | None = None,
         recheck_prereqs: bool = False,
@@ -236,6 +238,7 @@ class TransportSSH:
         self._become = become
         # `target` and `platform` both name a bootstrap spec; `target` wins.
         self._target = target or platform
+        self._arch = arch
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
         self._connection_factory = connection_factory or (
@@ -408,6 +411,27 @@ class TransportSSH:
         """
         runner = await self._connection()
         return await self._classify_platform(runner, timeout_s)
+
+    # -- arch -----------------------------------------------------------------
+
+    async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
+        """This host's architecture, normalized (e.g. ``"aarch64"`` -> ``"arm64"``).
+
+        An explicit ``arch`` wins outright, with no round trip. Otherwise the
+        host is probed once with a plain ``uname -m`` -- deliberately kept
+        separate from :meth:`_classify_platform`'s ``uname``/``os-release``
+        probe rather than folded into it, and the answer cached on this
+        instance. Exposing it lets ``orchestrate.py``'s probe-before-resolve
+        step (see ``_one()``) fill in an unset arch the same way it already
+        does for ``platform``.
+        """
+        if self._arch is not None:
+            return self._arch
+        runner = await self._connection()
+        stdout, _stderr, _code = await runner.run("uname -m", timeout=timeout_s)
+        self._arch = normalize_arch(stdout)
+        logger.debug("%s arch classified as %s", self.host, self._arch)
+        return self._arch
 
     # -- discovery ----------------------------------------------------------
 
