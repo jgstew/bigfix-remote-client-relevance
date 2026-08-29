@@ -45,6 +45,7 @@ class ResultPayload(TypedDict):
     host: str
     transport: str
     platform: str | None
+    arch: str | None
     client_relevance: str
     ok: bool
     answers: list[str]
@@ -59,7 +60,7 @@ class ResultPayload(TypedDict):
     raw_qna_output: str
 
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 """Bumped on any additive change to the result payload. See the module docstring."""
 
 SCHEMA_ID = (
@@ -73,6 +74,7 @@ _KEY_ORDER = (
     "host",
     "transport",
     "platform",
+    "arch",
     "client_relevance",
     "ok",
     "answers",
@@ -122,6 +124,7 @@ def result_to_dict(
         "host": result.host,
         "transport": result.transport,
         "platform": result.platform,
+        "arch": result.arch,
         "client_relevance": result.client_relevance,
         "ok": result.ok,
         # Copied, not aliased: a consumer mutating the payload must not reach
@@ -175,6 +178,13 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
             "type": _STRING_OR_NULL,
             "description": (
                 "The known-target key this run used, when one applies and was resolved."
+            ),
+        },
+        "arch": {
+            "type": _STRING_OR_NULL,
+            "description": (
+                'The architecture this run used (e.g. "x86_64", "arm64"), when known: '
+                "explicit, probed on ssh/local, or config-declared for a container."
             ),
         },
         "client_relevance": {

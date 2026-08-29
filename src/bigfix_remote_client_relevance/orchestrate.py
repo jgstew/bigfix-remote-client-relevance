@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError
-from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
+from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError, host_arch
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_QNA,
@@ -87,7 +87,12 @@ class Target:
     `local` on a macOS controller (qna needs root there unconditionally),
     False otherwise. An explicit True/False always wins."""
     image: str | None = None
-    arch: str = "x86_64"
+    arch: str | None = None
+    """``"x86_64"``, ``"arm64"``, etc. None means unset: probed for ssh/local
+    targets (see ``_one()``'s arch-probe block), falling back to
+    ``host_arch()`` if the probe fails or the transport doesn't support one.
+    Container transports always get an explicit value -- the CLI defaults
+    ``--arch`` to ``host_arch()`` itself."""
     engine: str = "auto"
     """Container only. ``"auto"`` | ``"docker"`` | ``"podman"``. ``"auto"``
     prefers docker, falling back to podman only when docker is unreachable --
@@ -135,7 +140,9 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
         # `become` defaults on there; SSH can't make the same call below --
         # the remote platform isn't known without a round trip.
         become = target.become if target.become is not None else sys.platform == "darwin"
-        return TransportLocal(target=target.platform, become=become, host=target.name)
+        return TransportLocal(
+            target=target.platform, become=become, host=target.name, arch=target.arch
+        )
     if target.kind == "ssh":
         from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 
@@ -145,6 +152,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             become=bool(target.become),
             target=target.platform,
             verify_host_key=target.verify_host_key,
+            arch=target.arch,
         )
     if target.kind == "container":
         from bigfix_remote_client_relevance.transports.container import (
@@ -174,7 +182,10 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
 
         return TransportContainer(
             target.image or target.name,
-            arch=target.arch,
+            # Defensive fallback for a programmatic Target(kind="container")
+            # built without arch; CLI-built container targets are never None
+            # (--arch itself defaults to host_arch()).
+            arch=target.arch or host_arch(),
             engine=engine,
             keep_alive=target.keep_alive,
             target=target.platform,
@@ -206,9 +217,12 @@ async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
     platform_key = target.platform or ("macos" if target.kind == "local" else "ubuntu")
     release_platform = spec_for(platform_key).release_platform
 
+    # Likewise, _one() probes arch for ssh/local before ever reaching here --
+    # target.arch is never None in the normal fan-out. host_arch() is a
+    # defensive fallback for a resolver called directly, bypassing that step.
     version = await asyncio.to_thread(resolve_version_spec, spec)
     ref = await asyncio.to_thread(
-        artifact_for, version, platform=release_platform, arch=target.arch
+        artifact_for, version, platform=release_platform, arch=target.arch or host_arch()
     )
     return await ensure_artifact(version, ref)
 
@@ -349,6 +363,26 @@ async def _evaluate_stream_indexed(
                 logger.debug("platform probe failed for %s: %s", target.label, exc)
                 return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
 
+        # Same probe-before-resolve idea, for arch: ssh/local targets expose
+        # resolve_arch (container does not -- its arch is always an explicit,
+        # intentional per-run choice, never an unknown to infer). Unlike
+        # platform, a failed arch probe never fails the target -- host_arch()
+        # is always a reasonable fallback, so there is no analog to
+        # UnknownTargetError here.
+        arch_probe = getattr(transport, "resolve_arch", None)
+        if (
+            target.arch is None
+            and arch_probe is not None
+            and (spec is not None or target.kind == "local")
+        ):
+            try:
+                async with image_budget:
+                    probed_arch = await arch_probe(timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001 - arch always has a safe fallback
+                logger.debug("arch probe failed for %s: %s", target.label, exc)
+                probed_arch = host_arch()
+            target = dataclasses.replace(target, arch=probed_arch)
+
         if spec is not None:
             try:
                 resolved = await _resolve(target, spec)
@@ -377,9 +411,11 @@ async def _evaluate_stream_indexed(
                 logger.debug("transport failed for %s: %s", target.label, exc)
                 return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
 
-        # Whatever platform this run actually used -- explicit, freshly
-        # probed, or (below) corrected -- so the CLI can write it back.
+        # Whatever platform/arch this run actually used -- explicit, freshly
+        # probed, or (platform only, below) corrected -- so the CLI can write
+        # them back.
         result.platform = target.platform
+        result.arch = target.arch
 
         if spec is not None and configured_platform is not None:
             # An explicit platform was trusted outright above and never

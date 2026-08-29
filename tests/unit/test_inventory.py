@@ -7,6 +7,7 @@ import pytest
 from bigfix_remote_client_relevance.inventory import (
     InventoryError,
     load_inventory,
+    update_inventory_arch,
     update_inventory_platform,
 )
 
@@ -99,6 +100,24 @@ def test_per_host_value_overrides_the_default(inventory_file):
     targets = {t.name: t for t in load_inventory(inventory_file)}
 
     assert targets["ubuntu-22"].qna_version == "10.0"
+
+
+def test_unset_arch_is_left_none_not_defaulted(inventory_file):
+    """None, not a hardcoded "x86_64" -- ssh/local targets get it probed
+    (see orchestrate._one()); a container needs an explicit one, which the
+    CLI always supplies."""
+    targets = {t.name: t for t in load_inventory(inventory_file)}
+
+    assert targets["mac-test"].arch is None
+
+
+def test_explicit_arch_is_carried_through(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text('[hosts.arm-box]\ntransport = "ssh"\narch = "arm64"\n', encoding="utf-8")
+
+    targets = {t.name: t for t in load_inventory(path)}
+
+    assert targets["arm-box"].arch == "arm64"
 
 
 def test_missing_file_reports_the_path(tmp_path):
@@ -225,5 +244,44 @@ def test_update_inventory_platform_unknown_host_raises(tmp_path):
 
     with pytest.raises(InventoryError) as excinfo:
         update_inventory_platform(path, "nope", "windows")
+
+    assert "nope" in str(excinfo.value)
+
+
+# update_inventory_arch shares its tomlkit read/parse/write plumbing with
+# update_inventory_platform (see _write_inventory_key); these just confirm
+# the wiring writes the right key, not every edge case re-tested above.
+
+
+def test_update_inventory_arch_adds_the_key_when_absent(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        '[hosts.arm-box]  # a comment worth keeping\ntransport = "ssh"\n', encoding="utf-8"
+    )
+
+    update_inventory_arch(path, "arm-box", "arm64")
+
+    text = path.read_text(encoding="utf-8")
+    assert "# a comment worth keeping" in text, "tomlkit must preserve comments"
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["arm-box"].arch == "arm64"
+
+
+def test_update_inventory_arch_overwrites_a_wrong_value(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text('[hosts.arm-box]\ntransport = "ssh"\narch = "x86_64"\n', encoding="utf-8")
+
+    update_inventory_arch(path, "arm-box", "arm64")
+
+    targets = {t.name: t for t in load_inventory(path)}
+    assert targets["arm-box"].arch == "arm64"
+
+
+def test_update_inventory_arch_unknown_host_raises(tmp_path):
+    path = tmp_path / "hosts.toml"
+    path.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
+
+    with pytest.raises(InventoryError) as excinfo:
+        update_inventory_arch(path, "nope", "arm64")
 
     assert "nope" in str(excinfo.value)

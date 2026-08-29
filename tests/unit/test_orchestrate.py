@@ -1246,3 +1246,145 @@ async def test_cancelling_the_stream_is_not_swallowed_into_a_result():
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# --- arch probing: ssh/local only ---------------------------------------------
+#
+# Unlike platform, container never gets probed here -- its arch is always an
+# explicit, per-run choice (--arch), not an unknown to infer. And unlike
+# platform, a failed arch probe has a safe fallback (host_arch()) rather than
+# failing the target -- there is no analog to UnknownTargetError/
+# ERROR_KIND_BOOTSTRAP for arch.
+
+
+class FakeArchProbingTransport(FakeTransport):
+    """An ssh/local-style transport whose probe answers with a canned arch."""
+
+    def __init__(self, host: str, arch: str | Exception = "arm64", **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self.arch = arch
+        self.probed = 0
+
+    async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
+        self.probed += 1
+        if isinstance(self.arch, Exception):
+            raise self.arch
+        return self.arch
+
+
+def arch_recording_resolver(seen: list[str | None]):
+    async def resolve(spec: str | None, target: Target) -> ResolvedQna:
+        seen.append(target.arch)
+        return ResolvedQna(version="11.0.6.137", artifact_path=Path("/cache/fake.deb"))
+
+    return resolve
+
+
+async def test_ssh_arch_is_probed_before_resolution():
+    seen: list[str | None] = []
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host0")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeArchProbingTransport(t.name, "arm64"),
+        resolver=arch_recording_resolver(seen),
+    )
+
+    assert seen == ["arm64"], "the resolver must see the probed arch, not None"
+
+
+async def test_local_arch_is_probed_before_resolution_too():
+    seen: list[str | None] = []
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="local", name="local")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeArchProbingTransport(t.name, "arm64"),
+        resolver=arch_recording_resolver(seen),
+    )
+
+    assert seen == ["arm64"]
+    assert results[0].arch == "arm64"
+
+
+async def test_ssh_arch_is_not_probed_with_no_version_to_resolve():
+    """Same contrast as platform: ssh's probe is a real round trip, gated on
+    there being a version to resolve an artifact for."""
+    transport = FakeArchProbingTransport("host0", "arm64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host0", qna_version=[])],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 0
+    assert results[0].arch is None
+
+
+async def test_arch_probe_failure_falls_back_to_host_arch_instead_of_failing():
+    """Unlike platform, a bad arch probe has a safe fallback -- it must never
+    turn into ERROR_KIND_BOOTSTRAP or any other target failure."""
+    from bigfix_remote_client_relevance.bootstrap.targets import host_arch
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host0")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeArchProbingTransport(
+            t.name, RuntimeError("connection dropped")
+        ),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].error_kind is None
+    assert results[0].arch == host_arch()
+
+
+async def test_explicit_arch_populates_result_arch_on_success():
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host", arch="x86_64")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].arch == "x86_64"
+
+
+async def test_explicit_arch_skips_the_orchestrator_probe():
+    seen: list[str | None] = []
+    made: list[FakeArchProbingTransport] = []
+
+    def factory(target):
+        transport = FakeArchProbingTransport(target.name, "arm64")
+        made.append(transport)
+        return transport
+
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host", arch="x86_64")],
+        qna_version="11.0",
+        transport_factory=factory,
+        resolver=arch_recording_resolver(seen),
+    )
+
+    assert seen == ["x86_64"]
+    assert made[0].probed == 0
+
+
+async def test_container_arch_is_never_probed():
+    """Container arch is always the config-declared value -- container
+    transports have no resolve_arch, so _one()'s probe block never fires."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", arch="amd64")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeProbingTransport(t.name, "ubuntu"),
+        resolver=make_resolver(),
+    )
+
+    assert results[0].arch == "amd64"

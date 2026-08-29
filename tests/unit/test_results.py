@@ -137,6 +137,7 @@ def test_result_has_every_designed_field():
         "elapsed_ms",
         "exit_code",
         "platform",
+        "arch",
     }
 
 

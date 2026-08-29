@@ -378,6 +378,24 @@ async def test_resolve_platform_honors_an_explicit_target(monkeypatch):
     assert await TransportLocal(target="windows").resolve_platform() == "windows"
 
 
+async def test_resolve_arch_reports_host_arch_with_no_round_trip(monkeypatch):
+    """Same reasoning as resolve_platform: this is the controller itself."""
+    monkeypatch.setattr(
+        "bigfix_remote_client_relevance.transports.local.host_arch", lambda: "arm64"
+    )
+
+    assert await TransportLocal().resolve_arch() == "arm64"
+
+
+async def test_resolve_arch_honors_an_explicit_arch(monkeypatch):
+    monkeypatch.setattr(
+        "bigfix_remote_client_relevance.transports.local.host_arch",
+        lambda: (_ for _ in ()).throw(AssertionError("host_arch() must not be called")),
+    )
+
+    assert await TransportLocal(arch="x86_64").resolve_arch() == "x86_64"
+
+
 async def test_result_host_defaults_to_the_bare_transport_name(fake_qna, qna_output):
     """No inventory name given (e.g. the CLI's ad hoc --local flag) -- fall
     back to "local", not some other guess."""
@@ -389,7 +407,7 @@ async def test_result_host_defaults_to_the_bare_transport_name(fake_qna, qna_out
 
 
 async def test_result_host_echoes_an_inventory_name(fake_qna, qna_output):
-    """cli._update_inventory_platforms matches write-back by host verbatim
+    """cli._update_inventory matches write-back by host verbatim
     against the inventory table name -- and a qna_version fan-out needs
     distinct names to tell multiple local entries apart (see render.label).
     Both need the real name echoed back, not a hardcoded "local"."""

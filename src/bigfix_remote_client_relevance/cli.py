@@ -30,6 +30,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS, host
 from bigfix_remote_client_relevance.inventory import (
     InventoryError,
     load_inventory,
+    update_inventory_arch,
     update_inventory_platform,
 )
 from bigfix_remote_client_relevance.orchestrate import (
@@ -178,36 +179,52 @@ def _summarize_failures(results: list[ClientRelevanceResult]) -> None:
             logger.error("%s: %s (%s)", result.host, result.error, result.error_kind)
 
 
-def _update_inventory_platforms(
+def _update_inventory(
     inventory: Path,
     inventory_targets: list[Target],
     results: list[ClientRelevanceResult],
 ) -> None:
-    """Write a probed or corrected `platform` back for each inventory host.
+    """Write a probed or corrected `platform`/`arch` back for each inventory host.
 
-    Compares each result's (possibly probed, possibly corrected) platform
-    against what that host's *original* Target carried before the run, so an
-    already-correct entry is never rewritten and a --qna-version fan-out over
-    multiple versions never writes the same host twice. Best-effort: a write
-    failure (e.g. the file became read-only mid-run) is logged, not raised --
-    one host's config problem must not turn a successful evaluation into a
-    failed command.
+    Compares each result's (possibly probed, possibly corrected) platform and
+    arch against what that host's *original* Target carried before the run,
+    so an already-correct entry is never rewritten and a --qna-version
+    fan-out over multiple versions never writes the same host twice. The two
+    fields are tracked (and written) independently -- a host can need one
+    updated and not the other. Best-effort: a write failure (e.g. the file
+    became read-only mid-run) is logged, not raised -- one host's config
+    problem must not turn a successful evaluation into a failed command.
     """
-    configured = {target.name: target.platform for target in inventory_targets}
-    written: set[str] = set()
+    configured_platform = {target.name: target.platform for target in inventory_targets}
+    configured_arch = {target.name: target.arch for target in inventory_targets}
+    written_platform: set[str] = set()
+    written_arch: set[str] = set()
     for result in results:
-        if result.host not in configured or result.host in written:
+        host = result.host
+        if host not in configured_platform:
             continue
-        if result.platform is None or result.platform == configured[result.host]:
-            continue
-        try:
-            update_inventory_platform(inventory, result.host, result.platform)
-        except InventoryError as exc:
-            logger.warning(
-                "could not update platform for %s in %s: %s", result.host, inventory, exc
-            )
-        else:
-            written.add(result.host)
+        if (
+            host not in written_platform
+            and result.platform is not None
+            and result.platform != configured_platform[host]
+        ):
+            try:
+                update_inventory_platform(inventory, host, result.platform)
+            except InventoryError as exc:
+                logger.warning("could not update platform for %s in %s: %s", host, inventory, exc)
+            else:
+                written_platform.add(host)
+        if (
+            host not in written_arch
+            and result.arch is not None
+            and result.arch != configured_arch[host]
+        ):
+            try:
+                update_inventory_arch(inventory, host, result.arch)
+            except InventoryError as exc:
+                logger.warning("could not update arch for %s in %s: %s", host, inventory, exc)
+            else:
+                written_arch.add(host)
 
 
 @app.command()
@@ -256,9 +273,9 @@ def evaluate(
         typer.Option(
             "--update-inventory/--no-update-inventory",
             help=(
-                "Write a probed or corrected `platform` back into --inventory's "
-                "hosts.toml, so future runs skip the probe and a wrong entry stops "
-                "failing silently forever."
+                "Write a probed or corrected `platform`/`arch` back into "
+                "--inventory's hosts.toml, so future runs skip the probe and a "
+                "wrong entry stops failing silently forever."
             ),
         ),
     ] = True,
@@ -543,7 +560,7 @@ def evaluate(
     _summarize_failures(results)
 
     if inventory is not None and update_inventory and inventory_targets:
-        _update_inventory_platforms(inventory, inventory_targets, results)
+        _update_inventory(inventory, inventory_targets, results)
 
     if not stream:
         payload = (
