@@ -1028,3 +1028,87 @@ def test_empty_answer_set_without_an_error_is_success():
 
 def test_no_results_is_not_a_success():
     assert worst_exit_code([]) != EXIT_OK
+
+
+# --- cancellation -----------------------------------------------------------
+#
+# An MCP server cancels in-flight requests as a matter of course, which lands
+# inside a fan-out as CancelledError. _one wraps every stage in a broad
+# `except Exception`, so these pin that cancellation escapes it rather than
+# being turned into a result with error_kind="transport".
+
+
+class HangingTransport:
+    """Blocks forever, and records whether it was cancelled."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = False
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+
+async def test_cancelling_the_fanout_is_not_swallowed_into_a_result():
+    transport = HangingTransport()
+    task = asyncio.create_task(
+        evaluate_client_relevance(
+            "true",
+            [Target(kind="local", name="local")],
+            transport_factory=lambda target: transport,
+        )
+    )
+    await asyncio.wait_for(transport.entered.wait(), timeout=5)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_cancellation_reaches_the_transport():
+    """Not just the caller: the in-flight transport call is cancelled too, so a
+    transport with cleanup of its own gets the chance to run it."""
+    transport = HangingTransport()
+    task = asyncio.create_task(
+        evaluate_client_relevance(
+            "true",
+            [Target(kind="local", name="local")],
+            transport_factory=lambda target: transport,
+        )
+    )
+    await asyncio.wait_for(transport.entered.wait(), timeout=5)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert transport.cancelled
+
+
+async def test_cancelling_the_stream_is_not_swallowed_into_a_result():
+    transport = HangingTransport()
+
+    async def consume():
+        async for _ in evaluate_client_relevance_stream(
+            "true",
+            [Target(kind="local", name="local")],
+            transport_factory=lambda target: transport,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(transport.entered.wait(), timeout=5)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task

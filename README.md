@@ -110,6 +110,11 @@ Actionable for CI gating; the worst across the fan-out wins.
 | 2 | qna failed, or provisioning it did |
 | 3 | a transport failure — connect, auth, or timeout |
 | 4 | a qna version spec could not be resolved |
+| 64 | usage error — bad flags or a missing argument |
+
+64 is sysexits `EX_USAGE`, deliberately outside the fan-out's range so a caller
+that shells out can tell a bad invocation from a failed evaluation. (It was 2
+through 0.1.2, which collided with "qna failed".)
 
 ### Inventory
 
@@ -161,7 +166,81 @@ and the full `raw_qna_output` for debugging. Failures are reported inside
 results rather than raised, so one unreachable host never breaks a fan-out.
 
 The library logs through `logging` and never writes to stdout — that channel
-belongs to the CLI's payload, and later to a stdio MCP server's JSON-RPC.
+belongs to the CLI's payload, and to a stdio MCP server's JSON-RPC.
+
+The package ships `py.typed`, so `mypy` and `pyright` see real types across the
+import boundary.
+
+## Building an MCP server on this
+
+The whole surface an MCP tool needs is here, in stdlib-only helpers — nothing
+below adds a dependency to your server.
+
+### From Python
+
+```python
+from bigfix_remote_client_relevance import (
+    BigFixRelevanceError,
+    Target,
+    count_work,
+    evaluate_client_relevance_stream,
+    format_results,
+    result_to_dict,
+)
+
+targets = [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")]
+
+total = count_work(targets, "11.0")          # the progress denominator
+results = []
+async for result in evaluate_client_relevance_stream(expr, targets, qna_version="11.0"):
+    results.append(result)
+    await report_progress(len(results), total)
+
+return {
+    "content": [{"type": "text", "text": format_results(results)}],
+    # max_raw_output caps qna's transcript, which is unbounded by default.
+    "structuredContent": {"results": [result_to_dict(r, max_raw_output=4000) for r in results]},
+    "isError": any(not r.ok for r in results),
+}
+```
+
+| Need | Use |
+|---|---|
+| the tool body | `evaluate_client_relevance` (batched) or `evaluate_client_relevance_stream` (completion order) |
+| progress notifications | `count_work(targets, qna_version)` for the total |
+| `structuredContent` | `result_to_dict` / `results_to_dicts`, typed as `ResultPayload` |
+| `outputSchema` | `RESULT_JSON_SCHEMA` (JSON Schema 2020-12), versioned by `SCHEMA_VERSION` |
+| the text `content` block | `format_result` / `format_results` — the CLI's own rendering, without typer |
+| classifying a failure | `result.error_kind`, one of `ERROR_KINDS`; `error_kind == "relevance"` plus `raw_qna_output` is what lets an agent fix its own expression and retry |
+| errors from the setup path | one `except BigFixRelevanceError` around `load_inventory`, version resolution, and artifact caching |
+
+The fan-out functions never raise for a target failure — an unreachable host
+comes back as a result with `error_kind` set — so only the setup path needs the
+`try`. Cancelling the fan-out (an MCP request cancellation) propagates
+`CancelledError` normally rather than being turned into a result.
+
+Result payloads only ever gain fields within a major version; `SCHEMA_VERSION`
+bumps when they do, and `RESULT_JSON_SCHEMA` does not set
+`additionalProperties: false` so an older validator keeps working.
+
+### From a non-Python server
+
+Shell out to the CLI, which is the same code paths:
+
+```bash
+bigfix-remote-client-relevance --schema
+```
+
+prints the JSON Schema for a single result and exits 0 — no target needed. Then
+`--jsonl` emits exactly one of those objects per line, flushed as each target
+answers, so a Node or Go server can stream progress off the pipe. `--json`
+emits the whole array once. stdout carries only the payload; logs and error
+summaries go to stderr, at a level set by `-v`/`-vv`.
+
+If several server processes share a machine, they also share the qna artifact
+cache. That is safe — downloads stage to a temp name, verify their published
+sha256, and land by atomic rename — but the deduplication lock is per-process,
+so two processes starting at once may each fetch the same artifact once.
 
 ## How qna gets to the target
 

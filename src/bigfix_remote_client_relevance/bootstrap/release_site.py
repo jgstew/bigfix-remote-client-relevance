@@ -21,6 +21,8 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
+
 logger = logging.getLogger(__name__)
 
 RELEASE_INDEX_URL = "https://support.bigfix.com/bes/release/"
@@ -55,7 +57,7 @@ _ARCH_DEB = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "
 _ARCH_RPM = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}
 
 
-class ResolveError(Exception):
+class ResolveError(BigFixRelevanceError):
     """A version spec or artifact could not be resolved.
 
     Maps to ``error_kind="resolve"``.

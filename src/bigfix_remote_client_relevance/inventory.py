@@ -23,6 +23,7 @@ from pathlib import Path
 import tomlkit
 from tomlkit.exceptions import ParseError
 
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.orchestrate import Target
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ KNOWN_TRANSPORTS = frozenset({"ssh", "local", "container", "fastquery"})
 DEFAULT_TRANSPORT = "ssh"
 
 
-class InventoryError(Exception):
+class InventoryError(BigFixRelevanceError):
     """The inventory file is missing, malformed, or describes an unusable host."""
 
 

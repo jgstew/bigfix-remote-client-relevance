@@ -17,6 +17,7 @@ from pathlib import Path
 import platformdirs
 
 from bigfix_remote_client_relevance.bootstrap.release_site import ArtifactRef
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.results import ResolvedQna
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ BytesFetcher = Callable[[str, Path], Awaitable[None]]
 _locks: dict[str, asyncio.Lock] = {}
 
 
-class ArtifactCacheError(Exception):
+class ArtifactCacheError(BigFixRelevanceError):
     """An artifact could not be downloaded or verified.
 
     Maps to ``error_kind="bootstrap"``.

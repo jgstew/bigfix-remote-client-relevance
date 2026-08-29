@@ -15,12 +15,15 @@ import pytest
 from typer.testing import CliRunner
 
 from bigfix_remote_client_relevance import cli as cli_module
+from bigfix_remote_client_relevance.cli import USAGE_EXIT_CODE
+from bigfix_remote_client_relevance.orchestrate import EXIT_QNA
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_RELEVANCE,
     ERROR_KIND_RESOLVE,
     ERROR_KIND_TRANSPORT,
     ClientRelevanceResult,
 )
+from bigfix_remote_client_relevance.serialize import RESULT_JSON_SCHEMA
 
 runner = CliRunner()
 
@@ -826,7 +829,7 @@ def test_diff_with_a_single_result_still_renders_a_group(captured):
 def test_diff_and_json_together_is_a_usage_error(captured):
     result = invoke("--container", "a", "--diff", "--json", "true")
 
-    assert result.exit_code == 2
+    assert result.exit_code == USAGE_EXIT_CODE
     assert "--diff" in result.output and "--json" in result.output
     assert "text summary" in result.output
 
@@ -848,3 +851,53 @@ def test_diff_with_no_results_prints_nothing(captured):
 
     assert "No such option" not in result.output, "the flag must be recognized"
     assert result.stdout.strip() == ""
+
+
+# --- the machine-readable contract -----------------------------------------
+#
+# A non-Python MCP server shells out to this CLI, so --json/--jsonl are a wire
+# format and the exit codes are its error channel. Both are pinned here.
+
+
+def test_schema_flag_prints_the_result_schema():
+    result = invoke("--schema")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == RESULT_JSON_SCHEMA
+
+
+def test_schema_flag_needs_no_target_or_relevance():
+    """It describes the output shape; it does not evaluate anything."""
+    assert invoke("--schema").exit_code == 0
+
+
+def test_usage_errors_are_distinguishable_from_qna_failures():
+    """A shelling-out consumer must tell bad flags from a failed evaluation.
+
+    Both were exit 2 before; usage now uses sysexits EX_USAGE.
+    """
+    assert USAGE_EXIT_CODE == 64
+    assert USAGE_EXIT_CODE != EXIT_QNA
+    assert invoke("--local").exit_code == USAGE_EXIT_CODE
+
+
+def test_json_payload_carries_the_derived_ok_field(captured):
+    result = invoke("--local", "--json", "true")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload[0]["ok"] is True
+
+
+def test_jsonl_payload_carries_the_derived_ok_field(captured):
+    result = invoke("--local", "--jsonl", "true")
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert [json.loads(line)["ok"] for line in lines] == [True]
+
+
+def test_json_payload_matches_the_schema_properties(captured):
+    result = invoke("--local", "--json", "true")
+
+    assert set(json.loads(result.stdout)[0]) == set(RESULT_JSON_SCHEMA["properties"])

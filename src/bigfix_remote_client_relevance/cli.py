@@ -17,7 +17,6 @@ enforced here rather than left to convention.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import sys
@@ -42,7 +41,18 @@ from bigfix_remote_client_relevance.orchestrate import (
     evaluate_client_relevance_stream,
     worst_exit_code,
 )
+from bigfix_remote_client_relevance.render import (
+    format_result as _render_one_plain,
+)
+from bigfix_remote_client_relevance.render import (
+    label as _label,
+)
 from bigfix_remote_client_relevance.results import ClientRelevanceResult
+from bigfix_remote_client_relevance.serialize import (
+    RESULT_JSON_SCHEMA,
+    result_to_dict,
+    results_to_dicts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +62,10 @@ app = typer.Typer(
     help="Evaluate BigFix client relevance on remote endpoints and in containers.",
 )
 
-USAGE_EXIT_CODE = 2
+# sysexits(3) EX_USAGE. Deliberately not 2, which is EXIT_QNA: a consumer
+# shelling out to this CLI has to be able to tell a bad invocation from a
+# qna failure on the target.
+USAGE_EXIT_CODE = 64
 
 # Implied when no target is given and this file exists in the current
 # directory -- see the `not any(modes)` branch in `evaluate`.
@@ -74,6 +87,20 @@ def _configure_logging(verbosity: int) -> None:
     package_logger.setLevel(level)
 
 
+def _print_schema(value: bool) -> None:
+    """Print the result JSON Schema and exit, before any argument validation.
+
+    Eager, so `--schema` needs no target and no relevance: it describes the
+    output shape rather than producing one. A flag rather than a subcommand
+    because this app has exactly one command -- adding a second would force an
+    `evaluate` verb into every existing invocation.
+    """
+    if not value:
+        return
+    typer.echo(json.dumps(RESULT_JSON_SCHEMA, indent=2))
+    raise typer.Exit(0)
+
+
 def _fail(message: str) -> None:
     """Report a usage problem on stderr and exit."""
     typer.echo(f"error: {message}", err=True)
@@ -92,62 +119,6 @@ def _read_client_relevance(inline: list[str], from_file: Path | None) -> str:
     if not inline:
         _fail("no client relevance given (pass it inline or with --client-relevance-file)")
     return " ".join(inline)
-
-
-def _display_host(result: ClientRelevanceResult) -> str:
-    """The host as shown in headers -- not necessarily ``result.host`` as-is.
-
-    ``local`` and ``container:<image>@<arch>`` already say how they're
-    reached; a bare ssh host like ``192.168.4.115`` doesn't, and an
-    inventory can mix an ssh and a fastquery entry for the same address.
-    This is display-only: ``result.host`` itself stays untouched, since
-    ``_update_inventory_platforms`` matches it against the inventory's
-    table names verbatim.
-    """
-    if result.transport in ("ssh", "fastquery") and not result.host.startswith(
-        f"{result.transport}:"
-    ):
-        return f"{result.transport}:{result.host}"
-    return result.host
-
-
-def _label(result: ClientRelevanceResult) -> str:
-    """Full header text: the display host, its platform when known, and the
-    qna version -- e.g. ``ssh:192.168.4.115:windows (qna 11.0.6.137)``, echoing
-    the ``container:<image>@<arch>`` shape's colon-separated qualifier.
-
-    Platform is shown only for ssh/fastquery, the two transports whose host
-    string alone doesn't say what's on the other end (an inventory full of
-    bare IPs and SSH aliases gives no hint which is Windows, macOS, or
-    Linux). ``local`` is always this machine and a container image already
-    names its own OS, so both would just be repeating themselves.
-    """
-    label = _display_host(result)
-    if result.transport in ("ssh", "fastquery") and result.platform:
-        label = f"{label}:{result.platform}"
-    if result.qna_version:
-        label = f"{label} (qna {result.qna_version})"
-    return label
-
-
-def _render_one_plain(result: ClientRelevanceResult, *, labelled: bool) -> str:
-    """One result's section. Shared by the batch and streaming renderers, so
-    the two can never drift into printing the same result differently."""
-    lines: list[str] = []
-    if labelled:
-        lines.append(f"== {_label(result)}")
-    lines.extend(result.answers)
-    if result.error:
-        # Errors go to stdout only as part of a labelled section; the
-        # summary on stderr is what a human reads.
-        lines.append(f"!! {result.error_kind}: {result.error}")
-    return "\n".join(lines)
-
-
-def _render_plain(results: list[ClientRelevanceResult]) -> str:
-    """Answers for a single result; host-labelled sections for a fan-out."""
-    multiple = len(results) > 1
-    return "\n".join(_render_one_plain(result, labelled=multiple) for result in results)
 
 
 def _diff_key(result: ClientRelevanceResult) -> tuple[object, ...]:
@@ -389,6 +360,15 @@ def evaluate(
     verbose: Annotated[
         int, typer.Option("--verbose", "-v", count=True, help="-v for info, -vv for debug.")
     ] = 0,
+    schema: Annotated[
+        bool,
+        typer.Option(
+            "--schema",
+            is_eager=True,
+            callback=_print_schema,
+            help="Print the JSON Schema for --json/--jsonl results and exit.",
+        ),
+    ] = False,
 ) -> None:
     """Evaluate a BigFix client-relevance expression and print the answers."""
     _configure_logging(verbose)
@@ -500,7 +480,7 @@ def evaluate(
         if as_jsonl:
             # Compact and newline-free: one record per line is the whole
             # contract a line-oriented reader depends on.
-            return json.dumps(dataclasses.asdict(result), separators=(",", ":"))
+            return json.dumps(result_to_dict(result), separators=(",", ":"))
         return _render_one_plain(result, labelled=labelled)
 
     async def _run() -> list[ClientRelevanceResult]:
@@ -537,9 +517,7 @@ def evaluate(
 
     if not stream:
         payload = (
-            json.dumps([dataclasses.asdict(r) for r in results], indent=2)
-            if as_json
-            else _render_diff(results)
+            json.dumps(results_to_dicts(results), indent=2) if as_json else _render_diff(results)
         )
         if payload:
             typer.echo(payload)

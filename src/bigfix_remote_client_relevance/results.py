@@ -33,6 +33,15 @@ ERROR_KIND_TRANSPORT = "transport"
 ERROR_KIND_RESOLVE = "resolve"
 """A qna version spec could not be resolved to a full version."""
 
+ERROR_KINDS: tuple[str, ...] = (
+    ERROR_KIND_RELEVANCE,
+    ERROR_KIND_QNA,
+    ERROR_KIND_BOOTSTRAP,
+    ERROR_KIND_TRANSPORT,
+    ERROR_KIND_RESOLVE,
+)
+"""Every non-``None`` ``error_kind``, for callers that need to enumerate them."""
+
 # A resolved version is four dot-separated numbers, e.g. 11.0.6.137 — never a
 # spec like "11.0".
 _FULL_VERSION = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
@@ -167,3 +176,17 @@ def parse_qna_output(raw: str) -> ParsedQnaOutput:
         errors=errors,
         qna_time=qna_time,
     )
+
+
+__all__ = [
+    "ERROR_KINDS",
+    "ERROR_KIND_BOOTSTRAP",
+    "ERROR_KIND_QNA",
+    "ERROR_KIND_RELEVANCE",
+    "ERROR_KIND_RESOLVE",
+    "ERROR_KIND_TRANSPORT",
+    "ClientRelevanceResult",
+    "ParsedQnaOutput",
+    "ResolvedQna",
+    "parse_qna_output",
+]

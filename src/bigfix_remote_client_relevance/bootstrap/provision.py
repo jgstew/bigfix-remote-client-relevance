@@ -31,6 +31,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import (
     MARKER_FILENAME,
     TargetSpec,
 )
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.results import ResolvedQna
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ RunResult = tuple[str, str, int]
 """``(stdout, stderr, exit_status)``."""
 
 
-class BootstrapFailure(Exception):
+class BootstrapFailure(BigFixRelevanceError):
     """Provisioning failed; maps to ``error_kind="bootstrap"``."""
 
 

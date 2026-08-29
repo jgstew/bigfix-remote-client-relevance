@@ -492,9 +492,13 @@ __all__ = [
     "EXIT_RELEVANCE",
     "EXIT_RESOLVE",
     "EXIT_TRANSPORT",
+    "Resolver",
     "Target",
+    "TransportFactory",
+    "count_work",
     "default_resolver",
     "default_transport_factory",
     "evaluate_client_relevance",
+    "evaluate_client_relevance_stream",
     "worst_exit_code",
 ]

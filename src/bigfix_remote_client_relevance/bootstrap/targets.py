@@ -12,13 +12,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
+
 # Written after a successful extraction. Its presence (not merely the binary's)
 # is what marks a version as usable, so a half-extracted tree is never mistaken
 # for a complete one.
 MARKER_FILENAME = ".bfrcr-complete"
 
 
-class UnknownTargetError(Exception):
+class UnknownTargetError(BigFixRelevanceError):
     """No bootstrap spec exists for the requested platform."""
 
 

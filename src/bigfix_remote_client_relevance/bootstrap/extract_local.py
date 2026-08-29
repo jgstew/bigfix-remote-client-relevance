@@ -30,6 +30,7 @@ from pathlib import Path, PurePosixPath
 
 from bigfix_remote_client_relevance.bootstrap.cache import default_cache_dir
 from bigfix_remote_client_relevance.bootstrap.targets import MARKER_FILENAME
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.results import ResolvedQna
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ _AR_HEADER_SIZE = 60
 _locks: dict[str, asyncio.Lock] = {}
 
 
-class LocalExtractionError(Exception):
+class LocalExtractionError(BigFixRelevanceError):
     """An artifact could not be unpacked on the controller.
 
     Maps to ``error_kind="bootstrap"``.

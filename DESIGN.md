@@ -724,11 +724,18 @@ image = "ubuntu:22.04"
 ```
 
 ### MCP-ready contract (server itself out of scope)
-- The whole surface a future MCP tool needs is one pure async function —
+The server is still out of scope; the affordances a server needs are not. The
+project is expected to be consumed by *several* MCP servers, so anything each
+of them would otherwise reimplement lives here, and none of it costs a
+dependency — it is all stdlib or a rearrangement of code the CLI already had.
+
+- The whole surface a tool body needs is one pure async function —
   the same one the CLI sits on:
   `orchestrate.evaluate_client_relevance(client_relevance, targets?,
   qna_version?) -> list[ClientRelevanceResult]` (one result per
-  target × version).
+  target × version). `evaluate_client_relevance_stream` is the
+  completion-order form, and `count_work` gives the denominator, which is
+  the pair a progress notification needs.
 - MCP tool name will be `eval_client_relevance` (never
   `eval_relevance`), matching the naming rule.
 - `raw_qna_output` + `error` + `qna_version` in the result let an agent
@@ -739,6 +746,55 @@ image = "ubuntu:22.04"
   library logs to `logging` and returns data; only `cli.py` writes to
   stdout, so the MCP server can claim the channel without auditing
   anything.
+
+What is *provided*, rather than merely possible:
+
+- **`py.typed`.** Without it every downstream `mypy`/`pyright` saw `Any`, which
+  wasted the strict typing this project already maintains internally.
+- **`serialize.py` owns the wire shape.** `result_to_dict` /`results_to_dicts`
+  replace the `dataclasses.asdict` that used to be inlined in `cli.py`, so the
+  CLI's `--json` and a server's `structuredContent` are the same document from
+  the same code. It adds a stable key order, the derived `ok` field, and
+  `max_raw_output` — a cap on the one unbounded field, which matters when the
+  payload is charged in tokens. `ResultPayload` is a `TypedDict`, so indexing a
+  payload yields a real type rather than `object`.
+- **`RESULT_JSON_SCHEMA`** is a hand-written JSON Schema 2020-12 document
+  serving as a tool's `outputSchema`. A unit test asserts its properties are
+  exactly the keys `result_to_dict` emits, which are exactly the dataclass
+  fields plus `ok` — without that guard the schema rots silently the first time
+  a field is added. Evolution is additive-only within a major version, tracked
+  by `SCHEMA_VERSION`; the schema deliberately omits
+  `additionalProperties: false` so a consumer pinning an older copy keeps
+  validating against a newer emitter.
+- **`render.py`** holds the plain-text rendering the CLI used to keep private.
+  A server wants that text for a tool result's `content` block and should not
+  have to import `cli.py` — and therefore `typer` — to get it. A test parses the
+  module's imports to keep it that way.
+- **`BigFixRelevanceError`** is a single base under all eight exception
+  classes. The fan-out never raises for a target failure, but the setup path
+  (inventory loading, version resolution, artifact caching) does; one `except`
+  now covers it.
+- **The CLI is a wire format**, for servers written in something other than
+  Python. `--schema` prints `RESULT_JSON_SCHEMA` and exits without needing a
+  target; `--jsonl` is one payload object per line in completion order.
+  `USAGE_EXIT_CODE` moved from `2` to sysexits `EX_USAGE` (64) because `2` is
+  also `EXIT_QNA` — a subprocess consumer could not distinguish bad flags from
+  a failed evaluation. Breaking, and taken deliberately at 0.1.x.
+
+Two operational notes for a multi-server deployment:
+
+- **The artifact cache lock is process-local.** `_locks` in `bootstrap/cache.py`
+  dedupes concurrent downloads within one process. Several server processes
+  sharing the platformdirs cache may therefore each download the same artifact
+  once. That is wasteful, never incorrect: each download stages to a `.part`
+  file, is verified against the published sha256, and lands by atomic rename, so
+  no reader ever observes a partial or unverified artifact. A cross-process file
+  lock is out of scope.
+- **Cancellation propagates.** MCP servers cancel in-flight requests routinely.
+  `_one` wraps each stage in a broad `except Exception`, which does not catch
+  `CancelledError` (a `BaseException`), so cancelling a fan-out cancels the
+  in-flight transport calls and re-raises rather than fabricating results with
+  `error_kind="transport"`. Pinned by tests in `tests/unit/test_orchestrate.py`.
 
 ## Setup guide (packaged as README)
 

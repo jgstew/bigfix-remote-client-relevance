@@ -36,6 +36,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import (
     classify_uname,
     spec_for,
 )
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.qna_paths import default_candidates
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 TRANSPORT_NAME = "ssh"
 
 
-class SSHConnectionError(Exception):
+class SSHConnectionError(BigFixRelevanceError):
     """Connecting to or authenticating with the target failed."""
 
 

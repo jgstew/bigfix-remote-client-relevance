@@ -41,6 +41,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import (
     normalize_arch,
     spec_for,
 )
+from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_TRANSPORT,
@@ -144,7 +145,7 @@ def _image_platform(image: object) -> tuple[str, str] | None:
     return str(os_name), str(arch)
 
 
-class ContainerEngineError(Exception):
+class ContainerEngineError(BigFixRelevanceError):
     """The container engine is unreachable or refused an operation."""
 
 
