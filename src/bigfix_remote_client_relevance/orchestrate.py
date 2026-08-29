@@ -135,7 +135,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
         # `become` defaults on there; SSH can't make the same call below --
         # the remote platform isn't known without a round trip.
         become = target.become if target.become is not None else sys.platform == "darwin"
-        return TransportLocal(target=target.platform, become=become)
+        return TransportLocal(target=target.platform, become=become, host=target.name)
     if target.kind == "ssh":
         from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 

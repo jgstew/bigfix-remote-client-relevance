@@ -364,6 +364,45 @@ def test_become_applies_on_linux_not_just_macos(monkeypatch):
     assert TransportLocal(become=True)._eval_argv("/opt/qna")[:2] == ["sudo", "-n"]
 
 
+async def test_resolve_platform_reports_sys_platform_with_no_round_trip(monkeypatch):
+    """Unlike ssh/container, this is the same process -- no probe to run,
+    just report what ``_local_target()`` already resolved to."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert await TransportLocal().resolve_platform() == "macos"
+
+
+async def test_resolve_platform_honors_an_explicit_target(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert await TransportLocal(target="windows").resolve_platform() == "windows"
+
+
+async def test_result_host_defaults_to_the_bare_transport_name(fake_qna, qna_output):
+    """No inventory name given (e.g. the CLI's ad hoc --local flag) -- fall
+    back to "local", not some other guess."""
+    stub = fake_qna(stdout=qna_output("single_answer"))
+
+    result = await TransportLocal().evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert result.host == "local"
+
+
+async def test_result_host_echoes_an_inventory_name(fake_qna, qna_output):
+    """cli._update_inventory_platforms matches write-back by host verbatim
+    against the inventory table name -- and a qna_version fan-out needs
+    distinct names to tell multiple local entries apart (see render.label).
+    Both need the real name echoed back, not a hardcoded "local"."""
+    stub = fake_qna(stdout=qna_output("single_answer"))
+
+    result = await TransportLocal(host="this-computer").evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    assert result.host == "this-computer"
+    assert result.transport == "local"
+
+
 @posix_only
 async def test_become_runs_qna_through_sudo(fake_qna, fake_sudo, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)

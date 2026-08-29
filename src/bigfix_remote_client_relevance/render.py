@@ -20,12 +20,14 @@ from bigfix_remote_client_relevance.results import ClientRelevanceResult
 def display_host(result: ClientRelevanceResult) -> str:
     """The host as shown in headers -- not necessarily ``result.host`` as-is.
 
-    ``local`` and ``container:<image>@<arch>`` already say how they're
-    reached; a bare ssh host like ``192.168.4.115`` doesn't, and an
-    inventory can mix an ssh and a fastquery entry for the same address.
-    This is display-only: ``result.host`` itself stays untouched, since the
-    CLI's inventory writeback matches it against the inventory's table names
-    verbatim.
+    ``container:<image>@<arch>`` already says how it's reached; a bare ssh
+    host like ``192.168.4.115`` doesn't, and an inventory can mix an ssh and
+    a fastquery entry for the same address. This is display-only:
+    ``result.host`` itself stays untouched, since the CLI's inventory
+    writeback matches it against the inventory's table names verbatim.
+
+    ssh/fastquery/local build a fuller, platform-including header in
+    :func:`label` instead of stopping here -- see its docstring.
     """
     if result.transport in ("ssh", "fastquery") and not result.host.startswith(
         f"{result.transport}:"
@@ -35,19 +37,41 @@ def display_host(result: ClientRelevanceResult) -> str:
 
 
 def label(result: ClientRelevanceResult) -> str:
-    """Full header text: the display host, its platform when known, and the
-    qna version -- e.g. ``ssh:192.168.4.115:windows (qna 11.0.6.137)``, echoing
+    """Full header text: ``transport:platform:host``, then the qna version --
+    e.g. ``ssh:windows:192.168.4.115 (qna 11.0.6.137)``, or
+    ``local:macos:this-mac-builtin`` for a local inventory entry -- echoing
     the ``container:<image>@<arch>`` shape's colon-separated qualifier.
 
-    Platform is shown only for ssh/fastquery, the two transports whose host
-    string alone doesn't say what's on the other end (an inventory full of
-    bare IPs and SSH aliases gives no hint which is Windows, macOS, or
-    Linux). ``local`` is always this machine and a container image already
-    names its own OS, so both would just be repeating themselves.
+    ssh, fastquery, and local all get this shape: their host strings alone
+    don't say what's on the other end -- an inventory full of bare IPs and
+    SSH aliases (or local entries with names like ``this-mac-builtin``) gives
+    no hint which is Windows, macOS, or Linux, and for local a
+    ``qna_version`` fan-out can turn one target into several results that
+    would otherwise all print the same bare, indistinguishable header. The
+    transport always leads, and the platform sits between it and the host
+    (not after, like the ``container:<image>@<arch>`` shape puts its arch)
+    so every header still says ``local``/``ssh``/``fastquery`` even when the
+    platform is unknown. A container image already names its own OS, so
+    repeating it there would just be noise -- container keeps its own shape
+    entirely.
+
+    The bare literal ``"local"`` host from a nameless, ad hoc invocation (the
+    CLI's ``--local`` flag) is dropped rather than doubled into
+    ``local:macos:local``, since it names nothing an inventory entry would.
+    An already-transport-qualified host (see :func:`display_host`) is not
+    double-prefixed.
     """
-    text = display_host(result)
-    if result.transport in ("ssh", "fastquery") and result.platform:
-        text = f"{text}:{result.platform}"
+    if result.transport in ("ssh", "fastquery", "local"):
+        prefix = f"{result.transport}:"
+        bare_host = result.host.removeprefix(prefix)
+        parts = [result.transport]
+        if result.platform:
+            parts.append(result.platform)
+        if not (result.transport == "local" and bare_host == "local"):
+            parts.append(bare_host)
+        text = ":".join(parts)
+    else:
+        text = display_host(result)
     if result.qna_version:
         text = f"{text} (qna {result.qna_version})"
     return text

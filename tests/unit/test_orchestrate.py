@@ -346,6 +346,30 @@ async def test_probe_failure_becomes_a_bootstrap_result():
     assert "platform" in (results[0].error or "").lower()
 
 
+async def test_local_platform_is_probed_before_resolution_too(monkeypatch):
+    """TransportLocal.resolve_platform is the same fast, no-round-trip probe
+    as the other transports' -- it must fill result.platform the same way,
+    or a qna_version fan-out leaves every local result indistinguishable
+    (render.label needs this to tell them apart)."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    seen: list[str | None] = []
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="local", name="local")],
+        qna_version="11.0",
+        transport_factory=default_transport_factory,
+        resolver=platform_recording_resolver(seen),
+    )
+
+    assert seen == ["macos"], "the resolver must see the probed platform, not None"
+    assert results[0].platform == "macos"
+
+
 async def test_probe_engine_failure_becomes_a_transport_result():
     from bigfix_remote_client_relevance.transports.container import ContainerEngineError
 

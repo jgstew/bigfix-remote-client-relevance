@@ -111,6 +111,7 @@ class TransportLocal:
         target: str | None = None,
         state_dir: Path | None = None,
         recheck_prereqs: bool = False,
+        host: str = TRANSPORT_NAME,
     ) -> None:
         self._qna_path = qna_path
         self._candidates = candidates
@@ -119,6 +120,13 @@ class TransportLocal:
         self._target = target
         self._state_dir = state_dir
         self._recheck_prereqs = recheck_prereqs
+        # What this instance reports back as ClientRelevanceResult.host --
+        # the inventory table name when it came from one, so write-back (see
+        # cli._update_inventory_platforms, which matches on host verbatim)
+        # and multi-local labelling (render.label) can tell entries apart.
+        # Defaults to the bare "local" for a caller with no inventory name,
+        # e.g. the CLI's ad hoc --local flag.
+        self._host = host
         # Set once a `become` run proves sudo cannot elevate; see class docstring.
         self._sudo_broken: str | None = None
 
@@ -130,6 +138,22 @@ class TransportLocal:
         if sys.platform.startswith("win"):
             return "windows"
         return "ubuntu"
+
+    async def resolve_platform(self, *, timeout_s: float = 30.0) -> str:
+        """The :data:`KNOWN_TARGETS` key this instance already uses to
+        provision -- ``_local_target()``, exposed the way
+        :class:`~...transports.ssh.TransportSSH` and
+        :class:`~...transports.container.TransportContainer` expose theirs.
+
+        Unlike an ssh or container probe, this costs no round trip: it's the
+        same process, so ``sys.platform`` (or an explicit ``target``) already
+        has the answer. Exposing it lets ``orchestrate.py``'s generic
+        probe-before-resolve step (see ``_one``) fill in ``result.platform``
+        for local the same way it does for the other transports, instead of
+        leaving it ``None`` and every ``local`` header indistinguishable from
+        every other -- see qna_version fan-out in ``render.label``.
+        """
+        return self._local_target()
 
     async def evaluate_client_relevance(
         self,
@@ -143,7 +167,7 @@ class TransportLocal:
 
         def _result(**overrides: object) -> ClientRelevanceResult:
             base: dict[str, object] = {
-                "host": TRANSPORT_NAME,
+                "host": self._host,
                 "transport": TRANSPORT_NAME,
                 "client_relevance": client_relevance,
                 "qna_version": qna.version if qna else None,
@@ -165,7 +189,7 @@ class TransportLocal:
                     LocalRunner(),
                     spec_for(self._local_target()),
                     qna,
-                    host_label="local",
+                    host_label=self._host,
                     state_dir=self._state_dir,
                     recheck_prereqs=self._recheck_prereqs,
                     timeout_s=max(timeout_s, 300.0),

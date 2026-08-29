@@ -68,14 +68,38 @@ def test_ssh_label_carries_the_platform_and_version():
         labelled=True,
     )
 
-    assert text.startswith("== ssh:win11:windows (qna 11.0.6.137)")
+    assert text.startswith("== ssh:windows:win11 (qna 11.0.6.137)")
 
 
-def test_local_label_omits_the_platform():
-    """local and container already say what they are; repeating it is noise."""
+def test_local_label_carries_the_platform():
+    """A qna_version fan-out can turn one local target into several results;
+    without the platform they'd all print the same bare '== local'."""
     text = format_result(make_result(platform="macos"), labelled=True)
 
+    assert text.startswith("== local:macos\n")
+
+
+def test_local_label_omits_the_platform_when_unknown():
+    text = format_result(make_result(), labelled=True)
+
     assert text.startswith("== local\n")
+
+
+def test_local_label_puts_platform_between_transport_and_host_name():
+    """transport:platform:host -- not ssh's transport:host:platform, since an
+    inventory's local entry name carries no hint it's `local` on its own."""
+    text = format_result(
+        make_result(host="this-mac-qna", platform="macos", qna_version="10.0.16.61"),
+        labelled=True,
+    )
+
+    assert text.startswith("== local:macos:this-mac-qna (qna 10.0.16.61)\n")
+
+
+def test_local_label_still_leads_with_the_transport_when_platform_is_unknown():
+    text = format_result(make_result(host="this-mac-builtin"), labelled=True)
+
+    assert text.startswith("== local:this-mac-builtin\n")
 
 
 def test_container_label_keeps_its_own_host_shape():

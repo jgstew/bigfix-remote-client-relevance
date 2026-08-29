@@ -564,7 +564,7 @@ def test_ssh_headers_show_the_platform_when_known(captured):
 
     result = invoke("--container", "a", "--container", "b", "--container", "c", "true")
 
-    assert "== ssh:10.0.0.5:windows (qna 11.0.6.137)" in result.stdout
+    assert "== ssh:windows:10.0.0.5 (qna 11.0.6.137)" in result.stdout
     assert "== ssh:10.0.0.6 (qna 11.0.6.137)" in result.stdout, (
         "unknown platform: omit, don't guess"
     )
@@ -603,8 +603,8 @@ def test_diff_headers_also_show_the_platform(captured):
 
     result = invoke("--container", "a", "--container", "b", "--diff", "true")
 
-    assert "-- ssh:10.0.0.5:windows" in result.stdout
-    assert "-- ssh:10.0.0.6:ubuntu" in result.stdout
+    assert "-- ssh:windows:10.0.0.5" in result.stdout
+    assert "-- ssh:ubuntu:10.0.0.6" in result.stdout
 
 
 def test_json_host_field_is_unaffected_by_the_display_prefix(captured):
