@@ -13,9 +13,13 @@ import subprocess
 
 import pytest
 
-from bigfix_remote_client_relevance.transports.container_setup import docker_context_endpoint
+from bigfix_remote_client_relevance.transports.container_setup import (
+    docker_context_endpoint,
+    podman_context_endpoint,
+)
 
 DESKTOP_SOCKET = "unix:///Users/someone/.docker/run/docker.sock"
+PODMAN_SOCKET_PATH = "/run/user/1000/podman/podman.sock"
 
 
 def runner_returning(stdout: str = "", *, returncode: int = 0):
@@ -158,3 +162,126 @@ def test_the_linux_install_hint_points_at_the_docs():
     hint = install_hint("linux")
 
     assert "docs.docker.com" in hint
+
+
+# --- podman: the same probes, but podman's own commands and output shape ------
+
+
+def test_podman_reads_the_socket_path_from_info():
+    """podman info reports a bare filesystem path, not a URL like docker context."""
+    assert (
+        podman_context_endpoint(runner_returning(f"{PODMAN_SOCKET_PATH}\n"))
+        == f"unix://{PODMAN_SOCKET_PATH}"
+    )
+
+
+def test_a_missing_podman_binary_is_not_an_error():
+    assert podman_context_endpoint(runner_raising(FileNotFoundError("podman"))) is None
+
+
+def test_a_podman_hang_is_not_an_error():
+    timeout = subprocess.TimeoutExpired(["podman"], 5)
+
+    assert podman_context_endpoint(runner_raising(timeout)) is None
+
+
+def test_a_failing_podman_command_is_not_an_error():
+    assert podman_context_endpoint(runner_returning("", returncode=1)) is None
+
+
+@pytest.mark.parametrize("stdout", ["", "   \n"])
+def test_empty_podman_output_is_ignored(stdout):
+    assert podman_context_endpoint(runner_returning(stdout)) is None
+
+
+def test_the_podman_probe_asks_podman_info():
+    run = runner_returning(PODMAN_SOCKET_PATH)
+
+    podman_context_endpoint(run)
+
+    argv, _timeout = run.calls[0]
+    assert argv[0] == "info"
+    assert "{{.Host.RemoteSocket.Path}}" in argv
+
+
+# --- podman: engine-starter detection, never deferring to docker/Colima -------
+
+
+def test_podman_machine_is_detected_on_macos():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_podman_starter
+
+    starter = detect_podman_starter(system="darwin", **fake_host(installed=("podman",)))
+
+    assert starter is not None
+    assert starter.argv == ["podman", "machine", "start"]
+
+
+def test_podman_starter_ignores_docker_and_colima_on_macos():
+    """A PodmanEngine explicitly asked for must never fall back to Docker Desktop."""
+    from bigfix_remote_client_relevance.transports.container_setup import detect_podman_starter
+
+    starter = detect_podman_starter(
+        system="darwin", **fake_host(installed=("podman", "colima"), apps=("Docker.app",))
+    )
+
+    assert starter is not None
+    assert starter.argv == ["podman", "machine", "start"]
+
+
+def test_podman_is_reported_rather_than_started_on_linux():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_podman_starter
+
+    starter = detect_podman_starter(system="linux", **fake_host(installed=("podman",)))
+
+    assert starter is not None
+    assert starter.argv is None, "a system service is not ours to start"
+    assert "podman.socket" in starter.note
+
+
+def test_detect_podman_starter_ignores_docker_on_linux():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_podman_starter
+
+    starter = detect_podman_starter(system="linux", **fake_host(installed=("docker", "podman")))
+
+    assert starter is not None
+    assert starter.name == "podman"
+
+
+def test_nothing_installed_is_detected_as_no_podman_starter():
+    from bigfix_remote_client_relevance.transports.container_setup import detect_podman_starter
+
+    assert detect_podman_starter(system="darwin", **fake_host()) is None
+
+
+def test_the_podman_install_hint_names_a_real_command():
+    from bigfix_remote_client_relevance.transports.container_setup import install_hint
+
+    assert "brew install podman" in install_hint("darwin", engine="podman")
+
+
+def test_the_docker_install_hint_is_unchanged_by_the_new_parameter():
+    from bigfix_remote_client_relevance.transports.container_setup import install_hint
+
+    assert "brew install --cask docker" in install_hint("darwin")
+    assert "brew install --cask docker" in install_hint("darwin", engine="docker")
+
+
+def test_podman_engine_setup_detects_and_hints_podman_only():
+    from bigfix_remote_client_relevance.transports.container_setup import PodmanEngineSetup
+
+    setup = PodmanEngineSetup()
+
+    # detect() must go through detect_podman_starter, not detect_engine_starter,
+    # so it never reports "start Docker Desktop" for a user who asked for podman.
+    import bigfix_remote_client_relevance.transports.container_setup as mod
+
+    real_detect = mod.detect_podman_starter
+    calls = []
+    mod.detect_podman_starter = lambda **kw: (calls.append(kw), real_detect(**kw))[1]
+    try:
+        setup.detect()
+    finally:
+        mod.detect_podman_starter = real_detect
+    assert calls, "PodmanEngineSetup.detect() must call detect_podman_starter"
+
+    assert "podman" in setup.hint()

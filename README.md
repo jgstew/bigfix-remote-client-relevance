@@ -238,9 +238,13 @@ emits the whole array once. stdout carries only the payload; logs and error
 summaries go to stderr, at a level set by `-v`/`-vv`.
 
 If several server processes share a machine, they also share the qna artifact
-cache. That is safe — downloads stage to a temp name, verify their published
-sha256, and land by atomic rename — but the deduplication lock is per-process,
-so two processes starting at once may each fetch the same artifact once.
+cache — safely and efficiently. Downloads stage to a temp name, verify their
+published sha256, and land by atomic rename, so a race can never serve a
+partial or corrupt artifact; a `filelock`-backed cross-process lock means two
+processes starting at once share one download rather than each fetching it.
+A stuck download only ever blocks a *live* wait — the lock is released by the
+OS the instant a holder crashes, no stale-lock cleanup needed — bounded by
+`ensure_artifact`'s `lock_timeout_s` (10 minutes by default).
 
 ## How qna gets to the target
 
@@ -321,10 +325,25 @@ any time:
 docker rmi $(docker images 'bfrcr/prepared:*' -q)
 ```
 
+`--arch` defaults to this host's own architecture (so on Apple Silicon a
+bare `--container ubuntu:24.04` now targets `arm64`, not the docs' `x86_64`
+examples above). It is also repeatable, to evaluate more than one
+architecture in a single run — useful on Apple Silicon, which runs `arm64`
+containers natively and `amd64` ones emulated (via Rosetta/QEMU), both at
+the same time:
+
+```bash
+bigfix-remote-client-relevance \
+  --container ubuntu:24.04 --arch amd64 --arch arm64 "name of operating system"
+```
+
+`--engine` picks the container engine: `auto` (default, prefers Docker and
+falls back to podman only if Docker is unreachable), `docker`, or `podman`.
+
 ## Requirements
 
 - Python 3.11+
-- Docker for `--container`; SSH access for remote hosts
+- Docker or podman for `--container`; SSH access for remote hosts
 - On macOS, `qna` needs root — `--local` implies `--become` there automatically
   (pass `--no-become` to opt out); over SSH it stays opt-in, since the remote
   platform isn't known up front. `--become` uses `sudo -n`, so it needs

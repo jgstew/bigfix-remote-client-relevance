@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-remote-client-relevance"
-version = "1.0.0"
+version = "1.0.1"
 description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -31,6 +31,7 @@ dependencies = [
   "asyncssh>=2.14",
   "beautifulsoup4>=4.12",
   "docker>=7.0",
+  "filelock>=3.32.3",
   "platformdirs>=4",
   "requests>=2.31",
   "rpmfile>=2.2.1",

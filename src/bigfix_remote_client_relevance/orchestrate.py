@@ -88,6 +88,10 @@ class Target:
     False otherwise. An explicit True/False always wins."""
     image: str | None = None
     arch: str = "x86_64"
+    engine: str = "auto"
+    """Container only. ``"auto"`` | ``"docker"`` | ``"podman"``. ``"auto"``
+    prefers docker, falling back to podman only when docker is unreachable --
+    a no-op for anyone not using podman."""
     platform: str | None = None
     """Bootstrap target key (``"ubuntu"``, ``"macos"``, ...); probed if None."""
 
@@ -143,11 +147,35 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             verify_host_key=target.verify_host_key,
         )
     if target.kind == "container":
-        from bigfix_remote_client_relevance.transports.container import TransportContainer
+        from bigfix_remote_client_relevance.transports.container import (
+            ContainerEngine,
+            ContainerEngineError,
+            DockerEngine,
+            PodmanEngine,
+            TransportContainer,
+        )
+
+        engine: ContainerEngine | None = None
+        if target.engine == "podman":
+            engine = PodmanEngine(auto_setup=target.auto_setup)
+        elif target.engine == "docker":
+            engine = DockerEngine(auto_setup=target.auto_setup)
+        elif target.engine == "auto":
+            # docker-preferred, matching detect_engine_starter's own ordering,
+            # so "auto" changes nothing for anyone not using podman.
+            docker_engine = DockerEngine(auto_setup=target.auto_setup)
+            try:
+                docker_engine._get_client()
+                engine = docker_engine
+            except ContainerEngineError:
+                engine = PodmanEngine(auto_setup=target.auto_setup)
+        else:
+            raise ValueError(f"unknown engine {target.engine!r}")
 
         return TransportContainer(
             target.image or target.name,
             arch=target.arch,
+            engine=engine,
             keep_alive=target.keep_alive,
             target=target.platform,
             rebuild_image=target.rebuild_image,

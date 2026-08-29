@@ -364,6 +364,74 @@ def test_container_without_platform_leaves_it_unset(captured):
     assert captured["targets"][0].platform is None
 
 
+# --- arch: defaults to the host, repeatable for multi-arch fan-out ---------
+
+
+def test_arch_defaults_to_the_host_architecture(captured):
+    from bigfix_remote_client_relevance.bootstrap.targets import host_arch
+
+    result = invoke("--container", "ubuntu:22.04", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].arch == host_arch()
+
+
+def test_explicit_arch_overrides_the_default(captured):
+    result = invoke("--container", "ubuntu:22.04", "--arch", "arm64", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].arch == "arm64"
+
+
+def test_arch_is_repeatable_and_expands_the_container_matrix(captured):
+    """Apple Silicon can run amd64 (emulated) and arm64 (native) at once."""
+    result = invoke("--container", "ubuntu:22.04", "--arch", "amd64", "--arch", "arm64", "true")
+
+    assert result.exit_code == 0, result.output
+    archs = {t.arch for t in captured["targets"]}
+    assert archs == {"amd64", "arm64"}
+    names = {t.name for t in captured["targets"]}
+    assert names == {"ubuntu:22.04@amd64", "ubuntu:22.04@arm64"}
+
+
+def test_single_arch_keeps_the_plain_image_name(captured):
+    """No behavior change for the common case: only >1 --arch adds a suffix."""
+    result = invoke("--container", "ubuntu:22.04", "--arch", "arm64", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].name == "ubuntu:22.04"
+
+
+def test_repeated_arch_requires_a_container_target(captured):
+    result = invoke("mac-test", "true", "--arch", "amd64", "--arch", "arm64")
+
+    assert result.exit_code != 0
+    assert "container" in result.output.lower()
+
+
+# --- engine: docker/podman/auto ---------------------------------------------
+
+
+def test_engine_defaults_to_auto(captured):
+    result = invoke("--container", "ubuntu:22.04", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].engine == "auto"
+
+
+def test_engine_flag_reaches_the_target(captured):
+    result = invoke("--container", "ubuntu:22.04", "--engine", "podman", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].engine == "podman"
+
+
+def test_unknown_engine_is_rejected(captured):
+    result = invoke("--container", "ubuntu:22.04", "--engine", "bogus", "true")
+
+    assert result.exit_code != 0
+
+
 # --- client relevance input ------------------------------------------------
 
 

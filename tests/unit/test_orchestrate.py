@@ -582,6 +582,64 @@ def test_rebuild_image_reaches_the_transport_factory():
     assert transport._rebuild_image is True
 
 
+def test_engine_docker_constructs_a_docker_engine():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    target = Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", engine="docker")
+    transport = default_transport_factory(target)
+
+    assert isinstance(transport._engine, DockerEngine)
+
+
+def test_engine_podman_constructs_a_podman_engine():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.container import PodmanEngine
+
+    target = Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", engine="podman")
+    transport = default_transport_factory(target)
+
+    assert isinstance(transport._engine, PodmanEngine)
+
+
+def test_engine_auto_is_the_default():
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    assert Target(kind="container", name="x").engine == "auto"
+
+
+def test_engine_auto_prefers_docker_when_it_answers(monkeypatch):
+    """auto must be a no-op for anyone not using podman: docker, if it works, wins."""
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.container import DockerEngine
+
+    monkeypatch.setattr(DockerEngine, "_get_client", lambda self: object())
+
+    target = Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", engine="auto")
+    transport = default_transport_factory(target)
+
+    assert isinstance(transport._engine, DockerEngine)
+
+
+def test_engine_auto_falls_back_to_podman_when_docker_is_unreachable(monkeypatch):
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.container import (
+        ContainerEngineError,
+        DockerEngine,
+        PodmanEngine,
+    )
+
+    def _no_docker(self):
+        raise ContainerEngineError("cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(DockerEngine, "_get_client", _no_docker)
+
+    target = Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04", engine="auto")
+    transport = default_transport_factory(target)
+
+    assert isinstance(transport._engine, PodmanEngine)
+
+
 def test_become_reaches_the_local_transport():
     """`become` was plumbed for ssh only; local dropped it on the floor."""
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory

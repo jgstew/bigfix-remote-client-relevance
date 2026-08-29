@@ -1405,3 +1405,83 @@ async def test_writes_nothing_to_stdout(capsys):
     await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance("true")
 
     assert capsys.readouterr().out == ""
+
+
+# --- PodmanEngine: a docker-compatible socket, reached podman's own way ------
+
+
+def test_podman_candidate_sockets_cover_rootless_and_machine_paths(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_podman_sockets
+
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
+    candidates = candidate_podman_sockets(endpoint_lookup=lambda: None, platform="linux")
+
+    assert any("podman/podman.sock" in c and "run/user" not in c for c in candidates), (
+        "rootful socket must be listed"
+    )
+    assert any("run/user" in c and "podman/podman.sock" in c for c in candidates), (
+        "rootless XDG socket must be listed"
+    )
+    assert any("podman-machine-default" in c for c in candidates), "machine socket must be listed"
+
+
+def test_podman_context_endpoint_is_tried_before_the_hardcoded_paths(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_podman_sockets
+
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
+    candidates = candidate_podman_sockets(
+        endpoint_lookup=lambda: "unix:///run/user/1000/podman/podman.sock", platform="linux"
+    )
+
+    assert candidates[0] == "unix:///run/user/1000/podman/podman.sock"
+
+
+def test_container_host_env_takes_precedence_for_podman(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import candidate_podman_sockets
+
+    monkeypatch.setenv("CONTAINER_HOST", "unix:///custom/podman.sock")
+
+    assert candidate_podman_sockets(endpoint_lookup=lambda: None)[0] == "unix:///custom/podman.sock"
+
+
+async def test_podman_engine_behaves_like_docker_engine_for_ensure_image():
+    """Inheritance from DockerEngine, not reimplementation, is the whole point."""
+    from bigfix_remote_client_relevance.transports.container import PodmanEngine
+
+    client = FakeDockerClient(FakeImage(attrs={"Architecture": "arm64", "Os": "linux"}))
+    engine = PodmanEngine(client=client)
+
+    await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/amd64"}]
+
+
+def test_podman_engine_uses_podman_sockets_not_docker_sockets(monkeypatch):
+    from bigfix_remote_client_relevance.transports.container import PodmanEngine
+
+    monkeypatch.delenv("CONTAINER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    engine = PodmanEngine()
+
+    assert all(".docker" not in c and "docker.sock" not in c for c in engine._candidates())
+
+
+def test_podman_engine_error_message_names_podman_not_docker():
+    from bigfix_remote_client_relevance.transports.container import PodmanEngine
+
+    engine = PodmanEngine(socket_candidates=["unix:///definitely/not/here.sock"], auto_setup=False)
+
+    with pytest.raises(ContainerEngineError) as excinfo:
+        engine._get_client()
+
+    assert "podman" in str(excinfo.value)
+    assert "Docker daemon" not in str(excinfo.value)
+
+
+def test_podman_engine_setup_defaults_to_podman_engine_setup():
+    from bigfix_remote_client_relevance.transports.container import PodmanEngine
+    from bigfix_remote_client_relevance.transports.container_setup import PodmanEngineSetup
+
+    engine = PodmanEngine()
+
+    assert isinstance(engine._setup, PodmanEngineSetup)

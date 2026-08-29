@@ -14,6 +14,7 @@ import pytest
 
 from bigfix_remote_client_relevance.bootstrap.cache import (
     ArtifactCacheError,
+    _cross_process_lock,
     default_cache_dir,
     ensure_artifact,
 )
@@ -166,3 +167,129 @@ def test_default_cache_dir_is_under_the_user_cache(monkeypatch):
 
     # Compared as paths: str() of a Path renders with the platform separator.
     assert default_cache_dir() == Path("/tmp/fake-cache")
+
+
+# --- the cross-process lock -------------------------------------------------
+#
+# Several MCP server processes can share one machine's cache dir. The
+# staging-file + checksum + atomic-rename sequence already makes a race
+# harmless; this is what stops it being *wasteful* -- two processes should
+# never both download the same artifact.
+#
+# These test `_cross_process_lock` directly rather than through
+# `ensure_artifact`, because `ensure_artifact` also holds an in-process
+# `asyncio.Lock` first -- going through it would only prove the in-process
+# lock works, which test_concurrent_requests_download_once already covers.
+
+
+async def test_second_acquirer_waits_for_the_first_to_release(tmp_path):
+    path = tmp_path / "artifact.bin"
+    events: list[str] = []
+
+    async def holder():
+        async with _cross_process_lock(path, timeout_s=5.0):
+            events.append("holder-acquired")
+            await asyncio.sleep(0.1)
+            events.append("holder-released")
+
+    async def waiter():
+        await asyncio.sleep(0.02)  # let the holder acquire first
+        async with _cross_process_lock(path, timeout_s=5.0):
+            events.append("waiter-acquired")
+
+    await asyncio.gather(holder(), waiter())
+
+    assert events == ["holder-acquired", "holder-released", "waiter-acquired"]
+
+
+async def test_timeout_raises_artifact_cache_error_not_a_bare_filelock_error(tmp_path):
+    path = tmp_path / "artifact.bin"
+    holder_has_lock = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def holder():
+        async with _cross_process_lock(path, timeout_s=5.0):
+            holder_has_lock.set()
+            await release_holder.wait()
+
+    holder_task = asyncio.create_task(holder())
+    await holder_has_lock.wait()
+    try:
+        with pytest.raises(ArtifactCacheError, match="timed out"):
+            async with _cross_process_lock(path, timeout_s=0.05):
+                pass
+    finally:
+        release_holder.set()
+        await holder_task
+
+
+async def test_lock_releases_even_when_the_body_raises(tmp_path):
+    path = tmp_path / "artifact.bin"
+
+    with pytest.raises(ValueError, match="boom"):
+        async with _cross_process_lock(path, timeout_s=5.0):
+            raise ValueError("boom")
+
+    # If the first lock leaked, this would hang and the test would time out.
+    async with _cross_process_lock(path, timeout_s=5.0):
+        pass
+
+
+async def test_creates_the_parent_directory_if_missing(tmp_path):
+    path = tmp_path / "nested" / "deeper" / "artifact.bin"
+
+    async with _cross_process_lock(path, timeout_s=5.0):
+        assert path.parent.is_dir()
+
+
+async def test_lock_file_is_a_sibling_named_after_the_artifact(tmp_path):
+    path = tmp_path / "artifact.bin"
+
+    async with _cross_process_lock(path, timeout_s=5.0):
+        assert (tmp_path / "artifact.bin.lock").exists()
+
+
+async def test_two_processes_download_the_artifact_once(tmp_path):
+    """The load-bearing test: proves the dedup crosses a real process boundary,
+    not just an asyncio event loop."""
+    import sys
+    import textwrap
+
+    marker_dir = tmp_path / "fetch-markers"
+    marker_dir.mkdir()
+
+    script = textwrap.dedent(
+        f"""
+        import asyncio, hashlib, time, uuid
+        from pathlib import Path
+        from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+        from bigfix_remote_client_relevance.bootstrap.release_site import ArtifactRef
+
+        payload = {PAYLOAD!r}
+        digest = hashlib.sha256(payload).hexdigest()
+        ref = ArtifactRef(
+            url="https://software.bigfix.com/download/bes/110/util/QNA11.0.6.137.zip",
+            filename="QNA11.0.6.137.zip",
+            sha256=digest,
+            platform="windows",
+            arch="x86_64",
+        )
+
+        async def fetch_bytes(url, destination):
+            (Path({str(marker_dir)!r}) / str(uuid.uuid4())).write_text("fetched")
+            await asyncio.sleep(0.3)
+            destination.write_bytes(payload)
+
+        asyncio.run(
+            ensure_artifact(
+                "11.0.6.137", ref, fetch_bytes=fetch_bytes, cache_dir=Path({str(tmp_path)!r})
+            )
+        )
+        """
+    )
+
+    procs = [await asyncio.create_subprocess_exec(sys.executable, "-c", script) for _ in range(2)]
+    for proc in procs:
+        assert await asyncio.wait_for(proc.wait(), timeout=30) == 0
+
+    assert len(list(marker_dir.iterdir())) == 1
