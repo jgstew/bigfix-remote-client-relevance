@@ -370,6 +370,43 @@ async def test_local_platform_is_probed_before_resolution_too(monkeypatch):
     assert results[0].platform == "macos"
 
 
+async def test_local_platform_is_probed_even_with_no_version_to_resolve(monkeypatch):
+    """`qna_version = []` ("probe whatever's installed") means spec is None,
+    so there's no artifact to pick and nothing gates the probe for ssh or
+    container -- but local's probe is free (no round trip), so it must not
+    be skipped just because nothing needs resolving. Otherwise an unpinned
+    local entry's platform is never known, never written back, and never
+    shown in its header."""
+    import sys
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="local", name="local", qna_version=[])],
+        transport_factory=default_transport_factory,
+    )
+
+    assert results[0].platform == "macos"
+
+
+async def test_ssh_platform_is_not_probed_with_no_version_to_resolve():
+    """The other half of the contrast: ssh's probe is a real round trip, so
+    it stays gated on there being a version to resolve an artifact for."""
+    transport = FakeProbingTransport("host0", "rhel")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host0", qna_version=[])],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 0
+    assert results[0].platform is None
+
+
 async def test_probe_engine_failure_becomes_a_transport_result():
     from bigfix_remote_client_relevance.transports.container import ContainerEngineError
 

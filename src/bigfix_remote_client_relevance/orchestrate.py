@@ -312,30 +312,44 @@ async def _evaluate_stream_indexed(
             image_semaphore if prepare is not None else contextlib.nullcontext()
         )
 
+        if spec is not None and target.kind == "fastquery":
+            # Endpoints evaluate with their installed agent; refuse before
+            # doing any work rather than resolving a version nothing can use.
+            return _failure(
+                target,
+                ERROR_KIND_RESOLVE,
+                f"cannot pin qna version {spec!r} for the fastquery transport: "
+                "endpoints evaluate with their installed BES agent",
+            )
+
+        # The resolver picks the artifact (deb vs rpm) from the platform, so an
+        # unset one must be probed BEFORE resolution -- gated on spec being set,
+        # since for ssh/container this is a real round trip not worth paying for
+        # a host that's never going to resolve a version anyway (e.g.
+        # `qna_version = []`, probing whatever's installed). Local's probe is
+        # the exception: it's just a `sys.platform` check, no round trip, so it
+        # runs unconditionally -- otherwise an unpinned local entry would never
+        # get its platform written back (`--update-inventory`) or shown in its
+        # header (`render.label`), the entire reason `resolve_platform` was
+        # added to it in the first place. For a container the probe can trigger
+        # the image pull, so it shares the image budget.
+        probe = getattr(transport, "resolve_platform", None)
+        if (
+            target.platform is None
+            and probe is not None
+            and (spec is not None or target.kind == "local")
+        ):
+            try:
+                async with image_budget:
+                    probed = await probe(timeout_s=timeout_s)
+                target = dataclasses.replace(target, platform=probed)
+            except UnknownTargetError as exc:
+                return _failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
+            except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
+                logger.debug("platform probe failed for %s: %s", target.label, exc)
+                return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+
         if spec is not None:
-            if target.kind == "fastquery":
-                # Endpoints evaluate with their installed agent; refuse before
-                # doing any work rather than resolving a version nothing can use.
-                return _failure(
-                    target,
-                    ERROR_KIND_RESOLVE,
-                    f"cannot pin qna version {spec!r} for the fastquery transport: "
-                    "endpoints evaluate with their installed BES agent",
-                )
-            # The resolver picks the artifact (deb vs rpm) from the platform, so
-            # an unset one must be probed BEFORE resolution. For a container the
-            # probe can trigger the image pull, so it shares the image budget.
-            probe = getattr(transport, "resolve_platform", None)
-            if target.platform is None and probe is not None:
-                try:
-                    async with image_budget:
-                        probed = await probe(timeout_s=timeout_s)
-                    target = dataclasses.replace(target, platform=probed)
-                except UnknownTargetError as exc:
-                    return _failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
-                except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
-                    logger.debug("platform probe failed for %s: %s", target.label, exc)
-                    return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
             try:
                 resolved = await _resolve(target, spec)
             except ResolveError as exc:
