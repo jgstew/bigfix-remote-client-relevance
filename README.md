@@ -325,12 +325,11 @@ any time:
 docker rmi $(docker images 'bfrcr/prepared:*' -q)
 ```
 
-`--arch` defaults to this host's own architecture (so on Apple Silicon a
-bare `--container ubuntu:24.04` now targets `arm64`, not the docs' `x86_64`
-examples above). It is also repeatable, to evaluate more than one
-architecture in a single run — useful on Apple Silicon, which runs `arm64`
-containers natively and `amd64` ones emulated (via Rosetta/QEMU), both at
-the same time:
+`--arch` defaults to `x86_64` — the common case for BigFix clients,
+regardless of this host's own architecture, so a bare
+`--container ubuntu:24.04` targets `x86_64` even on Apple Silicon (emulated
+via Rosetta/QEMU). It is also repeatable, to evaluate more than one
+architecture in a single run:
 
 ```bash
 bigfix-remote-client-relevance \

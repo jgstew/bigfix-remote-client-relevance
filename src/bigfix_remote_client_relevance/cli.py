@@ -26,7 +26,7 @@ from typing import Annotated
 
 import typer
 
-from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS, host_arch
+from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
 from bigfix_remote_client_relevance.inventory import (
     InventoryError,
     load_inventory,
@@ -325,6 +325,7 @@ def evaluate(
                 "Target architecture. Repeatable, to evaluate multiple "
                 "architectures in one run (e.g. on Apple Silicon, which can "
                 "run amd64 and arm64 containers simultaneously). Defaults to "
+                "x86_64, the common case for BigFix clients, regardless of "
                 "this host's own architecture."
             ),
         ),
@@ -414,7 +415,10 @@ def evaluate(
     args = args or []
     qna_version = qna_version or []
     container = container or []
-    arch_list = arch or [host_arch()]
+    # x86_64, not this host's own architecture: the common case for BigFix
+    # clients, on Apple Silicon included -- an explicit --arch (or an
+    # inventory host's own `arch`) is how anyone wanting arm64 opts in.
+    arch_list = arch or ["x86_64"]
 
     # --container and --inventory compose: a fleet plus an ad-hoc image is a
     # normal thing to want. --local is still on its own.

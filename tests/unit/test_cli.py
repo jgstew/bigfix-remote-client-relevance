@@ -445,16 +445,16 @@ def test_container_without_platform_leaves_it_unset(captured):
     assert captured["targets"][0].platform is None
 
 
-# --- arch: defaults to the host, repeatable for multi-arch fan-out ---------
+# --- arch: defaults to x86_64, repeatable for multi-arch fan-out -----------
 
 
-def test_arch_defaults_to_the_host_architecture(captured):
-    from bigfix_remote_client_relevance.bootstrap.targets import host_arch
-
+def test_arch_defaults_to_x86_64(captured):
+    """Not this host's own architecture -- x86_64 is the common case for
+    BigFix clients, Apple Silicon controllers included."""
     result = invoke("--container", "ubuntu:22.04", "true")
 
     assert result.exit_code == 0, result.output
-    assert captured["targets"][0].arch == host_arch()
+    assert captured["targets"][0].arch == "x86_64"
 
 
 def test_explicit_arch_overrides_the_default(captured):

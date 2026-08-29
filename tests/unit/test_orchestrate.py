@@ -1252,9 +1252,9 @@ async def test_cancelling_the_stream_is_not_swallowed_into_a_result():
 #
 # Unlike platform, container never gets probed here -- its arch is always an
 # explicit, per-run choice (--arch), not an unknown to infer. And unlike
-# platform, a failed arch probe has a safe fallback (host_arch()) rather than
-# failing the target -- there is no analog to UnknownTargetError/
-# ERROR_KIND_BOOTSTRAP for arch.
+# platform, a failed arch probe has a safe fallback ("x86_64", the common
+# case for BigFix clients) rather than failing the target -- there is no
+# analog to UnknownTargetError/ERROR_KIND_BOOTSTRAP for arch.
 
 
 class FakeArchProbingTransport(FakeTransport):
@@ -1324,11 +1324,11 @@ async def test_ssh_arch_is_not_probed_with_no_version_to_resolve():
     assert results[0].arch is None
 
 
-async def test_arch_probe_failure_falls_back_to_host_arch_instead_of_failing():
+async def test_arch_probe_failure_falls_back_to_x86_64_instead_of_failing():
     """Unlike platform, a bad arch probe has a safe fallback -- it must never
-    turn into ERROR_KIND_BOOTSTRAP or any other target failure."""
-    from bigfix_remote_client_relevance.bootstrap.targets import host_arch
-
+    turn into ERROR_KIND_BOOTSTRAP or any other target failure. x86_64, not
+    this host's own architecture, since that's the common case for BigFix
+    clients."""
     results = await evaluate_client_relevance(
         "true",
         [Target(kind="ssh", name="host0")],
@@ -1340,7 +1340,7 @@ async def test_arch_probe_failure_falls_back_to_host_arch_instead_of_failing():
     )
 
     assert results[0].error_kind is None
-    assert results[0].arch == host_arch()
+    assert results[0].arch == "x86_64"
 
 
 async def test_explicit_arch_populates_result_arch_on_success():
