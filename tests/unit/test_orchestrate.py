@@ -346,23 +346,28 @@ async def test_probe_failure_becomes_a_bootstrap_result():
     assert "platform" in (results[0].error or "").lower()
 
 
-async def test_local_platform_is_probed_before_resolution_too(monkeypatch):
-    """TransportLocal.resolve_platform is the same fast, no-round-trip probe
-    as the other transports' -- it must fill result.platform the same way,
-    or a qna_version fan-out leaves every local result indistinguishable
-    (render.label needs this to tell them apart)."""
-    import sys
+async def test_local_platform_is_probed_before_resolution_too():
+    """Local gets the same probe-before-resolve step as container/ssh -- it
+    must fill result.platform the same way, or a qna_version fan-out leaves
+    every local result indistinguishable (render.label needs this to tell
+    them apart).
 
-    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
-
-    monkeypatch.setattr(sys, "platform", "darwin")
+    Uses FakeProbingTransport rather than the real TransportLocal /
+    default_transport_factory deliberately: a real local transport with a
+    fake, nonexistent artifact path actually attempts real subprocess-based
+    provisioning (mkdir/xar/cpio-shaped shell commands), which behaves
+    differently enough across OSes that it once passed on macOS/Linux CI and
+    failed on Windows CI for reasons unrelated to what this test checks --
+    see test_transport_local.py's resolve_platform tests for real-behavior
+    coverage instead.
+    """
     seen: list[str | None] = []
 
     results = await evaluate_client_relevance(
         "true",
         [Target(kind="local", name="local")],
         qna_version="11.0",
-        transport_factory=default_transport_factory,
+        transport_factory=lambda t: FakeProbingTransport(t.name, "macos"),
         resolver=platform_recording_resolver(seen),
     )
 
@@ -376,12 +381,22 @@ async def test_local_platform_is_probed_even_with_no_version_to_resolve(monkeypa
     container -- but local's probe is free (no round trip), so it must not
     be skipped just because nothing needs resolving. Otherwise an unpinned
     local entry's platform is never known, never written back, and never
-    shown in its header."""
+    shown in its header.
+
+    Faking ``sys.platform`` as "darwin" makes the real TransportLocal's own
+    macOS root check (see ``_macos_root_problem``/``_eval_argv``) run for
+    real too, and that calls the POSIX-only ``os.geteuid()`` -- absent on
+    Windows, where this test would otherwise crash with an unrelated
+    AttributeError instead of checking what it's here to check. Neutralize
+    it the same way test_transport_local.py does.
+    """
+    import os
     import sys
 
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
 
     results = await evaluate_client_relevance(
         "true",
