@@ -264,8 +264,18 @@ def candidate_podman_sockets(
     if from_context:
         candidates.append(from_context)
 
-    if not platform.startswith("win") and hasattr(os, "getuid"):
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if not platform.startswith("win"):
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir is None:
+            # os.getuid does not exist on Windows at all -- not even in the
+            # type stubs -- so it's looked up dynamically rather than called
+            # directly; this also covers being asked about "linux" candidates
+            # while actually running on Windows (as the tests do, to stay
+            # deterministic regardless of which OS runs the suite). Either
+            # way this is a best-effort guess, so a common default UID is a
+            # harmless fallback when the real one cannot be read.
+            getuid = getattr(os, "getuid", None)
+            runtime_dir = f"/run/user/{getuid()}" if getuid is not None else "/run/user/1000"
         candidates.append(f"unix://{runtime_dir}/podman/podman.sock")
         candidates.append("unix:///run/podman/podman.sock")
     home = Path.home()
