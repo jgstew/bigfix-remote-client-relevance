@@ -60,7 +60,9 @@ from bigfix_remote_client_relevance.transports.container_libs import (
 )
 from bigfix_remote_client_relevance.transports.container_setup import (
     EngineSetup,
+    PodmanEngineSetup,
     docker_context_endpoint,
+    podman_context_endpoint,
 )
 from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
 from bigfix_remote_client_relevance.transports.local import (
@@ -238,6 +240,44 @@ def candidate_docker_sockets(
     return list(dict.fromkeys(candidates))
 
 
+def candidate_podman_sockets(
+    *,
+    endpoint_lookup: Callable[[], str | None] = podman_context_endpoint,
+    platform: str | None = None,
+) -> list[str]:
+    """Socket URLs to try for podman, most specific first.
+
+    podman has no SDK-level equivalent of ``DOCKER_HOST``, so ``CONTAINER_HOST``
+    is read here directly as the most explicit override. After that,
+    ``podman info`` is asked which socket it is actually using, then the
+    hardcoded defaults are tried: the rootless per-user socket (the common
+    case), the rootful system socket, and finally the default ``podman
+    machine`` socket used on macOS/Windows.
+    """
+    platform = platform if platform is not None else sys.platform
+
+    candidates: list[str] = []
+    from_env = os.environ.get("CONTAINER_HOST")
+    if from_env:
+        candidates.append(from_env)
+    from_context = endpoint_lookup()
+    if from_context:
+        candidates.append(from_context)
+
+    if not platform.startswith("win") and hasattr(os, "getuid"):
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        candidates.append(f"unix://{runtime_dir}/podman/podman.sock")
+        candidates.append("unix:///run/podman/podman.sock")
+    home = Path.home()
+    candidates.append(
+        "unix://"
+        + (
+            home / ".local/share/containers/podman/machine/podman-machine-default/podman.sock"
+        ).as_posix()
+    )
+    return list(dict.fromkeys(candidates))
+
+
 class DockerEngine:
     """:class:`ContainerEngine` backed by the docker SDK.
 
@@ -251,11 +291,13 @@ class DockerEngine:
         socket_candidates: list[str] | None = None,
         auto_setup: bool = True,
         setup: EngineSetup | None = None,
+        engine_name: str = "Docker",
     ) -> None:
         self._client = client
         self._socket_candidates = socket_candidates
         self._auto_setup = auto_setup
         self._setup = setup or EngineSetup()
+        self._engine_name = engine_name
 
     def _connect(self, urls: list[str], tried: list[str]) -> object | None:
         """The first URL that answers, or ``None``."""
@@ -291,7 +333,8 @@ class DockerEngine:
             return client
 
         raise ContainerEngineError(
-            f"cannot connect to the Docker daemon; {self._setup.hint()}. tried: " + ", ".join(tried)
+            f"cannot connect to the {self._engine_name} daemon; {self._setup.hint()}. tried: "
+            + ", ".join(tried)
         )
 
     def _start_engine_and_wait(self, tried: list[str]) -> object | None:
@@ -486,6 +529,36 @@ class DockerEngine:
             raise
         except Exception as exc:
             raise ContainerEngineError(str(exc)) from exc
+
+
+class PodmanEngine(DockerEngine):
+    """:class:`ContainerEngine` backed by podman's docker-compatible socket.
+
+    podman's REST API is Docker-API-compatible, so every verb (``ensure_image``,
+    ``run_one_shot``, ``start``, ``exec_in``, ``stop``, ``image_digest``,
+    ``image_exists``, ``commit``) is inherited unchanged from
+    :class:`DockerEngine`; only how the socket is found, and how a stopped
+    engine is started, differ.
+    """
+
+    def __init__(
+        self,
+        client: object | None = None,
+        *,
+        socket_candidates: list[str] | None = None,
+        auto_setup: bool = True,
+        setup: EngineSetup | None = None,
+    ) -> None:
+        super().__init__(
+            client,
+            socket_candidates=socket_candidates,
+            auto_setup=auto_setup,
+            setup=setup or PodmanEngineSetup(),
+            engine_name="podman",
+        )
+
+    def _candidates(self) -> list[str]:
+        return self._socket_candidates or candidate_podman_sockets()
 
 
 def _to_volumes(mounts: dict[str, str]) -> dict[str, dict[str, str]]:
@@ -933,6 +1006,8 @@ __all__ = [
     "ContainerEngine",
     "ContainerEngineError",
     "DockerEngine",
+    "PodmanEngine",
     "TransportContainer",
     "candidate_docker_sockets",
+    "candidate_podman_sockets",
 ]

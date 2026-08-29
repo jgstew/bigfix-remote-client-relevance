@@ -24,6 +24,7 @@ Runner = Callable[[list[str], float], "subprocess.CompletedProcess[str]"]
 
 _CONTEXT_ARGV = ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]
 _CONTEXT_TIMEOUT_S = 5.0
+_PODMAN_INFO_ARGV = ["info", "--format", "{{.Host.RemoteSocket.Path}}"]
 
 # Schemes the docker SDK can dial. A context naming anything else is skipped
 # rather than handed over to fail obscurely later.
@@ -75,6 +76,53 @@ def docker_context_endpoint(
         return None
 
     logger.debug("docker context endpoint: %s", endpoint)
+    return endpoint
+
+
+def _run_podman(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    import shutil
+
+    podman = shutil.which("podman")
+    if podman is None:
+        raise FileNotFoundError("podman")
+    # Fixed argv, no shell: nothing here interpolates user input.
+    return subprocess.run(
+        [podman, *argv],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def podman_context_endpoint(
+    runner: Runner | None = None, *, timeout: float = _CONTEXT_TIMEOUT_S
+) -> str | None:
+    """The socket podman's current connection actually uses, or ``None``.
+
+    ``podman info`` reports a bare filesystem path rather than a URL the way
+    ``docker context inspect`` does, so this wraps it as ``unix://<path>``.
+    Never raises: a missing ``podman`` binary, a non-zero exit, a hang, or
+    empty output all mean the same thing to the caller — fall back to the
+    hardcoded socket list.
+    """
+    run = runner or _run_podman
+    try:
+        completed = run(_PODMAN_INFO_ARGV, timeout)
+    except Exception as exc:  # noqa: BLE001 - every failure is just "no answer"
+        logger.debug("could not read the podman socket path: %s", exc)
+        return None
+
+    if completed.returncode != 0:
+        logger.debug("podman info exited %d", completed.returncode)
+        return None
+
+    path = completed.stdout.strip().splitlines()[0].strip() if completed.stdout.strip() else ""
+    if not path:
+        return None
+
+    endpoint = f"unix://{path}"
+    logger.debug("podman socket endpoint: %s", endpoint)
     return endpoint
 
 
@@ -158,7 +206,43 @@ def detect_engine_starter(
     return None
 
 
-def install_hint(system: str | None = None) -> str:
+def detect_podman_starter(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    exists: Callable[[str], bool] | None = None,
+) -> EngineStarter | None:
+    """The podman installed here that could be started, if any.
+
+    Unlike :func:`detect_engine_starter`, this never prefers Docker Desktop
+    or Colima when both are present: a caller reaching for this function has
+    already decided it wants podman specifically, so it must not silently
+    start (or report) a different engine instead.
+    """
+    import shutil
+    import sys
+
+    system = system if system is not None else sys.platform
+    which = which if which is not None else shutil.which
+
+    if system == "darwin" or system.startswith("win"):
+        if which("podman"):
+            return EngineStarter(name="podman machine", argv=["podman", "machine", "start"])
+        return None
+
+    if system.startswith("linux"):
+        if which("podman"):
+            return EngineStarter(
+                name="podman",
+                argv=None,
+                note="start it with: systemctl --user start podman.socket",
+            )
+        return None
+
+    return None
+
+
+def install_hint(system: str | None = None, *, engine: str = "docker") -> str:
     """How to install a container engine on this platform.
 
     Only commands that are actually right for the platform — a wrong install
@@ -168,6 +252,12 @@ def install_hint(system: str | None = None) -> str:
     import sys
 
     system = system if system is not None else sys.platform
+    if engine == "podman":
+        if system == "darwin":
+            return "install one with: brew install podman"
+        if system.startswith("win"):
+            return "install podman: https://podman.io/docs/installation#windows"
+        return "install podman: https://podman.io/docs/installation#installing-on-linux"
     if system == "darwin":
         return (
             "install one with: brew install --cask docker  (Docker Desktop), "
@@ -202,10 +292,23 @@ class EngineSetup:
         return install_hint()
 
 
+class PodmanEngineSetup(EngineSetup):
+    """Like :class:`EngineSetup`, but only ever detects or hints at podman."""
+
+    def detect(self) -> EngineStarter | None:
+        return detect_podman_starter()
+
+    def hint(self) -> str:
+        return install_hint(engine="podman")
+
+
 __all__ = [
     "EngineSetup",
     "EngineStarter",
+    "PodmanEngineSetup",
     "detect_engine_starter",
+    "detect_podman_starter",
     "docker_context_endpoint",
     "install_hint",
+    "podman_context_endpoint",
 ]

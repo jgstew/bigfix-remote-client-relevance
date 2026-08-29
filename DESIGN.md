@@ -476,9 +476,13 @@ Four concrete transports, all class-named `Transport<Kind>`:
   `bigfix_ubuntu`) as the seed image catalog; extend as needed. Also
   aligns with the `.github/workflows/run_qna*.yaml` CI, which already
   proves qna-in-a-container works for the family.
-- **Engine abstraction:** default `engine="docker"`, but talk to it via
-  the `docker` Python SDK (or plain `docker` CLI subprocess as a fallback)
-  behind a small `ContainerEngine` interface so `podman` slots in later.
+- **Engine abstraction:** talk to the engine via the `docker` Python SDK
+  behind a small `ContainerEngine` interface. `DockerEngine` and
+  `PodmanEngine` (podman's socket is docker-API-compatible, so it subclasses
+  `DockerEngine` and only overrides socket discovery and engine-starter
+  detection) both implement it. `--engine {auto,docker,podman}` picks between
+  them; `auto` (the default) prefers docker and falls back to podman only
+  when docker is unreachable, so it is a no-op for anyone not using podman.
 - **Lifecycle:**
   1. Ensure the image exists locally (pull if missing).
   2. If `qna_version` is set and the image doesn't already have that
@@ -491,14 +495,16 @@ Four concrete transports, all class-named `Transport<Kind>`:
   4. `keep_alive=True` reuses a long-lived container (via `docker exec`)
      for hot repeat evals against the same image; default is one-shot for
      hermetic answers.
-- **Arch coverage:** on Docker Desktop / Colima with QEMU, `--platform
-  linux/arm64` (or `linux/amd64`) lets one host answer for both arches,
-  which matches the `run_qna_arm64.yaml` and `run_qna_qemu.yaml`
+- **Arch coverage:** `--arch` defaults to the host's own architecture and is
+  repeatable, so `--container ubuntu:24.04 --arch amd64 --arch arm64`
+  evaluates both in one run — the concrete case is Docker Desktop on Apple
+  Silicon, which runs arm64 natively and amd64 via Rosetta/QEMU emulation
+  simultaneously. Matches the `run_qna_arm64.yaml` and `run_qna_qemu.yaml`
   workflows already in `jgstew/tools`.
 - **Result `host` field:** `"container:<image>@<arch>"` so an agent /
   human can tell which image produced an answer.
 - **Not-goals for the first cut:** Windows containers (host-OS coupled),
-  rootless-podman quirks, image publication. Note them as follow-ups.
+  image publication. Note them as follow-ups.
 
 ### qna binary cache & distribution (controller-side)
 The machine running `bigfix-remote-client-relevance` (the **controller**)
@@ -783,13 +789,21 @@ What is *provided*, rather than merely possible:
 
 Two operational notes for a multi-server deployment:
 
-- **The artifact cache lock is process-local.** `_locks` in `bootstrap/cache.py`
-  dedupes concurrent downloads within one process. Several server processes
-  sharing the platformdirs cache may therefore each download the same artifact
-  once. That is wasteful, never incorrect: each download stages to a `.part`
-  file, is verified against the published sha256, and lands by atomic rename, so
-  no reader ever observes a partial or unverified artifact. A cross-process file
-  lock is out of scope.
+- **The artifact cache lock is cross-process.** `_locks` in `bootstrap/cache.py`
+  dedupes concurrent downloads within one process (an `asyncio.Lock` per cache
+  key); `_cross_process_lock` extends that across processes with a
+  `filelock.FileLock` sibling to the artifact, so several server processes
+  sharing the platformdirs cache pay for one download between them, not one
+  each. Neither lock was ever load-bearing for correctness — each download
+  stages to a `.part` file, is verified against the published sha256, and
+  lands by atomic rename, so no reader ever observes a partial or unverified
+  artifact regardless of locking. Recovery from a crashed holder is
+  structural rather than a stale-lock heuristic: `filelock` uses the OS's own
+  primitive (`flock` / `LockFile`), which the kernel releases the instant a
+  holding process exits, so there is no orphaned lock file to detect or break.
+  `ensure_artifact`'s `lock_timeout_s` (10 minutes by default) only bounds how
+  long a waiter blocks on a *live* holder — a genuinely wedged download, or a
+  filesystem where OS-level locking is unreliable.
 - **Cancellation propagates.** MCP servers cancel in-flight requests routinely.
   `_one` wraps each stage in a broad `except Exception`, which does not catch
   `CancelledError` (a `BaseException`), so cancelling a fan-out cancels the
@@ -911,9 +925,10 @@ answers cross an untrusted network.
 ## Out of scope (for this task)
 - The MCP server itself (design keeps the surface compatible).
 - Full `TransportFastQuery` implementation (stub only).
-- Windows containers, rootless-podman quirks, and publishing our own
-  qna-preloaded images to a registry (noted for `TransportContainer`
-  follow-ups).
+- Windows containers, and publishing our own qna-preloaded images to a
+  registry (noted for `TransportContainer` follow-ups). podman is supported
+  via `PodmanEngine`/`--engine podman`; niche rootless-podman configurations
+  beyond the default per-user socket are still unverified.
 - AIX / Solaris / ppc64le / s390x bootstraps (start with macOS + Windows +
   Debian/Ubuntu; the rest are mechanical follow-ups against the existing
   shell scripts).

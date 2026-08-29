@@ -17,6 +17,7 @@ enforced here rather than left to convention.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import sys
@@ -25,7 +26,7 @@ from typing import Annotated
 
 import typer
 
-from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
+from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS, host_arch
 from bigfix_remote_client_relevance.inventory import (
     InventoryError,
     load_inventory,
@@ -299,7 +300,28 @@ def evaluate(
             ),
         ),
     ] = None,
-    arch: Annotated[str, typer.Option("--arch", help="Target architecture.")] = "x86_64",
+    arch: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--arch",
+            help=(
+                "Target architecture. Repeatable, to evaluate multiple "
+                "architectures in one run (e.g. on Apple Silicon, which can "
+                "run amd64 and arm64 containers simultaneously). Defaults to "
+                "this host's own architecture."
+            ),
+        ),
+    ] = None,
+    engine: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help=(
+                "Container engine: auto (default, prefers docker and falls "
+                "back to podman), docker, or podman."
+            ),
+        ),
+    ] = "auto",
     platform: Annotated[
         str | None,
         typer.Option(
@@ -375,6 +397,7 @@ def evaluate(
     args = args or []
     qna_version = qna_version or []
     container = container or []
+    arch_list = arch or [host_arch()]
 
     # --container and --inventory compose: a fleet plus an ad-hoc image is a
     # normal thing to want. --local is still on its own.
@@ -387,6 +410,12 @@ def evaluate(
 
     if rebuild_image and not container:
         _fail("--rebuild-image only applies to --container targets")
+
+    if len(arch_list) > 1 and not container:
+        _fail("--arch is only repeatable for --container targets")
+
+    if engine not in ("auto", "docker", "podman"):
+        _fail(f"unknown engine {engine!r}; known: auto, docker, podman")
 
     if diff and (as_json or as_jsonl):
         # --json is one schema, a flat array of results, and it is the future
@@ -439,14 +468,15 @@ def evaluate(
     targets.extend(
         Target(
             kind="container",
-            name=image,
+            name=image if len(arch_list) == 1 else f"{image}@{target_arch}",
             image=image,
-            arch=arch,
+            arch=target_arch,
+            engine=engine,
             platform=platform,
             rebuild_image=rebuild_image,
             auto_setup=auto_setup,
         )
-        for image in container
+        for image, target_arch in itertools.product(container, arch_list)
     )
     if local:
         # `become` stays whatever the caller passed (True/False/unspecified);
