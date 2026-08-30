@@ -1360,7 +1360,14 @@ class FakeDockerClient:
         return True
 
 
-def engine_with(client: FakeDockerClient):
+def engine_with(client: object):
+    """Build a DockerEngine over a fake client.
+
+    Typed as `object`, matching DockerEngine's own `client` parameter: these
+    fakes implement only the slice of the SDK the call under test touches
+    (FakeDockerClient covers images, FakeContainerClient covers containers),
+    so no one fake satisfies the whole surface.
+    """
     from bigfix_remote_client_relevance.transports.container import DockerEngine
 
     return DockerEngine(client=client)
