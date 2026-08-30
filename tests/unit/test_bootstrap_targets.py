@@ -55,7 +55,7 @@ def test_macos_prereqs_are_stock_tools():
 # --- Debian family ---------------------------------------------------------
 
 
-@pytest.mark.parametrize("target", ["ubuntu", "debian"])
+@pytest.mark.parametrize("target", ["ubuntu", "debian", "raspbian"])
 def test_deb_family_extracts_with_dpkg_deb(target):
     spec = spec_for(target)
     joined = " ; ".join(spec.extract_commands("/tmp/a.deb", "/tmp/dest"))
@@ -133,6 +133,10 @@ def test_windows_non_admin_root_is_under_user_temp():
         ("Darwin", "macos"),
         ("Linux\nubuntu debian", "ubuntu"),
         ("Linux\ndebian", "debian"),
+        # Raspberry Pi OS reports ID=raspbian, ID_LIKE=debian -- must not
+        # fold into plain "debian", since raspbian has its own bootstrap
+        # spec (and its own agent build, matched regardless of arch).
+        ("Linux\nraspbian debian", "raspbian"),
         ("Linux\nrhel fedora", "rhel"),
         ("Linux\ncentos rhel fedora", "rhel"),
         ("Linux\nopensuse-leap suse", "suse"),

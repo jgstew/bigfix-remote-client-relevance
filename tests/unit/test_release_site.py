@@ -139,6 +139,65 @@ def test_rhel_uses_the_x86_64_rpm(fetch):
     assert "x86_64" in artifact.filename
 
 
+def test_rhel_arm64_uses_the_amazon_linux_named_rpm(fetch):
+    """BigFix ships the rhel-family arm64 client under an Amazon Linux
+    filename (`al2.aarch64.rpm`) -- officially supported only there, but a
+    plain rpm that runs on any rhel-family arm64 host, so it belongs under
+    the `rhel` platform rather than a separate one."""
+    artifact = artifact_for("11.0.6.137", platform="rhel", arch="arm64", fetch=fetch)
+
+    assert artifact.filename == "BESAgent-11.0.6.137-al2.aarch64.rpm"
+
+
+# --- raspbian: one build, any requested arch maps onto it -----------------
+
+
+@pytest.mark.parametrize("arch", ["armhf", "arm64", "aarch64", "x86_64"])
+def test_raspbian_resolves_its_one_build_regardless_of_requested_arch(fetch, arch):
+    """raspbian ships exactly one architecture -- unlike every other platform,
+    an arbitrary requested arch must still map onto that build rather than
+    fail to match a suffix the filename never carries."""
+    artifact = artifact_for("11.0.6.137", platform="raspbian", arch=arch, fetch=fetch)
+
+    assert artifact.filename == "BESAgent-11.0.6.137-raspbian10.armhf.deb"
+
+
+# --- the raspbian armhf deb as an arm64 stand-in for debian/ubuntu ---------
+#
+# Neither publishes a native arm64 build. The raspbian armhf (32-bit ARM) deb
+# is the only thing that runs on an arm64 host at all, via the kernel's
+# 32-bit ARM userspace compat -- a cross-arch substitution, unlike the rhel
+# case above where the filename genuinely is a 64-bit arm64 build.
+
+
+def test_debian_arm64_falls_back_to_the_raspbian_armhf_deb(fetch):
+    artifact = artifact_for("11.0.6.137", platform="debian", arch="arm64", fetch=fetch)
+
+    assert artifact.filename == "BESAgent-11.0.6.137-raspbian10.armhf.deb"
+
+
+def test_ubuntu_arm64_falls_back_to_the_raspbian_armhf_deb(fetch):
+    artifact = artifact_for("11.0.6.137", platform="ubuntu", arch="arm64", fetch=fetch)
+
+    assert artifact.filename == "BESAgent-11.0.6.137-raspbian10.armhf.deb"
+
+
+def test_aarch64_spelling_also_triggers_the_raspbian_fallback(fetch):
+    """The fallback is keyed off the normalized arch, not the literal string."""
+    artifact = artifact_for("11.0.6.137", platform="ubuntu", arch="aarch64", fetch=fetch)
+
+    assert artifact.filename == "BESAgent-11.0.6.137-raspbian10.armhf.deb"
+
+
+def test_the_raspbian_fallback_never_leaks_into_an_x86_64_request(fetch):
+    """The fallback pattern is a fixed literal with no {arch_deb} placeholder
+    -- it must only be added as a candidate for arm64, or it would silently
+    win an x86_64 lookup too if page order ever put it first."""
+    artifact = artifact_for("11.0.6.137", platform="ubuntu", arch="x86_64", fetch=fetch)
+
+    assert "raspbian" not in artifact.filename
+
+
 def test_artifact_carries_published_sha256(fetch):
     artifact = artifact_for("11.0.6.137", platform="macos", arch="arm64", fetch=fetch)
 

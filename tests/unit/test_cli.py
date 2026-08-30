@@ -10,6 +10,7 @@ The orchestrator is stubbed throughout; no transport is ever constructed here.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from typer.testing import CliRunner
@@ -71,6 +72,46 @@ def _patch_orchestrator(monkeypatch, fake_evaluate):
 
 def invoke(*args):
     return runner.invoke(cli_module.app, list(args))
+
+
+# --- default logging: progress visible without -v ---------------------------
+#
+# Every slow first-time operation (a qna download, an image pull, an image
+# being prepped) already logs its own start/finish at INFO -- with no flags,
+# a first run used to look hung for however long that took, with nothing on
+# stderr to say otherwise.
+
+
+def _package_logger_level() -> int:
+    return logging.getLogger("bigfix_remote_client_relevance").level
+
+
+def test_default_verbosity_shows_progress_by_default(captured):
+    result = invoke("--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert _package_logger_level() == logging.INFO
+
+
+def test_quiet_flag_restores_the_old_warnings_only_silence(captured):
+    result = invoke("--quiet", "--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert _package_logger_level() == logging.WARNING
+
+
+def test_verbose_flag_still_reaches_debug(captured):
+    result = invoke("-v", "--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert _package_logger_level() == logging.DEBUG
+
+
+def test_quiet_overrides_verbose_when_both_are_given(captured):
+    result = invoke("--quiet", "-v", "--local", "true")
+
+    assert result.exit_code == 0, result.output
+    assert _package_logger_level() == logging.WARNING
 
 
 # --- target selection ------------------------------------------------------

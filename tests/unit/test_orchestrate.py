@@ -600,6 +600,22 @@ async def test_a_failed_reprobe_never_masks_the_original_error():
     assert results[0].platform == "ubuntu", "unchanged: the reprobe attempt itself failed"
 
 
+def test_container_label_shows_the_effective_arch_not_none():
+    """An inventory container host with no `arch` line leaves Target.arch
+    None (it is the transports that fall back to x86_64), so the label -- the
+    `host` field every failure is reported under -- must show the arch that
+    was actually used, never a bare "None"."""
+    target = Target(kind="container", name="almalinux:9", image="almalinux:9")
+
+    assert target.label == "container:almalinux:9@x86_64"
+
+
+def test_container_label_still_shows_an_explicit_arch():
+    target = Target(kind="container", name="alma", image="almalinux:9", arch="arm64")
+
+    assert target.label == "container:almalinux:9@arm64"
+
+
 def test_default_factory_no_longer_defaults_containers_to_ubuntu():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 

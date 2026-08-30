@@ -42,6 +42,12 @@ def link_failure(soname: str) -> str:
     )
 
 
+def qemu_interpreter_failure(interpreter_path: str) -> str:
+    """qemu-user's message when a foreign-arch ELF interpreter is missing, as
+    captured running the raspbian armhf agent under an arm64 debian:12."""
+    return f"qemu-arm: Could not open '{interpreter_path}': No such file or directory"
+
+
 @dataclass
 class FakeEngine:
     """Records container lifecycle and answers commands by regex."""
@@ -60,6 +66,15 @@ class FakeEngine:
     # Sonames the image is missing; a successful install consumes one, so a
     # list of two models "fixing one library reveals the next".
     missing_libs: list[str] = field(default_factory=list)
+    # The foreign-arch ELF interpreter the image is missing (e.g.
+    # "/lib/ld-linux-armhf.so.3"), or None once the whole-architecture fix
+    # (dpkg --add-architecture + install) has landed. A field rather than a
+    # list like missing_libs: only one interpreter is ever missing at once,
+    # unlike a chain of shared-library dependencies.
+    missing_interpreter: str | None = None
+    # Set once `dpkg --add-architecture` runs; from then on a native package
+    # no longer satisfies the (foreign-architecture) binary.
+    foreign_arch_enabled: bool = False
     package_manager: str = "dnf"
     install_exit_code: int = 0
     installs: list[str] = field(default_factory=list)
@@ -71,16 +86,32 @@ class FakeEngine:
             return (self.package_manager, "", 0)
         if " install " in command or "apt-get update" in command:
             self.installs.append(command)
-            if self.install_exit_code == 0 and "update" not in command and self.missing_libs:
-                self.missing_libs.pop(0)
+            if "add-architecture" in command:
+                self.foreign_arch_enabled = True
+            if self.install_exit_code == 0 and " install " in command:
+                if self.missing_interpreter is not None:
+                    # Only the foreign-arch libc provides the interpreter.
+                    if ":armhf" in command:
+                        self.missing_interpreter = None
+                elif self.missing_libs and (
+                    # Once the binary is known to be a foreign architecture,
+                    # only a foreign-arch package actually satisfies it --
+                    # installing the native one changes nothing, which is the
+                    # whole failure this models.
+                    not self.foreign_arch_enabled or ":armhf" in command
+                ):
+                    self.missing_libs.pop(0)
             return (
                 "",
                 "" if self.install_exit_code == 0 else "No match for argument",
                 self.install_exit_code,
             )
-        # Any attempt to run qna fails while a library is missing — the build's
-        # link probe and the evaluation alike. Must precede the regex table,
-        # since both carry -showtypes and would otherwise match EVAL_OK.
+        # Any attempt to run qna fails while something is missing — the
+        # build's link probe and the evaluation alike. Must precede the regex
+        # table, since both carry -showtypes and would otherwise match
+        # EVAL_OK.
+        if "-showtypes" in command and self.missing_interpreter:
+            return ("", qemu_interpreter_failure(self.missing_interpreter), 127)
         if "-showtypes" in command and self.missing_libs:
             return ("", link_failure(self.missing_libs[0]), 127)
         if "< /dev/null" in command:
@@ -90,8 +121,15 @@ class FakeEngine:
                 return response
         return self.default
 
-    async def ensure_image(self, image: str, *, platform: str | None = None) -> None:
+    # Set to simulate DockerEngine.ensure_image's real return value -- a
+    # local alias distinct from the upstream image -- so tests can prove
+    # TransportContainer actually uses it rather than falling straight back
+    # to self.image everywhere.
+    resolved_image: str | None = None
+
+    async def ensure_image(self, image: str, *, platform: str | None = None) -> str:
         self.pulled.append(image)
+        return self.resolved_image or image
 
     async def image_digest(self, image: str) -> str:
         return self.digest
@@ -875,6 +913,109 @@ async def test_a_linkable_image_installs_nothing(resolved, extracted):
     assert len(engine.committed) == 1
 
 
+# --- installing a missing foreign architecture (raspbian-on-arm64) -------------
+#
+# Running the raspbian armhf (32-bit ARM) agent under an arm64 Debian/Ubuntu
+# container needs a whole architecture enabled, not one library -- a
+# different remediation shape from the soname case above (dpkg
+# --add-architecture + install, not just install).
+
+
+async def test_a_missing_interpreter_is_fixed_by_enabling_the_foreign_arch(resolved, extracted):
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, EVAL_OK],
+        missing_interpreter="/lib/ld-linux-armhf.so.3",
+        package_manager="apt-get",
+    )
+
+    result = await TransportContainer(
+        "debian:12", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert any("dpkg --add-architecture armhf" in c for c in engine.installs)
+    assert any("libc6:armhf" in c for c in engine.installs)
+    assert len(engine.committed) == 1
+    assert result.error_kind is None
+
+
+async def test_an_unmapped_interpreter_is_reported_not_guessed(resolved, extracted):
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, EVAL_OK],
+        missing_interpreter="/lib/ld-linux-riscv64-lp64d.so.1",
+        package_manager="apt-get",
+    )
+
+    result = await TransportContainer(
+        "debian:12", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs == []
+    assert engine.committed == []
+    assert "ld-linux-riscv64-lp64d.so.1" in (result.error or "")
+
+
+async def test_a_missing_interpreter_on_an_rpm_family_image_is_refused(resolved, extracted):
+    """dpkg --add-architecture is a deb-family mechanism; there is nothing to
+    fall back to on rpm-family images, so this must refuse rather than try
+    dnf/yum against a foreign-arch package name they don't understand."""
+    engine = FakeEngine(
+        responses=[PROBE_ALMA, EVAL_OK], missing_interpreter="/lib/ld-linux-armhf.so.3"
+    )
+
+    result = await TransportContainer(
+        "rockylinux:9", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs == []
+    assert engine.committed == []
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+
+
+async def test_libraries_needed_after_a_foreign_arch_switch_use_that_arch(resolved, extracted):
+    """The gap that made this whole path useless in practice: enabling armhf
+    and installing libc6:armhf gets qna far enough to report its *next*
+    missing library -- which is also armhf. Installing the native package for
+    it changes nothing, the probe reports the same soname again, and the
+    build gives up and discards the container, so the evaluation runs against
+    a pristine image and reports the original interpreter error."""
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, EVAL_OK],
+        missing_interpreter="/lib/ld-linux-armhf.so.3",
+        missing_libs=["libstdc++.so.6"],
+        package_manager="apt-get",
+    )
+
+    result = await TransportContainer(
+        "ubuntu:24.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert any("libc6:armhf" in c for c in engine.installs)
+    assert any("libstdc++6:armhf" in c for c in engine.installs), (
+        "the follow-up library must be installed for armhf, not the native arch"
+    )
+    assert not any("libstdc++6 " in c for c in engine.installs), (
+        "the native package would not satisfy an armhf binary"
+    )
+    assert len(engine.committed) == 1, "the prepared image must actually be usable"
+    assert result.error_kind is None
+
+
+async def test_no_auto_setup_installs_nothing_for_a_missing_interpreter(resolved, extracted):
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, EVAL_OK],
+        missing_interpreter="/lib/ld-linux-armhf.so.3",
+        package_manager="apt-get",
+    )
+
+    result = await TransportContainer(
+        "debian:12", engine=engine, extractor=extracted, auto_setup=False
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.installs == []
+    assert engine.committed == []
+    assert "ld-linux-armhf.so.3" in (result.error or "")
+
+
 # --- emulation is never silent -------------------------------------------------
 #
 # The release site publishes no arm64 agent for any platform this tool targets,
@@ -1086,31 +1227,128 @@ async def test_a_transport_without_a_coordinator_still_works(resolved, extracted
     assert len(engine.committed) == 1
 
 
+# --- using the resolved (aliased) image, not the bare upstream tag ------------
+#
+# ensure_image returns the reference to actually use -- a local alias tag
+# when DockerEngine had to disambiguate a platform (see _local_pull_tag) --
+# and every later operation on this image must use it, or the whole point of
+# aliasing (surviving a concurrent pull of the same tag at another platform)
+# is lost the moment anything falls back to self.image.
+
+
+async def test_one_shot_eval_runs_the_resolved_image_not_the_bare_tag():
+    engine = FakeEngine(responses=[EVAL_OK])
+    engine.resolved_image = "bfrcr/base:deadbeef"
+
+    await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance("true")
+
+    assert engine.one_shots[-1]["image"] == "bfrcr/base:deadbeef"
+    assert engine.pulled == ["ubuntu:22.04"], "the upstream image is still what gets pulled"
+
+
+async def test_keep_alive_container_starts_the_resolved_image():
+    engine = FakeEngine(responses=[EVAL_OK])
+    engine.resolved_image = "bfrcr/base:deadbeef"
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, keep_alive=True
+    ).evaluate_client_relevance("true")
+
+    assert engine.started[0]["image"] == "bfrcr/base:deadbeef"
+
+
+async def test_platform_probe_runs_against_the_resolved_image(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+    engine.resolved_image = "bfrcr/base:deadbeef"
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    probes = [c for c in engine.one_shots if "os-release" in str(c["command"])]
+    assert probes and probes[0]["image"] == "bfrcr/base:deadbeef"
+
+
+async def test_prepared_image_build_digests_and_starts_the_resolved_image(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+    engine.resolved_image = "bfrcr/base:deadbeef"
+
+    await TransportContainer(
+        "ubuntu:22.04", engine=engine, extractor=extracted
+    ).evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.started[0]["image"] == "bfrcr/base:deadbeef", (
+        "the build container must start from the resolved image"
+    )
+
+
 # --- image architecture ------------------------------------------------------
 
 
 @dataclass
 class FakeImage:
     attrs: dict[str, object]
+    id: str = "sha256:fakeimagedigest"
+    tags_created: list[str] = field(default_factory=list)
+
+    def tag(self, repository: str, tag: str | None = None) -> bool:
+        """Overridden per-instance by FakeDockerClient.pull() so a tag
+        actually registers under client._existing, the way the real SDK's
+        Image.tag() registers a new local reference with the daemon."""
+        raise AssertionError("tag() called on an image FakeDockerClient never pulled")
 
 
 class FakeDockerClient:
-    """Just enough of the docker SDK to drive ensure_image."""
+    """Just enough of the docker SDK to drive ensure_image.
 
-    def __init__(self, existing: FakeImage | None = None) -> None:
+    Keyed by name (a real Docker daemon has exactly one image per tag), so a
+    ``pull`` for one platform can be made to repoint the same upstream tag a
+    concurrent ``pull`` for a different platform is also using -- the exact
+    race ``ensure_image``'s local aliasing has to survive.
+    """
+
+    def __init__(
+        self,
+        existing: dict[str, FakeImage] | None = None,
+        *,
+        pull_result: FakeImage | None = None,
+    ) -> None:
         self.images = self
-        self.existing = existing
+        self._existing = dict(existing or {})
         self.pulled: list[dict[str, object]] = []
+        self._pull_result = pull_result or FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})
 
     def get(self, image: str) -> FakeImage:
         import docker.errors
 
-        if self.existing is None:
-            raise docker.errors.ImageNotFound(image)
-        return self.existing
+        try:
+            return self._existing[image]
+        except KeyError:
+            raise docker.errors.ImageNotFound(image) from None
 
-    def pull(self, image: str, platform: str | None = None) -> None:
+    def pull(self, image: str, platform: str | None = None) -> FakeImage:
         self.pulled.append({"image": image, "platform": platform})
+        # The real SDK returns the pulled Image directly -- independent of
+        # whatever the upstream tag ends up pointing at afterward, which is
+        # exactly what lets ensure_image alias it safely regardless of a
+        # concurrent pull for another platform repointing the same tag.
+        pulled = self._pull_result
+        self._existing[image] = pulled
+
+        client = self
+
+        def _tag(repository: str, tag: str | None = None) -> bool:
+            # The real Image.tag() registers a new local reference with the
+            # daemon -- keyed by the pulled image's own identity, not by
+            # re-reading `image` off self._existing (which may already have
+            # been repointed by a concurrent pull for another platform).
+            full = f"{repository}:{tag}" if tag else repository
+            pulled.tags_created.append(full)
+            client._existing[full] = pulled
+            return True
+
+        pulled.tag = _tag  # type: ignore[method-assign]
+        return pulled
 
     def ping(self) -> bool:
         return True
@@ -1122,21 +1360,255 @@ def engine_with(client: FakeDockerClient):
     return DockerEngine(client=client)
 
 
-async def test_ensure_image_repulls_on_architecture_mismatch():
-    """A cached arm64 image satisfies images.get, then creation 404s on amd64."""
-    client = FakeDockerClient(FakeImage(attrs={"Architecture": "arm64", "Os": "linux"}))
+async def test_ensure_image_without_a_platform_behaves_as_before():
+    """No platform means nothing to disambiguate -- no aliasing, plain pull."""
+    client = FakeDockerClient()
+
+    resolved = await engine_with(client).ensure_image("ubuntu:24.04")
+
+    assert resolved == "ubuntu:24.04"
+    assert client.pulled == [{"image": "ubuntu:24.04", "platform": None}]
+
+
+async def test_ensure_image_does_not_pull_when_already_cached_for_that_platform():
+    client = FakeDockerClient()
+    engine = engine_with(client)
+    first = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+    client.pulled.clear()
+
+    second = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled == [], "the local alias from the first call must be reused"
+    assert second == first
+
+
+async def test_ensure_image_gives_each_platform_a_distinct_local_alias():
+    """The whole point: two platforms of the same tag must not collide."""
+    client = FakeDockerClient()
+    engine = engine_with(client)
+
+    amd64 = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+    arm64 = await engine.ensure_image("ubuntu:24.04", platform="linux/arm64")
+
+    assert amd64 != arm64
+    assert amd64 != "ubuntu:24.04"
+    assert arm64 != "ubuntu:24.04"
+
+
+async def test_ensure_image_survives_a_concurrent_repoint_of_the_shared_tag():
+    """The regression this exists for: pulling the same upstream tag at two
+    platforms must not let whichever pull finishes last steal the other's
+    alias, even though both share Docker's one mutable tag pointer."""
+    amd64_image = FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})
+    arm64_image = FakeImage(attrs={"Os": "linux", "Architecture": "arm64"})
+    client = FakeDockerClient(pull_result=amd64_image)
+    engine = engine_with(client)
+
+    amd64_tag = await engine.ensure_image("debian:12", platform="linux/amd64")
+
+    # Simulates a concurrent pull for arm64 repointing the shared upstream
+    # tag *after* the amd64 alias was already created above.
+    client._pull_result = arm64_image
+    arm64_tag = await engine.ensure_image("debian:12", platform="linux/arm64")
+
+    # Both aliases must still resolve to the image actually pulled for them,
+    # regardless of what the shared "debian:12" tag points to by now.
+    assert _image_attrs(client.get(amd64_tag)) == {"Os": "linux", "Architecture": "amd64"}
+    assert _image_attrs(client.get(arm64_tag)) == {"Os": "linux", "Architecture": "arm64"}
+
+
+def _image_attrs(image: FakeImage) -> dict[str, object]:
+    return image.attrs
+
+
+async def test_ensure_image_repulls_when_the_local_alias_is_the_wrong_architecture():
+    """Defensive: the alias is keyed deterministically by (image, platform),
+    so this should never happen organically, but a corrupted or manually
+    retagged local image must not be trusted silently."""
+    client = FakeDockerClient(pull_result=FakeImage(attrs={"Os": "linux", "Architecture": "amd64"}))
+    engine = engine_with(client)
+    amd64_tag = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+    # Corrupt it: the alias this next call looks up now claims the wrong arch.
+    client._existing[amd64_tag] = FakeImage(attrs={"Os": "linux", "Architecture": "arm64"})
+    client.pulled.clear()
+
+    resolved = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled, "a mismatched alias must be re-pulled, not trusted"
+    assert _image_attrs(client.get(resolved)) == {"Os": "linux", "Architecture": "amd64"}
+
+
+# --- transient daemon faults are retried, not fatal --------------------------
+#
+# Docker Desktop intermittently answers with a 5xx under concurrent container
+# churn -- the identical call succeeds moments later (confirmed live: an
+# inspect that 500'd mid-run succeeded immediately afterward). Treating those
+# as fatal failed whole targets; treating a failed *removal* as fatal leaked
+# the container, so every later run faced a busier daemon and failed more.
+
+
+def api_error(status: int = 500) -> Exception:
+    """A docker APIError carrying a real status code, as the daemon sends."""
+    import docker.errors
+    import requests
+
+    response = requests.Response()
+    response.status_code = status
+    return docker.errors.APIError(f"{status} Server Error", response=response)
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Retry without the real sleep, so these stay fast."""
+    from bigfix_remote_client_relevance.transports import container as container_module
+
+    monkeypatch.setattr(container_module, "_TRANSIENT_BACKOFF_S", 0)
+
+
+async def test_a_transient_inspect_failure_is_retried_rather_than_failing(no_backoff):
+    """A cached alias that 500s once must be found on the retry -- not
+    re-pulled, which would spend minutes on a fault that clears in under a
+    second."""
+    from bigfix_remote_client_relevance.transports.container import _local_pull_tag
+
+    alias = _local_pull_tag("ubuntu:24.04", "linux/amd64")
+    assert alias is not None
+    client = FakeDockerClient(
+        existing={alias: FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})}
+    )
+    calls = {"n": 0}
+    real_get = client.get
+
+    def flaky_get(image: str) -> FakeImage:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise api_error(500)
+        return real_get(image)
+
+    client.get = flaky_get  # type: ignore[method-assign]
+
+    resolved = await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert calls["n"] == 2, "the 500 must be retried, not surfaced"
+    assert client.pulled == [], "a retry that succeeds must not also re-pull"
+    assert resolved == alias
+
+
+async def test_a_persistent_daemon_fault_still_fails_rather_than_retrying_forever(no_backoff):
+    client = FakeDockerClient()
+
+    def always_500(image: str) -> FakeImage:
+        raise api_error(500)
+
+    client.get = always_500  # type: ignore[method-assign]
+
+    with pytest.raises(ContainerEngineError):
+        await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+
+async def test_a_404_is_never_retried(no_backoff):
+    """ImageNotFound is a real answer about what exists, not a fault -- so a
+    legitimate cache miss must not pay the retry delay."""
+    client = FakeDockerClient()
+    calls = {"n": 0}
+    real_get = client.get
+
+    def counting_get(image: str) -> FakeImage:
+        calls["n"] += 1
+        return real_get(image)
+
+    client.get = counting_get  # type: ignore[method-assign]
 
     await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
 
-    assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/amd64"}]
+    assert calls["n"] == 1, "a 404 means absent; retrying it just wastes time"
+    assert client.pulled, "and it must pull, as before"
 
 
-async def test_ensure_image_does_not_pull_when_the_architecture_matches():
-    client = FakeDockerClient(FakeImage(attrs={"Architecture": "amd64", "Os": "linux"}))
+async def test_image_digest_survives_a_transient_fault(no_backoff):
+    client = FakeDockerClient(existing={"bfrcr/base:x": FakeImage(attrs={})})
+    calls = {"n": 0}
+    real_get = client.get
 
-    await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+    def flaky_get(image: str) -> FakeImage:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise api_error(500)
+        return real_get(image)
 
-    assert client.pulled == []
+    client.get = flaky_get  # type: ignore[method-assign]
+
+    digest = await engine_with(client).image_digest("bfrcr/base:x")
+
+    assert digest, "a transient 500 inspecting the alias must not fail the target"
+
+
+async def test_image_exists_survives_a_transient_fault(no_backoff):
+    client = FakeDockerClient(existing={"bfrcr/base:x": FakeImage(attrs={})})
+    calls = {"n": 0}
+    real_get = client.get
+
+    def flaky_get(image: str) -> FakeImage:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise api_error(500)
+        return real_get(image)
+
+    client.get = flaky_get  # type: ignore[method-assign]
+
+    assert await engine_with(client).image_exists("bfrcr/base:x") is True
+
+
+# --- a container that fails to remove is a leak, and leaks compound ----------
+
+
+class FakeRemovableContainer:
+    def __init__(self, container_id: str, *, fail_removes: int = 0) -> None:
+        self.id = container_id
+        self.removed = False
+        self.remove_attempts = 0
+        self._fail_removes = fail_removes
+
+    def remove(self, force: bool = False) -> None:
+        self.remove_attempts += 1
+        if self.remove_attempts <= self._fail_removes:
+            raise api_error(500)
+        self.removed = True
+
+
+class FakeContainerClient:
+    """Just enough of the docker SDK to drive stop()."""
+
+    def __init__(self, container: FakeRemovableContainer) -> None:
+        self.containers = self
+        self._container = container
+
+    def get(self, container_id: str) -> FakeRemovableContainer:
+        return self._container
+
+    def ping(self) -> bool:
+        return True
+
+
+async def test_a_transient_removal_failure_is_retried_so_nothing_leaks(no_backoff):
+    """The feedback loop this closes: a leaked container makes the daemon
+    busier, which makes the next removal likelier to fail, and so on."""
+    container = FakeRemovableContainer("abc123", fail_removes=1)
+
+    await engine_with(FakeContainerClient(container)).stop("abc123")
+
+    assert container.removed, "a transient 500 must not strand the container"
+    assert container.remove_attempts == 2
+
+
+async def test_a_container_that_truly_cannot_be_removed_is_still_reported(no_backoff, caplog):
+    container = FakeRemovableContainer("abc123", fail_removes=99)
+
+    with caplog.at_level(logging.WARNING, logger=CONTAINER_LOGGER):
+        await engine_with(FakeContainerClient(container)).stop("abc123")
+
+    assert not container.removed
+    assert any("abc123" in record.message for record in caplog.records)
 
 
 # --- keep-alive ------------------------------------------------------------
@@ -1448,7 +1920,7 @@ async def test_podman_engine_behaves_like_docker_engine_for_ensure_image():
     """Inheritance from DockerEngine, not reimplementation, is the whole point."""
     from bigfix_remote_client_relevance.transports.container import PodmanEngine
 
-    client = FakeDockerClient(FakeImage(attrs={"Architecture": "arm64", "Os": "linux"}))
+    client = FakeDockerClient()
     engine = PodmanEngine(client=client)
 
     await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")

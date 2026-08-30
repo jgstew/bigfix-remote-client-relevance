@@ -38,6 +38,13 @@ _PATCH_HREF = re.compile(r"^(\d+\.\d+)/patch(\d+)/?$")
 # consult this, so pinned runs work offline once the artifact is cached.
 STREAM_CACHE_TTL_S = 24 * 60 * 60
 
+# raspbian ships exactly one architecture, regardless of what's requested --
+# there is no separate arm64/x86_64 build to pick between, just this armhf
+# (32-bit ARM) one. Kept as its own constant (rather than inlined below)
+# because it's reused again further down as the arm64 fallback for
+# ubuntu/debian, which has the same "only one real option" shape.
+_RASPBIAN_ARMHF_PATTERN = r"^BESAgent-[\d.]+-raspbian\d+\.armhf\.deb$"
+
 # Selects the agent artifact for a target. Windows is the one platform with a
 # standalone QnA download; everywhere else qna is extracted out of the agent
 # package without installing it.
@@ -46,15 +53,35 @@ _PLATFORM_PATTERNS: dict[str, tuple[str, ...]] = {
     "macos": (r"^BESAgent-[\d.]+-BigFix_MacOS.*\.pkg$",),
     "ubuntu": (r"^BESAgent-[\d.]+-ubuntu\d+\.{arch_deb}\.deb$",),
     "debian": (r"^BESAgent-[\d.]+-debian\d+\.{arch_deb}\.deb$",),
-    "raspbian": (r"^BESAgent-[\d.]+-raspbian\d+\.{arch_deb}\.deb$",),
-    "rhel": (r"^BESAgent-[\d.]+-rhe\d+\.{arch_rpm}\.rpm$",),
+    # Not templated by {arch_deb}: whatever arch is requested maps onto the
+    # one build that exists, rather than failing to match an arm64/x86_64
+    # suffix that this filename never actually carries.
+    "raspbian": (_RASPBIAN_ARMHF_PATTERN,),
+    "rhel": (
+        r"^BESAgent-[\d.]+-rhe\d+\.{arch_rpm}\.rpm$",
+        # arm64 ships under an Amazon Linux-named build (BigFix officially
+        # supports it only there), but it's a plain rpm that runs on any
+        # rhel-family arm64 host -- not something worth its own platform.
+        r"^BESAgent-[\d.]+-al\d+\.{arch_rpm}\.rpm$",
+    ),
     "suse": (r"^BESAgent-[\d.]+-sle\d+\.{arch_rpm}\.rpm$",),
-    "amazonlinux": (r"^BESAgent-[\d.]+-al\d+\.{arch_rpm}\.rpm$",),
 }
 
 # Debian and rpm families spell the same architectures differently.
 _ARCH_DEB = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm64"}
 _ARCH_RPM = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}
+
+# Neither Debian nor Ubuntu publishes a native arm64 build -- the raspbian
+# armhf deb (a 32-bit ARM package) is the only thing that runs on an arm64
+# host at all, via the kernel's 32-bit ARM userspace compat. Unlike the rhel
+# arm64 case above, this is a genuine cross-arch substitution (32-bit
+# standing in for a 64-bit request), not just a different distro's naming for
+# the same arch -- so it can't go through the {arch_deb}/{arch_rpm}
+# templating above, which assumes the filename's arch matches the request.
+# It generically works for Debian; on Ubuntu it mostly works but with some
+# rough edges -- still better than refusing outright, since there is no other
+# option today.
+_ARM64_RASPBIAN_FALLBACK_PLATFORMS = frozenset({"ubuntu", "debian"})
 
 
 class ResolveError(BigFixRelevanceError):
@@ -346,6 +373,12 @@ def artifact_for(
         )
         for p in patterns
     ]
+
+    if platform in _ARM64_RASPBIAN_FALLBACK_PLATFORMS and _ARCH_DEB.get(arch) == "arm64":
+        logger.debug(
+            "no native %s/arm64 build exists -- falling back to the raspbian armhf deb", platform
+        )
+        compiled.append(re.compile(_RASPBIAN_ARMHF_PATTERN))
 
     for filename, url in links.items():
         if full_version not in filename:

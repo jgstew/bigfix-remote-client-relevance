@@ -180,3 +180,90 @@ def test_an_unknown_manager_is_an_error_not_a_guess():
 
     with pytest.raises(ValueError, match="brew"):
         install_command("brew", "dbus-libs")
+
+
+# --- missing foreign-arch interpreter (raspbian-on-arm64) -------------------
+#
+# A whole missing architecture, not one dependency: running the raspbian
+# armhf (32-bit ARM) agent under an arm64 Debian/Ubuntu container needs
+# 32-bit ARM userspace enabled at all. qemu-user's message when the ELF
+# interpreter itself is absent is a different shape than the dynamic
+# linker's "cannot open shared object file" -- confirmed live against
+# debian:12 (arm64) running the raspbian-fallback agent.
+
+QEMU_ARMHF_STDERR = "qemu-arm: Could not open '/lib/ld-linux-armhf.so.3': No such file or directory"
+
+
+def test_parses_the_missing_interpreter_path():
+    from bigfix_remote_client_relevance.transports.container_libs import missing_arm_interpreter
+
+    assert missing_arm_interpreter(QEMU_ARMHF_STDERR) == "/lib/ld-linux-armhf.so.3"
+
+
+def test_a_missing_shared_library_is_not_a_missing_interpreter():
+    """The two detectors must not both fire on the same message."""
+    from bigfix_remote_client_relevance.transports.container_libs import missing_arm_interpreter
+
+    assert missing_arm_interpreter(ROCKY_STDERR) is None
+
+
+def test_a_missing_interpreter_is_not_a_missing_shared_library():
+    assert missing_shared_library(QEMU_ARMHF_STDERR) is None
+
+
+def test_empty_stderr_is_not_a_missing_interpreter():
+    from bigfix_remote_client_relevance.transports.container_libs import missing_arm_interpreter
+
+    assert missing_arm_interpreter("") is None
+
+
+def test_a_plain_no_such_file_is_not_a_missing_interpreter():
+    """Same overlap risk as missing_shared_library: qemu's message also ends
+    in "No such file or directory"."""
+    from bigfix_remote_client_relevance.transports.container_libs import missing_arm_interpreter
+
+    assert missing_arm_interpreter("sh: /opt/qna: No such file or directory") is None
+
+
+def test_armhf_interpreter_maps_to_its_dpkg_arch_and_package():
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        foreign_arch_package_for_interpreter,
+    )
+
+    assert foreign_arch_package_for_interpreter("/lib/ld-linux-armhf.so.3") == (
+        "armhf",
+        "libc6:armhf",
+    )
+
+
+def test_an_unmapped_interpreter_has_no_known_package():
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        foreign_arch_package_for_interpreter,
+    )
+
+    assert foreign_arch_package_for_interpreter("/lib/ld-linux-riscv64-lp64d.so.1") is None
+
+
+def test_a_package_can_be_named_for_a_foreign_architecture():
+    """Once the binary turns out to be armhf, so is every library it needs --
+    the native `libstdc++6` does nothing for it, `libstdc++6:armhf` is the
+    package that actually satisfies the link."""
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        qualify_for_foreign_arch,
+    )
+
+    assert qualify_for_foreign_arch("libstdc++6", "armhf") == "libstdc++6:armhf"
+
+
+def test_enabling_a_foreign_arch_also_refreshes_the_index():
+    """A previously-fetched apt index predates the new architecture, so this
+    must re-refresh regardless of any earlier refresh -- unlike the ordinary
+    needs_index_refresh/INDEX_REFRESH_COMMAND path, which only runs once."""
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        enable_foreign_arch_command,
+    )
+
+    command = enable_foreign_arch_command("armhf")
+
+    assert "dpkg --add-architecture armhf" in command
+    assert "apt-get update" in command

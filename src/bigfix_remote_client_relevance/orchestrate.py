@@ -118,7 +118,12 @@ class Target:
     @property
     def label(self) -> str:
         if self.kind == "container":
-            return f"container:{self.image or self.name}@{self.arch}"
+            # `arch or "x86_64"` mirrors what default_transport_factory
+            # actually runs with: a container target left unset (an inventory
+            # host with no `arch` line) is never probed, it falls back. The
+            # label is the `host` every failure is reported under, so it has
+            # to name the arch that was really used, not a bare "None".
+            return f"container:{self.image or self.name}@{self.arch or 'x86_64'}"
         return self.name
 
 

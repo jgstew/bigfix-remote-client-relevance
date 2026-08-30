@@ -38,7 +38,15 @@ def test_stream_11_0_resolves_within_its_stream():
 
 @pytest.mark.parametrize(
     ("platform", "arch"),
-    [("windows", "x86_64"), ("macos", "arm64"), ("ubuntu", "x86_64"), ("rhel", "x86_64")],
+    [
+        ("windows", "x86_64"),
+        ("macos", "arm64"),
+        ("ubuntu", "x86_64"),
+        ("ubuntu", "arm64"),
+        ("debian", "arm64"),
+        ("rhel", "x86_64"),
+        ("rhel", "arm64"),
+    ],
 )
 def test_artifact_urls_are_live(platform, arch):
     import requests
@@ -52,17 +60,27 @@ def test_artifact_urls_are_live(platform, arch):
     assert response.status_code == 200, f"{artifact.url} returned {response.status_code}"
 
 
-@pytest.mark.parametrize("platform", ["ubuntu", "debian", "rhel", "suse"])
+@pytest.mark.parametrize("platform", ["suse"])
 def test_no_arm64_agent_is_published_for_the_platforms_we_target(platform):
     """Why --arch still defaults to x86_64 rather than the host's architecture.
 
     As of 11.0.6.137 the release site publishes amd64/x86_64, ppc64le, s390x
-    and armhf (raspbian) builds, plus one aarch64 build under an `al2`
-    (Amazon Linux) name that no TargetSpec maps to. For every platform this
-    tool can actually select there is no arm64 agent — so on Apple Silicon
-    defaulting to the host architecture would fail resolution on every run and
-    fall back to x86_64 emulation anyway. The tool emulates and says so
-    instead.
+    and armhf (raspbian) builds. Two families have an arm64-capable
+    workaround, both handled by `artifact_for`, neither a true native build:
+
+    - `rhel` ships its arm64 client under an Amazon Linux-named filename
+      (`al2.aarch64.rpm`, officially supported only there, but a plain rpm
+      that runs on any rhel-family arm64 host) -- see the `rhel` entry in
+      `_PLATFORM_PATTERNS`.
+    - `ubuntu`/`debian` have no native arm64 build at all, but the raspbian
+      armhf (32-bit ARM) deb runs under an arm64 kernel's 32-bit userspace
+      compat -- generically on Debian, mostly on Ubuntu with some rough
+      edges -- see `_ARM64_RASPBIAN_FALLBACK`.
+
+    `suse` is the one platform left with no arm64 option whatsoever -- so on
+    Apple Silicon defaulting to the host architecture would still fail
+    resolution there, and fall back to x86_64 emulation anyway. The tool
+    emulates and says so instead.
 
     If this test starts failing, that assumption has changed and defaulting
     --arch to the host architecture becomes worth doing.

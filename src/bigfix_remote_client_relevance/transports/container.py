@@ -18,6 +18,7 @@ controller's cache.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import posixpath
@@ -52,11 +53,15 @@ from bigfix_remote_client_relevance.results import (
 from bigfix_remote_client_relevance.transports.container_libs import (
     INDEX_REFRESH_COMMAND,
     PACKAGE_MANAGER_PROBE_COMMAND,
+    enable_foreign_arch_command,
+    foreign_arch_package_for_interpreter,
     install_command,
+    missing_arm_interpreter,
     missing_shared_library,
     needs_index_refresh,
     package_for_soname,
     package_manager_from,
+    qualify_for_foreign_arch,
 )
 from bigfix_remote_client_relevance.transports.container_setup import (
     EngineSetup,
@@ -118,6 +123,30 @@ _BUILD_TIMEOUT_S = 600.0
 _ENGINE_START_TIMEOUT_S = 90.0
 _ENGINE_POLL_INTERVAL_S = 2.0
 
+# Docker Desktop intermittently answers with a 5xx under the concurrent
+# container churn a fan-out produces -- the identical call succeeds moments
+# later. Left unhandled these cost far more than the one target that saw
+# them: a failed *removal* strands its container, so every later run faces a
+# busier daemon, fails more removals, and strands more (observed live: 20
+# leaked `sleep infinity` containers, one of them five hours old, and the
+# failures spreading to targets that had nothing to do with the original
+# fault). A few bounded retries turn that loop into a short delay.
+_TRANSIENT_RETRIES = 3
+_TRANSIENT_BACKOFF_S = 0.4
+
+
+def _is_transient_docker_error(exc: BaseException) -> bool:
+    """Whether a failed Docker call is worth retrying.
+
+    Only server-side (5xx) faults qualify. A 4xx -- notably the 404 behind
+    :class:`docker.errors.ImageNotFound` -- is a real, stable answer about
+    what exists rather than a fault, and retrying it would make every
+    legitimate cache miss pay the backoff for nothing.
+    """
+    import docker.errors
+
+    return isinstance(exc, docker.errors.APIError) and bool(exc.is_server_error())
+
 
 def prepared_image_tag(base_digest: str, version: str, arch: str) -> str:
     """Tag for the image holding ``version`` baked into ``base_digest``.
@@ -127,6 +156,29 @@ def prepared_image_tag(base_digest: str, version: str, arch: str) -> str:
     """
     short_digest = base_digest.rpartition(":")[2][:12]
     return f"bfrcr/prepared:{short_digest}-{version}-{arch}"
+
+
+def _local_pull_tag(image: str, platform: str | None) -> str | None:
+    """A stable local alias for ``image`` pulled at ``platform``, or ``None``.
+
+    Docker's local image store has one tag -> one image. Pulling the same
+    upstream tag at two different platforms within one run -- the documented
+    ``--arch amd64 --arch arm64`` fan-out, or two inventory hosts that happen
+    to share an image -- would otherwise race: two pulls run concurrently
+    (bounded only by ``pull_parallel``), and whichever repoints the shared
+    tag last wins, so the other target's container-create call 404s on a
+    platform mismatch it already thought it had resolved.
+
+    Aliasing the pulled image (by its own returned identity, not by
+    re-reading the mutable tag afterward -- see :meth:`DockerEngine.ensure_image`)
+    to a tag keyed on ``(image, platform)`` lets both coexist. ``None`` when
+    no platform was given: nothing to disambiguate, so the plain ``image`` is
+    used exactly as before this existed.
+    """
+    if platform is None:
+        return None
+    digest = hashlib.sha256(f"{image}@{platform}".encode()).hexdigest()[:16]
+    return f"bfrcr/base:{digest}"
 
 
 def _platform_parts(platform: str | None) -> tuple[str, str] | None:
@@ -154,7 +206,7 @@ class ContainerEngineError(BigFixRelevanceError):
 class ContainerEngine(Protocol):
     """The slice of a container engine this transport uses."""
 
-    async def ensure_image(self, image: str, *, platform: str | None = None) -> None: ...
+    async def ensure_image(self, image: str, *, platform: str | None = None) -> str: ...
 
     async def run_one_shot(
         self,
@@ -387,29 +439,76 @@ class DockerEngine:
             + ", ".join(tried)
         )
 
-    async def ensure_image(self, image: str, *, platform: str | None = None) -> None:
-        def _ensure() -> None:
-            import docker.errors
+    async def ensure_image(self, image: str, *, platform: str | None = None) -> str:
+        """Make sure ``image`` (at ``platform``, if given) is available locally.
 
-            client = self._get_client()
-            try:
-                found = client.images.get(image)  # type: ignore[attr-defined]
-            except docker.errors.ImageNotFound:
-                logger.info("pulling image %s", image)
-                client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
-                return
+        Returns the reference every later operation on this image must
+        actually use -- ``image`` itself when no platform was given, or a
+        local alias tag otherwise (see :func:`_local_pull_tag`). Callers
+        that keep using the bare ``image`` after this returns reopen the
+        exact clobbering race this return value exists to close.
+        """
+        local_tag = _local_pull_tag(image, platform)
+        if local_tag is None:
+            return await self._guard(lambda: self._ensure_plain(image), retry=True)
+        return await self._guard(
+            lambda: self._ensure_aliased(image, platform, local_tag), retry=True
+        )
 
-            # images.get ignores platform: a cached image of the wrong
-            # architecture satisfies it, then container creation 404s. Compare
-            # what's actually on disk and re-pull on mismatch.
-            wanted = _platform_parts(platform)
-            if wanted is not None and _image_platform(found) not in (None, wanted):
-                logger.info(
-                    "cached %s is %s, not %s; re-pulling", image, _image_platform(found), wanted
-                )
-                client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
+    def _ensure_plain(self, image: str) -> str:
+        import docker.errors
 
-        await self._guard(_ensure)
+        client = self._get_client()
+        try:
+            client.images.get(image)  # type: ignore[attr-defined]
+        except docker.errors.ImageNotFound:
+            # Only the clean 404 means "absent, pull it". A 5xx is a daemon
+            # fault, deliberately left to propagate so _guard's retry can
+            # take it -- re-pulling a multi-hundred-MB image over a hiccup
+            # that a retry clears in under a second is the wrong trade.
+            logger.info("pulling image %s", image)
+            client.images.pull(image)  # type: ignore[attr-defined]
+            logger.info("pulled image %s", image)
+        return image
+
+    def _ensure_aliased(self, image: str, platform: str | None, local_tag: str) -> str:
+        import docker.errors
+
+        client = self._get_client()
+        try:
+            found = client.images.get(local_tag)  # type: ignore[attr-defined]
+        except docker.errors.ImageNotFound:
+            # As in _ensure_plain: absent means pull; a 5xx propagates to
+            # _guard's retry rather than triggering a needless re-pull.
+            found = None
+
+        # The alias is keyed deterministically by (image, platform), so this
+        # should never happen organically -- only a manually retagged or
+        # otherwise corrupted local image reaches here, and it must not be
+        # trusted silently, same reasoning as the pre-aliasing mismatch check
+        # this replaces.
+        wanted = _platform_parts(platform)
+        if found is not None and (wanted is None or _image_platform(found) in (None, wanted)):
+            return local_tag
+        if found is not None:
+            logger.info(
+                "local alias %s for %s is %s, not %s; re-pulling",
+                local_tag,
+                image,
+                _image_platform(found),
+                wanted,
+            )
+
+        logger.info("pulling image %s for %s", image, platform)
+        pulled = client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
+        logger.info("pulled image %s for %s", image, platform)
+        # Tagged by the pulled image's own identity, not by re-reading
+        # `image` -- a concurrent pull of the same upstream tag at a
+        # different platform can repoint it in between, and must not be
+        # allowed to steal this alias.
+        repository, _sep, tag_name = local_tag.partition(":")
+        pulled.tag(repository, tag_name)
+        return local_tag
 
     async def run_one_shot(
         self,
@@ -488,7 +587,11 @@ class DockerEngine:
                 int(result.exit_code or 0),
             )
 
-        return await asyncio.wait_for(self._guard(_exec), timeout=timeout)
+        # Retryable: every command this transport execs is idempotent (a
+        # uname/os-release probe, a `cp -a`, a package install, a qna
+        # evaluation), so re-running one after a daemon fault repeats work
+        # rather than changing the outcome.
+        return await asyncio.wait_for(self._guard(_exec, retry=True), timeout=timeout)
 
     async def stop(self, container_id: str) -> None:
         def _stop() -> None:
@@ -497,16 +600,26 @@ class DockerEngine:
             container.remove(force=True)
 
         try:
-            await self._guard(_stop)
-        except ContainerEngineError:
-            logger.warning("could not remove container %s", container_id)
+            # Retried, and the most important place to do it: a removal lost
+            # to a transient fault strands a running container for the rest
+            # of the machine's life, and those accumulate across runs until
+            # the daemon they are loading starts failing everything else too.
+            await self._guard(_stop, retry=True)
+        except ContainerEngineError as exc:
+            logger.warning(
+                "could not remove container %s (%s); it is still running -- "
+                "remove it with `docker rm -f %s`",
+                container_id,
+                exc,
+                container_id,
+            )
 
     async def image_digest(self, image: str) -> str:
         def _digest() -> str:
             client = self._get_client()
             return str(client.images.get(image).id)  # type: ignore[attr-defined]
 
-        return await self._guard(_digest)
+        return await self._guard(_digest, retry=True)
 
     async def image_exists(self, image: str) -> bool:
         def _exists() -> bool:
@@ -519,7 +632,7 @@ class DockerEngine:
                 return False
             return True
 
-        return await self._guard(_exists)
+        return await self._guard(_exists, retry=True)
 
     async def commit(self, container_id: str, tag: str) -> None:
         def _commit() -> None:
@@ -531,14 +644,36 @@ class DockerEngine:
         await self._guard(_commit)
 
     @staticmethod
-    async def _guard(fn: Callable[[], T]) -> T:
-        """Run a blocking SDK call off the event loop, normalizing its errors."""
-        try:
-            return await asyncio.to_thread(fn)
-        except ContainerEngineError:
-            raise
-        except Exception as exc:
-            raise ContainerEngineError(str(exc)) from exc
+    async def _guard(fn: Callable[[], T], *, retry: bool = False) -> T:
+        """Run a blocking SDK call off the event loop, normalizing its errors.
+
+        ``retry`` re-attempts transient daemon faults (see
+        :func:`_is_transient_docker_error`). Pass it only for calls that are
+        safe to repeat: inspects, pulls and removals are all idempotent, but
+        *creating* a container is not -- a retry there would leave the first
+        one behind, which is precisely the leak this mechanism exists to
+        prevent.
+        """
+        attempts = _TRANSIENT_RETRIES if retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return await asyncio.to_thread(fn)
+            except ContainerEngineError:
+                raise
+            except Exception as exc:
+                if attempt < attempts and _is_transient_docker_error(exc):
+                    delay = _TRANSIENT_BACKOFF_S * attempt
+                    logger.debug(
+                        "transient docker error (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt,
+                        attempts,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise ContainerEngineError(str(exc)) from exc
+        raise AssertionError("unreachable: the final attempt returns or raises")
 
 
 class PodmanEngine(DockerEngine):
@@ -615,10 +750,22 @@ class TransportContainer:
         # right for a transport used on its own rather than through a fan-out.
         self._coordinator = coordinator or ImageCoordinator()
         self._prepared: tuple[str, tuple[str, dict[str, str]]] | None = None
+        # What ensure_image resolved self.image (at self.platform) to -- a
+        # local alias tag when the engine had to disambiguate a platform (see
+        # container.DockerEngine.ensure_image), otherwise self.image
+        # unchanged. None until _ensure_image_once has actually run; every
+        # later Docker operation must use _run_image, never self.image
+        # directly, or the whole point of aliasing is lost.
+        self._resolved_image: str | None = None
 
     @property
     def host(self) -> str:
         return f"container:{self.image}@{self.arch}"
+
+    @property
+    def _run_image(self) -> str:
+        """The reference to actually run against -- see ``_resolved_image``."""
+        return self._resolved_image or self.image
 
     @property
     def platform(self) -> str | None:
@@ -656,7 +803,7 @@ class TransportContainer:
 
     async def _ensure_image_once(self) -> None:
         """Pull the base image, at most once per image across a whole run."""
-        await self._coordinator.once(
+        self._resolved_image = await self._coordinator.once(
             f"pull:{self.image}@{self.platform}",
             lambda: self._engine.ensure_image(self.image, platform=self.platform),
         )
@@ -697,7 +844,10 @@ class TransportContainer:
                 )
             else:
                 stdout, _stderr, _code = await self._engine.run_one_shot(
-                    self.image, PLATFORM_PROBE_COMMAND, platform=self.platform, timeout=timeout_s
+                    self._run_image,
+                    PLATFORM_PROBE_COMMAND,
+                    platform=self.platform,
+                    timeout=timeout_s,
                 )
             self._probed = classify_uname(stdout, strict=True)
             logger.debug("probed %s as platform %r", self.image, self._probed)
@@ -731,6 +881,10 @@ class TransportContainer:
         try:
             self._note_emulation()
             await self._ensure_image_once()
+            # _ensure_image_once may have just resolved self._resolved_image
+            # for the first time -- recompute now that it can reflect that,
+            # not the pre-resolution default above.
+            image_to_run = self._run_image
 
             # Provisioning needs the real platform (deb vs rpm agent); without
             # provisioning the spec is cosmetic, so the cheap path never probes.
@@ -794,11 +948,22 @@ class TransportContainer:
 
         # qna is there but the image lacks something it links against.
         soname = missing_shared_library(stderr)
+        interpreter = missing_arm_interpreter(stderr)
         if error_kind is not None and soname is not None:
             error_kind = ERROR_KIND_BOOTSTRAP
             error = (
                 f"qna cannot start in image {self.image}: missing shared library "
                 f"{soname}; install the package providing it in the image "
+                f"({stderr.strip()})"
+            )
+
+        # A missing foreign-arch interpreter is a whole missing architecture,
+        # not one library -- see _make_qna_runnable's separate remediation.
+        elif error_kind is not None and interpreter is not None:
+            error_kind = ERROR_KIND_BOOTSTRAP
+            error = (
+                f"qna cannot start in image {self.image}: missing the foreign-arch "
+                f"interpreter {interpreter}; enable that architecture in the image "
                 f"({stderr.strip()})"
             )
 
@@ -838,7 +1003,7 @@ class TransportContainer:
         if self._keep_alive and self._container_id is not None:
             return self._container_id
         container_id = await self._engine.start(
-            image or self.image, mounts=mounts, platform=self.platform
+            image or self._run_image, mounts=mounts, platform=self.platform
         )
         if self._keep_alive:
             self._container_id = container_id
@@ -859,15 +1024,21 @@ class TransportContainer:
         key = f"prepared:{self.image}@{self.arch}:{qna.version}:{self._rebuild_image}"
 
         async def build() -> tuple[str, dict[str, str]]:
-            digest = await self._engine.image_digest(self.image)
+            digest = await self._engine.image_digest(self._run_image)
             tag = prepared_image_tag(digest, qna.version, self.arch)
             if self._rebuild_image or not await self._engine.image_exists(tag):
+                logger.info(
+                    "preparing %s with qna %s (%s) -- first run against this image is slower",
+                    self.image,
+                    qna.version,
+                    self.arch,
+                )
                 # Only pay for extraction when a build (or its fallback) needs
                 # the tree; a cache hit skips both.
                 tree = await self._extractor(qna)
                 if await self._build_prepared_image(tree, tag, spec, timeout_s=timeout_s):
                     return tag, {}
-                return self.image, {str(tree): f"{QNA_MOUNT}:ro"}
+                return self._run_image, {str(tree): f"{QNA_MOUNT}:ro"}
             return tag, {}
 
         image, mounts = await self._coordinator.once(key, build)
@@ -879,7 +1050,7 @@ class TransportContainer:
     ) -> bool:
         timeout_s = max(timeout_s, _BUILD_TIMEOUT_S)
         container_id = await self._engine.start(
-            self.image,
+            self._run_image,
             mounts={str(tree): f"{_BUILD_STAGING_MOUNT}:ro"},
             platform=self.platform,
         )
@@ -901,6 +1072,7 @@ class TransportContainer:
                 return False
 
             await self._engine.commit(container_id, tag)
+            logger.info("prepared image %s ready as %s", self.image, tag)
             return True
         finally:
             await self._engine.stop(container_id)
@@ -922,24 +1094,49 @@ class TransportContainer:
         manager: str | None = None
         refreshed = False
         attempted: set[str] = set()
+        # Set once a foreign architecture is enabled below. From then on the
+        # binary is known to be that architecture, so every library it still
+        # reports missing has to be installed for it too.
+        foreign_arch: str | None = None
 
         for _attempt in range(_MAX_LIBRARY_FIXES):
             _stdout, stderr, _code = await self._engine.exec_in(
                 container_id, probe, timeout=timeout_s
             )
             soname = missing_shared_library(stderr)
-            if soname is None:
+            # A missing foreign-arch interpreter (see the raspbian-on-arm64
+            # fallback in bootstrap/release_site.py) means a whole
+            # architecture is absent, not one shared-library dependency --
+            # checked only once soname comes up empty, since the two
+            # detectors are mutually exclusive by construction.
+            interpreter = None if soname is not None else missing_arm_interpreter(stderr)
+            if soname is None and interpreter is None:
                 # Either it links, or it failed for a reason no install fixes;
                 # an image whose probe cannot run at all lands here too and is
                 # committed exactly as it was before this check existed.
                 return True
+            missing = soname if soname is not None else interpreter
             if not self._auto_setup:
                 logger.info(
                     "%s is missing %s and auto-setup is off; not installing it",
                     self.image,
-                    soname,
+                    missing,
                 )
                 return False
+
+            if interpreter is not None:
+                foreign_arch = await self._enable_foreign_arch(
+                    container_id,
+                    interpreter,
+                    family=family,
+                    attempted=attempted,
+                    timeout_s=timeout_s,
+                )
+                if foreign_arch is None:
+                    return False
+                continue
+
+            assert soname is not None  # narrowed by the branch above, for mypy
             if soname in attempted:
                 logger.warning(
                     "installing for %s did not make qna runnable in %s", soname, self.image
@@ -969,6 +1166,8 @@ class TransportContainer:
                     family,
                 )
                 return False
+            if foreign_arch is not None:
+                package = qualify_for_foreign_arch(package, foreign_arch)
 
             if needs_index_refresh(manager) and not refreshed:
                 await self._engine.exec_in(container_id, INDEX_REFRESH_COMMAND, timeout=timeout_s)
@@ -989,6 +1188,67 @@ class TransportContainer:
         )
         return False
 
+    async def _enable_foreign_arch(
+        self,
+        container_id: str,
+        interpreter: str,
+        *,
+        family: str | None,
+        attempted: set[str],
+        timeout_s: float,
+    ) -> str | None:
+        """Register and install the foreign architecture providing `interpreter`.
+
+        Returns the dpkg architecture that was enabled, so the caller can
+        name every *later* missing library for it too (an armhf binary needs
+        armhf libraries), or None if it could not be enabled.
+
+        A different remediation shape from a missing shared library: dpkg
+        needs the whole architecture registered (``--add-architecture``)
+        before it can even consider a foreign-arch package -- a deb-only
+        mechanism, with no rpm-family equivalent.
+        """
+        foreign = foreign_arch_package_for_interpreter(interpreter)
+        if foreign is None:
+            logger.warning(
+                "%s needs the %s interpreter but no known package provides it; "
+                "add a mapping or install it in the image yourself",
+                self.image,
+                interpreter,
+            )
+            return None
+        dpkg_arch, package = foreign
+
+        if package in attempted:
+            logger.warning("installing %s did not make qna runnable in %s", package, self.image)
+            return None
+        attempted.add(package)
+
+        if family != "deb":
+            logger.warning(
+                "%s needs the %s foreign architecture but is not a deb-family image; "
+                "dpkg --add-architecture has no equivalent there",
+                self.image,
+                dpkg_arch,
+            )
+            return None
+
+        logger.info(
+            "enabling the %s architecture in %s to provide %s", dpkg_arch, self.image, interpreter
+        )
+        await self._engine.exec_in(
+            container_id, enable_foreign_arch_command(dpkg_arch), timeout=timeout_s
+        )
+
+        logger.info("installing %s in %s to provide %s", package, self.image, interpreter)
+        _stdout, stderr, exit_code = await self._engine.exec_in(
+            container_id, install_command("apt-get", package), timeout=timeout_s
+        )
+        if exit_code != 0:
+            logger.warning("could not install %s in %s: %s", package, self.image, stderr.strip())
+            return None
+        return dpkg_arch
+
     def _eval_command(self, spec: TargetSpec, qna_path: str | None) -> str:
         # API boundary: qna's CLI vocabulary uses "relevance"; internal name
         # stays `client_relevance`.
@@ -1004,8 +1264,9 @@ class TransportContainer:
 def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
     # A binary that cannot link exits 127 too, and the linker's message ends in
     # "No such file or directory" — so that case is ruled out first, or every
-    # missing shared library would be reported as a missing binary.
-    if missing_shared_library(stderr) is not None:
+    # missing shared library would be reported as a missing binary. qemu's
+    # missing-interpreter message ends the same way, so it's ruled out too.
+    if missing_shared_library(stderr) is not None or missing_arm_interpreter(stderr) is not None:
         return False
     lowered = stderr.lower()
     return exit_code in (126, 127) or "not found" in lowered or "no such file" in lowered

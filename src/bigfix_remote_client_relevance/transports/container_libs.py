@@ -161,13 +161,86 @@ def needs_index_refresh(manager: str) -> bool:
 INDEX_REFRESH_COMMAND = "apt-get update"
 
 
+# qemu-user's own message when the target's ELF interpreter itself (not one
+# of its shared library dependencies) is missing -- meaning the image has no
+# userspace for that foreign architecture at all, not just one package away.
+# Distinct from missing_shared_library's "error while loading shared
+# libraries: ... cannot open shared object file", which names a dependency of
+# a program that otherwise runs; this fires before the program ever starts.
+# Confirmed live: running the raspbian armhf (32-bit ARM) agent under an
+# arm64 debian:12 container reports
+# "qemu-arm: Could not open '/lib/ld-linux-armhf.so.3': No such file or directory".
+_ARM_INTERPRETER_RE = re.compile(
+    r"qemu-\S+: Could not open '(?P<path>/lib/ld-linux-\S+\.so\.\d+)': "
+    r"No such file or directory"
+)
+
+
+def missing_arm_interpreter(stderr: str) -> str | None:
+    """The missing foreign-arch ELF interpreter path, or ``None``.
+
+    Fixing this needs a whole architecture enabled (``dpkg
+    --add-architecture`` plus an install), not just one package -- see
+    :func:`foreign_arch_package_for_interpreter` and
+    :func:`enable_foreign_arch_command`.
+    """
+    match = _ARM_INTERPRETER_RE.search(stderr)
+    return match.group("path") if match else None
+
+
+# Interpreter basename -> (dpkg foreign architecture, package providing it).
+# armhf is the only case this tool exercises today -- the raspbian-on-arm64
+# fallback for Debian/Ubuntu (see bootstrap/release_site.py's
+# _ARM64_RASPBIAN_FALLBACK_PLATFORMS); add rows as new cross-arch cases arise.
+_ARM_INTERPRETER_PACKAGES: dict[str, tuple[str, str]] = {
+    "ld-linux-armhf.so.3": ("armhf", "libc6:armhf"),
+}
+
+
+def foreign_arch_package_for_interpreter(interpreter_path: str) -> tuple[str, str] | None:
+    """``(dpkg foreign arch, package)`` that provides ``interpreter_path``.
+
+    ``None`` if unknown -- reported rather than guessed at, the same policy
+    :func:`package_for_soname` follows for an unmapped deb soname.
+    """
+    basename = interpreter_path.rsplit("/", 1)[-1]
+    return _ARM_INTERPRETER_PACKAGES.get(basename)
+
+
+def qualify_for_foreign_arch(package: str, dpkg_arch: str) -> str:
+    """Name ``package`` for a foreign dpkg architecture (``libstdc++6:armhf``).
+
+    Once the binary turns out to be a foreign architecture, so is every
+    library it links against: the native ``libstdc++6`` does nothing for an
+    armhf binary, and installing it leaves the loader reporting the very same
+    missing soname on the next probe.
+    """
+    return f"{package}:{dpkg_arch}"
+
+
+def enable_foreign_arch_command(dpkg_arch: str) -> str:
+    """Register ``dpkg_arch`` (e.g. ``"armhf"``) and refresh the package index.
+
+    dpkg refuses a foreign-arch package (``libc6:armhf``) until its
+    architecture is registered, and any previously-fetched index predates
+    that registration -- so this always re-refreshes, regardless of whether
+    an index refresh already ran for the native architecture via
+    :func:`needs_index_refresh`/:data:`INDEX_REFRESH_COMMAND`.
+    """
+    return f"dpkg --add-architecture {shlex.quote(dpkg_arch)} && apt-get update"
+
+
 __all__ = [
     "INDEX_REFRESH_COMMAND",
     "PACKAGE_FOR_SONAME",
     "PACKAGE_MANAGER_PROBE_COMMAND",
+    "enable_foreign_arch_command",
+    "foreign_arch_package_for_interpreter",
     "install_command",
+    "missing_arm_interpreter",
     "missing_shared_library",
     "needs_index_refresh",
     "package_for_soname",
     "package_manager_from",
+    "qualify_for_foreign_arch",
 ]

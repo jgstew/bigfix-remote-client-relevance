@@ -74,14 +74,27 @@ USAGE_EXIT_CODE = 64
 DEFAULT_INVENTORY_PATH = Path("hosts.toml")
 
 
-def _configure_logging(verbosity: int) -> None:
+def _configure_logging(verbosity: int, *, quiet: bool = False) -> None:
     """Send logs to stderr, leaving stdout free for the payload.
 
     Adds a handler rather than replacing the package's ``NullHandler``: the
     library's own configuration is left intact, and only the level this
     application wants is applied.
+
+    Defaults to INFO, not WARNING: every slow first-time operation -- a qna
+    artifact download, a container image pull, an image getting a missing
+    library or foreign architecture installed while it's prepped -- already
+    logs its own start (and, for most, its finish) at INFO. Without that
+    visible by default, a first run against a fresh image or a new qna
+    version looks hung for however long that download or pull actually takes,
+    with nothing on stderr to say otherwise. ``--quiet`` restores the old
+    warnings-only silence, for scripted or automated invocations that don't
+    want it.
     """
-    level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
+    if quiet:
+        level = logging.WARNING
+    else:
+        level = {0: logging.INFO}.get(verbosity, logging.DEBUG)
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
     package_logger = logging.getLogger("bigfix_remote_client_relevance")
@@ -398,8 +411,25 @@ def evaluate(
         ),
     ] = False,
     verbose: Annotated[
-        int, typer.Option("--verbose", "-v", count=True, help="-v for info, -vv for debug.")
+        int,
+        typer.Option(
+            "--verbose",
+            "-v",
+            count=True,
+            help=(
+                "Progress (downloads, image pulls, image prep) is already shown "
+                "by default; -v adds full debug detail."
+            ),
+        ),
     ] = 0,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            help="Suppress progress messages, back to warnings/errors only.",
+        ),
+    ] = False,
     schema: Annotated[
         bool,
         typer.Option(
@@ -411,7 +441,7 @@ def evaluate(
     ] = False,
 ) -> None:
     """Evaluate a BigFix client-relevance expression and print the answers."""
-    _configure_logging(verbose)
+    _configure_logging(verbose, quiet=quiet)
     args = args or []
     qna_version = qna_version or []
     container = container or []

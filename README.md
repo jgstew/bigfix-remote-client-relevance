@@ -336,6 +336,30 @@ bigfix-remote-client-relevance \
   --container ubuntu:24.04 --arch amd64 --arch arm64 "name of operating system"
 ```
 
+Ubuntu and Debian have no native arm64 BigFix client, so the `arm64` run above
+uses the raspbian armhf (32-bit ARM) build under the host's arm64 kernel's
+32-bit compat — it works generically on Debian, and mostly on Ubuntu with
+some rough edges, which still beats having no arm64 option at all. RHEL's
+arm64 client ships under an Amazon Linux-named filename (officially
+supported only there, but it's a plain rpm that runs on any rhel-family
+arm64 host), which this tool resolves transparently for `--container
+amazonlinux:2023 --arch arm64` and any other rhel-family image.
+
+Running that armhf build at all — even on a native arm64 host, since armhf
+(32-bit ARM) is a different architecture from arm64 (64-bit) — needs
+QEMU/binfmt_misc support for it registered with the container engine.
+`--auto-setup` installs the missing 32-bit C library *inside* the image, but
+the engine itself still needs to know how to execute a 32-bit ARM binary at
+all. Check what's registered, and install the rest, with:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt          # lists registered platforms
+docker run --privileged --rm tonistiigi/binfmt --install all
+```
+
+Without this, exec calls into the container can fail with a raw Docker API
+error (e.g. a 500) rather than a qna-level message this tool can parse.
+
 `--engine` picks the container engine: `auto` (default, prefers Docker and
 falls back to podman only if Docker is unreachable), `docker`, or `podman`.
 

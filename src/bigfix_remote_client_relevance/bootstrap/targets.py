@@ -141,6 +141,15 @@ KNOWN_TARGETS: dict[str, TargetSpec] = {
         prereqs=_DEB_PREREQS,
         _extract=_deb_extract,
     ),
+    "raspbian": TargetSpec(
+        name="raspbian",
+        family="posix",
+        cache_root="/tmp/bigfix_qna",
+        qna_relative_path="opt/BESClient/bin/qna",
+        release_platform="raspbian",
+        prereqs=_DEB_PREREQS,
+        _extract=_deb_extract,
+    ),
     "rhel": TargetSpec(
         name="rhel",
         family="posix",
@@ -222,7 +231,8 @@ _RPM_TOKENS = frozenset(
     {"rhel", "fedora", "centos", "almalinux", "rocky", "ol", "oracle", "amzn", "amazon"}
 )
 _SUSE_TOKENS = frozenset({"suse", "opensuse", "sles", "opensuse-leap", "opensuse-tumbleweed"})
-_DEBIAN_TOKENS = frozenset({"debian", "raspbian"})
+_RASPBIAN_TOKENS = frozenset({"raspbian"})
+_DEBIAN_TOKENS = frozenset({"debian"})
 
 
 def classify_uname(probe_output: str, *, strict: bool = False) -> str:
@@ -262,6 +272,10 @@ def classify_uname(probe_output: str, *, strict: bool = False) -> str:
         return "suse"
     if tokens & _RPM_TOKENS:
         return "rhel"
+    # Raspberry Pi OS's os-release lists ID=raspbian, ID_LIKE=debian -- check
+    # raspbian first so that ID_LIKE token doesn't fold it into plain debian.
+    if tokens & _RASPBIAN_TOKENS:
+        return "raspbian"
     if tokens & _DEBIAN_TOKENS and "ubuntu" not in tokens:
         return "debian"
     if "ubuntu" in tokens:
