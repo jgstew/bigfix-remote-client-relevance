@@ -19,9 +19,15 @@ repos:
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: end-of-file-fixer
-        exclude: \.svg$
+        exclude: (?x)( \.svg$ | ^tests/fixtures/release_site/patch_page_10\.0\.16\.html$ )
+      # Captured upstream HTML is a byte-for-byte record of what the release
+      # site served -- 227 of its lines end in a space. "Fixing" that edits
+      # evidence, and the scraper's own behaviour on real markup is exactly
+      # what the fixture exists to pin. Excluded rather than cleaned.
       - id: trailing-whitespace
+        exclude: &captured_page ^tests/fixtures/release_site/patch_page_10\.0\.16\.html$
       - id: mixed-line-ending
+        exclude: *captured_page
       - id: detect-private-key
       # Leftover breakpoint()/pdb.set_trace() in a commit.
       - id: debug-statements
@@ -110,16 +116,22 @@ repos:
 
   # False positives (e.g. "rhe" -> "the") are whitelisted in _typos.toml
   # rather than excluded by path, so real artifact filenames/regexes stay
-  # covered instead of silently skipped.
+  # covered instead of silently skipped. The one path exclusion is the
+  # captured release page below: typos rewrote a real hostname inside it
+  # and a word in an HTML comment,
+  # silently editing a byte-for-byte capture of someone else's markup. There
+  # is nothing there a spellchecker can usefully own.
   - repo: https://github.com/crate-ci/typos
     rev: b859c0df7f391deba73030f79b957e62b4d81dc6 # varcon-core-v5.0.7
     hooks:
       - id: typos
+        exclude: *captured_page
 
   - repo: https://github.com/codespell-project/codespell
     rev: 57b21406f092110c18776e39b0bda50d37c945c8 # v2.4.3
     hooks:
       - id: codespell
+        exclude: *captured_page
 
   # Enforces .editorconfig itself, which until now nothing checked - notably
   # the `end_of_line = crlf` rule for .bat/.cmd files. `mixed-line-ending`
@@ -129,6 +141,7 @@ repos:
     rev: e8b4e28241a9ae8296ba6e4a491b5da4eda73283 # 3.11.1
     hooks:
       - id: editorconfig-checker
+        exclude: *captured_page
 
   - repo: https://github.com/adrienverge/yamllint.git
     rev: cba56bcde1fdd01c1deb3f945e69764c291a6530 # v1.38.0

@@ -42,6 +42,13 @@ def pages(release_site_fixture):
         "https://support.bigfix.com/bes/release/11.0/patch6/SHA256SUMS": release_site_fixture(
             "SHA256SUMS.txt"
         ),
+        # 10.0 patch16 is the one captured page that publishes two macOS pkgs.
+        "https://support.bigfix.com/bes/release/10.0/patch16/": release_site_fixture(
+            "patch_page_10.0.16.html"
+        ),
+        "https://support.bigfix.com/bes/release/10.0/patch16/SHA256SUMS": release_site_fixture(
+            "SHA256SUMS_10.0.16.txt"
+        ),
     }
 
 
@@ -123,6 +130,19 @@ def test_macos_uses_the_pkg(fetch):
     artifact = artifact_for("11.0.6.137", platform="macos", arch="arm64", fetch=fetch)
 
     assert artifact.filename == "BESAgent-11.0.6.137-BigFix_MacOS11.0.pkg"
+
+
+@pytest.mark.parametrize("arch", ["arm64", "x86_64"])
+def test_macos_10x_prefers_the_universal_pkg_over_the_intel_only_one(fetch, arch):
+    """The 10.x pages list the Intel-only BigFix_MacOSX10.14.pkg first.
+
+    MacOS11.0 is the universal build and runs on both architectures, so it has
+    to win on page order alone -- see the pattern preference in artifact_for.
+    """
+    artifact = artifact_for("10.0.16.61", platform="macos", arch=arch, fetch=fetch)
+
+    assert artifact.filename == "BESAgent-10.0.16.61-BigFix_MacOS11.0.pkg"
+    assert artifact.sha256 == "ae111bdfc77eab972d5cbbe0e99ba26505bf9e94163777ffcbb8916b25b6ad8c"
 
 
 def test_ubuntu_uses_the_amd64_deb(fetch):

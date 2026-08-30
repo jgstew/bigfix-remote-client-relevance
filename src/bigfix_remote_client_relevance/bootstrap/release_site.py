@@ -50,7 +50,16 @@ _RASPBIAN_ARMHF_PATTERN = r"^BESAgent-[\d.]+-raspbian\d+\.armhf\.deb$"
 # package without installing it.
 _PLATFORM_PATTERNS: dict[str, tuple[str, ...]] = {
     "windows": (r"^QNA[\d.]+\.zip$",),
-    "macos": (r"^BESAgent-[\d.]+-BigFix_MacOS.*\.pkg$",),
+    # BigFix_MacOS11.0.pkg is the universal (Intel + Apple Silicon) build. The
+    # 10.x patch pages also publish an older BigFix_MacOSX10.14.pkg that is
+    # Intel-only and happens to be listed first, so the preference has to be
+    # explicit -- the discriminator is the digit right after "MacOS". The
+    # fallback is only reached on releases predating the universal build, and
+    # is the one thing that would still serve a pre-macOS-11 target.
+    "macos": (
+        r"^BESAgent-[\d.]+-BigFix_MacOS\d[\d.]*\.pkg$",
+        r"^BESAgent-[\d.]+-BigFix_MacOS.*\.pkg$",
+    ),
     "ubuntu": (r"^BESAgent-[\d.]+-ubuntu\d+\.{arch_deb}\.deb$",),
     "debian": (r"^BESAgent-[\d.]+-debian\d+\.{arch_deb}\.deb$",),
     # Not templated by {arch_deb}: whatever arch is requested maps onto the
@@ -380,18 +389,24 @@ def artifact_for(
         )
         compiled.append(re.compile(_RASPBIAN_ARMHF_PATTERN))
 
-    for filename, url in links.items():
-        if full_version not in filename:
-            continue
-        if any(pattern.match(filename) for pattern in compiled):
-            checksums = _checksums_for(page_url, fetch)
-            return ArtifactRef(
-                url=url,
-                filename=filename,
-                sha256=checksums.get(filename, ""),
-                platform=platform,
-                arch=arch,
-            )
+    # Patterns outer, links inner: the pattern tuples above express a
+    # preference order (universal macOS pkg over the Intel-only one, native
+    # rhel rpm over the Amazon Linux-named one, raspbian armhf only as a last
+    # resort) and this is what makes that order authoritative. Iterating links
+    # first would instead hand the decision to the release page's own layout.
+    for pattern in compiled:
+        for filename, url in links.items():
+            if full_version not in filename:
+                continue
+            if pattern.match(filename):
+                checksums = _checksums_for(page_url, fetch)
+                return ArtifactRef(
+                    url=url,
+                    filename=filename,
+                    sha256=checksums.get(filename, ""),
+                    platform=platform,
+                    arch=arch,
+                )
 
     raise ResolveError(f"no {platform}/{arch} qna artifact for {full_version} at {page_url}")
 
