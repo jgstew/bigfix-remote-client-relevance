@@ -177,6 +177,12 @@ jobs:
             echo "::warning::could not generate release notes; falling back to a plain body"
             printf 'Release v%s\n' "${VERSION}" > "$notes_file"
           fi
+          # SC2016 fires on the backticks below, but they are markdown code
+          # spans destined for the release body, not command substitutions --
+          # single quotes are what keeps them literal. The suggested fix
+          # (double quotes) would mean escaping every one of them for no gain.
+          # Scoped to this group so the rest of the script keeps the check.
+          # shellcheck disable=SC2016
           {
             printf '\n## SHA-256\n\n'
             printf 'Verify with `sha256sum -c SHA256SUMS.txt`:\n\n'
