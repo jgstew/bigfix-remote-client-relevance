@@ -475,22 +475,29 @@ class DockerEngine:
         import docker.errors
 
         client = self._get_client()
-        try:
-            found = client.images.get(local_tag)  # type: ignore[attr-defined]
-        except docker.errors.ImageNotFound:
-            # As in _ensure_plain: absent means pull; a 5xx propagates to
-            # _guard's retry rather than triggering a needless re-pull.
-            found = None
-
-        # The alias is keyed deterministically by (image, platform), so this
-        # should never happen organically -- only a manually retagged or
-        # otherwise corrupted local image reaches here, and it must not be
-        # trusted silently, same reasoning as the pre-aliasing mismatch check
-        # this replaces.
         wanted = _platform_parts(platform)
-        if found is not None and (wanted is None or _image_platform(found) in (None, wanted)):
+        repository, _sep, tag_name = local_tag.partition(":")
+
+        def _usable(candidate: object) -> bool:
+            return wanted is None or _image_platform(candidate) in (None, wanted)
+
+        def _lookup(reference: str) -> object | None:
+            try:
+                return cast(object, client.images.get(reference))  # type: ignore[attr-defined]
+            except docker.errors.ImageNotFound:
+                # Absent. A 5xx is a different thing entirely and propagates
+                # to _guard's retry rather than triggering a needless pull.
+                return None
+
+        # The alias this run (or an earlier one) already created.
+        found = _lookup(local_tag)
+        if found is not None and _usable(found):
             return local_tag
         if found is not None:
+            # Keyed deterministically by (image, platform), so this should
+            # never happen organically -- only a manually retagged or
+            # otherwise corrupted local image reaches here, and it must not
+            # be trusted silently.
             logger.info(
                 "local alias %s for %s is %s, not %s; re-pulling",
                 local_tag,
@@ -499,6 +506,18 @@ class DockerEngine:
                 wanted,
             )
 
+        # Already on disk under its own name, at the platform we want? Alias
+        # it rather than pulling. Not an optimization: a locally built image
+        # exists in no registry at all, so pulling it fails outright with
+        # "pull access denied" -- and for one that *is* published, a registry
+        # round trip for something already on disk is pure cost, paid on the
+        # first use of every image in every run.
+        existing = _lookup(image)
+        if existing is not None and _usable(existing):
+            logger.debug("aliasing already-local %s as %s", image, local_tag)
+            existing.tag(repository, tag_name)  # type: ignore[attr-defined]
+            return local_tag
+
         logger.info("pulling image %s for %s", image, platform)
         pulled = client.images.pull(image, platform=platform)  # type: ignore[attr-defined]
         logger.info("pulled image %s for %s", image, platform)
@@ -506,7 +525,6 @@ class DockerEngine:
         # `image` -- a concurrent pull of the same upstream tag at a
         # different platform can repoint it in between, and must not be
         # allowed to steal this alias.
-        repository, _sep, tag_name = local_tag.partition(":")
         pulled.tag(repository, tag_name)
         return local_tag
 

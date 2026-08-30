@@ -1317,6 +1317,25 @@ class FakeDockerClient:
         self._existing = dict(existing or {})
         self.pulled: list[dict[str, object]] = []
         self._pull_result = pull_result or FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})
+        for image in self._existing.values():
+            self._bind_tag(image)
+
+    def _bind_tag(self, image: FakeImage) -> None:
+        """Give ``image`` a working ``tag()``, as the real SDK's Image has.
+
+        Registers the new reference against this client, keyed by the image's
+        own identity -- never by re-reading whatever name it was found under,
+        which a concurrent pull may already have repointed.
+        """
+        client = self
+
+        def _tag(repository: str, tag: str | None = None) -> bool:
+            full = f"{repository}:{tag}" if tag else repository
+            image.tags_created.append(full)
+            client._existing[full] = image
+            return True
+
+        image.tag = _tag  # type: ignore[method-assign]
 
     def get(self, image: str) -> FakeImage:
         import docker.errors
@@ -1334,20 +1353,7 @@ class FakeDockerClient:
         # concurrent pull for another platform repointing the same tag.
         pulled = self._pull_result
         self._existing[image] = pulled
-
-        client = self
-
-        def _tag(repository: str, tag: str | None = None) -> bool:
-            # The real Image.tag() registers a new local reference with the
-            # daemon -- keyed by the pulled image's own identity, not by
-            # re-reading `image` off self._existing (which may already have
-            # been repointed by a concurrent pull for another platform).
-            full = f"{repository}:{tag}" if tag else repository
-            pulled.tags_created.append(full)
-            client._existing[full] = pulled
-            return True
-
-        pulled.tag = _tag  # type: ignore[method-assign]
+        self._bind_tag(pulled)
         return pulled
 
     def ping(self) -> bool:
@@ -1380,6 +1386,37 @@ async def test_ensure_image_does_not_pull_when_already_cached_for_that_platform(
 
     assert client.pulled == [], "the local alias from the first call must be reused"
     assert second == first
+
+
+async def test_an_image_already_present_locally_is_aliased_rather_than_pulled():
+    """A locally built image (the integration suite's stub, a private base,
+    anything not published) exists in no registry at all -- pulling it fails
+    outright with "pull access denied". And even for a registry image, a
+    round trip for something already on disk is pure cost, paid on the first
+    use of every image in every run."""
+    client = FakeDockerClient(
+        existing={"local-only:latest": FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})}
+    )
+
+    resolved = await engine_with(client).ensure_image("local-only:latest", platform="linux/amd64")
+
+    assert client.pulled == [], "an image already on disk must never be pulled"
+    assert resolved.startswith("bfrcr/base:")
+    assert client.get(resolved).attrs == {"Os": "linux", "Architecture": "amd64"}
+
+
+async def test_an_already_local_image_of_the_wrong_platform_is_still_pulled():
+    """The multi-arch case must keep working: present locally is not the same
+    as present at the architecture that was asked for."""
+    client = FakeDockerClient(
+        existing={"ubuntu:24.04": FakeImage(attrs={"Os": "linux", "Architecture": "arm64"})},
+        pull_result=FakeImage(attrs={"Os": "linux", "Architecture": "amd64"}),
+    )
+
+    resolved = await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
+
+    assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/amd64"}]
+    assert client.get(resolved).attrs == {"Os": "linux", "Architecture": "amd64"}
 
 
 async def test_ensure_image_gives_each_platform_a_distinct_local_alias():
@@ -1421,10 +1458,12 @@ def _image_attrs(image: FakeImage) -> dict[str, object]:
     return image.attrs
 
 
-async def test_ensure_image_repulls_when_the_local_alias_is_the_wrong_architecture():
+async def test_ensure_image_does_not_trust_a_wrong_architecture_alias():
     """Defensive: the alias is keyed deterministically by (image, platform),
     so this should never happen organically, but a corrupted or manually
-    retagged local image must not be trusted silently."""
+    retagged local image must not be trusted silently. What matters is the
+    outcome -- the caller gets the architecture it asked for -- not whether
+    that took a re-pull or an already-correct local image."""
     client = FakeDockerClient(pull_result=FakeImage(attrs={"Os": "linux", "Architecture": "amd64"}))
     engine = engine_with(client)
     amd64_tag = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
@@ -1434,8 +1473,9 @@ async def test_ensure_image_repulls_when_the_local_alias_is_the_wrong_architectu
 
     resolved = await engine.ensure_image("ubuntu:24.04", platform="linux/amd64")
 
-    assert client.pulled, "a mismatched alias must be re-pulled, not trusted"
-    assert _image_attrs(client.get(resolved)) == {"Os": "linux", "Architecture": "amd64"}
+    assert _image_attrs(client.get(resolved)) == {"Os": "linux", "Architecture": "amd64"}, (
+        "a wrong-architecture alias must be re-resolved, never returned as-is"
+    )
 
 
 # --- transient daemon faults are retried, not fatal --------------------------
@@ -1510,18 +1550,21 @@ async def test_a_404_is_never_retried(no_backoff):
     """ImageNotFound is a real answer about what exists, not a fault -- so a
     legitimate cache miss must not pay the retry delay."""
     client = FakeDockerClient()
-    calls = {"n": 0}
+    looked_up: list[str] = []
     real_get = client.get
 
     def counting_get(image: str) -> FakeImage:
-        calls["n"] += 1
+        looked_up.append(image)
         return real_get(image)
 
     client.get = counting_get  # type: ignore[method-assign]
 
     await engine_with(client).ensure_image("ubuntu:24.04", platform="linux/amd64")
 
-    assert calls["n"] == 1, "a 404 means absent; retrying it just wastes time"
+    # Several distinct references are looked up (the alias, then the image
+    # under its own name); what must never happen is the same one being
+    # asked for twice, which would mean a 404 got retried.
+    assert len(looked_up) == len(set(looked_up)), "a 404 means absent, not 'retry me'"
     assert client.pulled, "and it must pull, as before"
 
 
