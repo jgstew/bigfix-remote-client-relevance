@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -376,7 +377,8 @@ def classify_qna_outcome(
     locally, over SSH, or in a container.
     """
     if parsed.errors:
-        return parsed.errors[0], ERROR_KIND_RELEVANCE
+        first = parsed.errors[0]
+        return dmi_unavailable(first) or first, ERROR_KIND_RELEVANCE
 
     if exit_code != 0:
         detail = stderr.strip() or f"qna exited {exit_code} with no output"
@@ -387,6 +389,58 @@ def classify_qna_outcome(
         return detail, ERROR_KIND_QNA
 
     return None, None
+
+
+# qna builds its dmi.info from three sources in turn -- the sysfs DMI tables,
+# then /dev/mem read, then /dev/mem mmap -- and reports all three failures in
+# one E: line when none works. The C function names are the stable part of that
+# message; the prose around them is not.
+_DMI_RE = re.compile(r"dmi inspector error creating dmi\.info")
+# Only the sysfs attempt distinguishes the two cases worth telling apart, since
+# /dev/mem is absent from every container regardless.
+_DMI_SYSFS_ERRNO_RE = re.compile(r"CreateDmiInfoSysF error opening \S+ \((?P<errno>\d+)\)")
+
+_ENOENT = 2
+_EACCES = 13
+
+
+def dmi_unavailable(error: str) -> str | None:
+    """Explain a DMI/SMBIOS failure, or ``None`` when the error is not one.
+
+    Left alone, qna's own message is three C function names and two bare errnos,
+    which reads as a qna bug rather than as what it is: a property of the
+    machine the evaluation landed on. The errno is what separates the two very
+    different remedies, so it drives the advice.
+    """
+    if not _DMI_RE.search(error):
+        return None
+
+    match = _DMI_SYSFS_ERRNO_RE.search(error)
+    errno = int(match.group("errno")) if match else None
+
+    if errno == _ENOENT:
+        remedy = (
+            "the kernel exposes no SMBIOS/DMI tables, so hardware inspectors "
+            "cannot answer here. This is not a privilege problem -- the files "
+            "are absent, not unreadable, and root, --become and --privileged "
+            "make no difference. A container sees the host kernel's /sys, so "
+            "emulating a different architecture does not change it either "
+            "(an Apple Silicon container VM boots from a device tree and has "
+            "no SMBIOS at all). Evaluate DMI-dependent relevance on an x86_64 "
+            "Linux host, or over ssh against real hardware or a VM that "
+            "exposes SMBIOS"
+        )
+    elif errno == _EACCES:
+        remedy = (
+            "the SMBIOS/DMI tables are there but readable only by root. Rerun "
+            "with --become, or as root"
+        )
+    else:
+        remedy = (
+            "qna could not read the SMBIOS/DMI tables, so hardware inspectors cannot answer here"
+        )
+
+    return f"{remedy} ({error})"
 
 
 def sudo_privilege_problem(stderr: str) -> str | None:
@@ -417,6 +471,7 @@ def sudo_privilege_problem(stderr: str) -> str | None:
 __all__ = [
     "TransportLocal",
     "classify_qna_outcome",
+    "dmi_unavailable",
     "normalize_stdin_payload",
     "sudo_privilege_problem",
 ]

@@ -20,10 +20,13 @@ from bigfix_remote_client_relevance.results import (
     ERROR_KIND_QNA,
     ERROR_KIND_RELEVANCE,
     ERROR_KIND_TRANSPORT,
+    ParsedQnaOutput,
     ResolvedQna,
 )
 from bigfix_remote_client_relevance.transports.local import (
     TransportLocal,
+    classify_qna_outcome,
+    dmi_unavailable,
     sudo_privilege_problem,
 )
 
@@ -661,3 +664,57 @@ def test_sudo_privilege_problem_detects_a_sudo_line():
 
 def test_sudo_privilege_problem_ignores_plain_qna_stderr():
     assert sudo_privilege_problem("qna: could not open file\n") is None
+
+
+# Verbatim from a `number of processors` run against ubi9 on an Apple Silicon
+# host, where the container VM boots from a device tree and exposes no SMBIOS.
+DMI_ENOENT_ERROR = (
+    "dmi inspector error creating dmi.info "
+    "([CreateDmiInfoSysF error opening /sys/firmware/dmi/tables/smbios_entry_point (2)]"
+    "[CreateDmiInfoDevMem cannot open /dev/mem (2)]"
+    "[CreateDmiInfoMMap cannot open /dev/mem (2)])"
+)
+
+DMI_EACCES_ERROR = DMI_ENOENT_ERROR.replace("smbios_entry_point (2)", "smbios_entry_point (13)")
+
+
+def test_dmi_unavailable_explains_absent_tables():
+    """errno 2 means the files are missing, so elevation is the wrong advice."""
+    explained = dmi_unavailable(DMI_ENOENT_ERROR)
+
+    assert explained is not None
+    assert "no SMBIOS/DMI tables" in explained
+    assert "not a privilege problem" in explained
+    # qna's own detail survives, for anyone diagnosing further.
+    assert "CreateDmiInfoSysF" in explained
+
+
+def test_dmi_unavailable_points_at_elevation_when_denied():
+    """errno 13 is the opposite case: the tables exist and root can read them."""
+    explained = dmi_unavailable(DMI_EACCES_ERROR)
+
+    assert explained is not None
+    assert "--become" in explained
+    assert "not a privilege problem" not in explained
+
+
+def test_dmi_unavailable_ignores_unrelated_errors():
+    assert dmi_unavailable("The operator 'dmi' is not defined.") is None
+
+
+def test_classify_enriches_a_dmi_error_without_changing_its_kind():
+    error, kind = classify_qna_outcome(
+        ParsedQnaOutput(errors=[DMI_ENOENT_ERROR]), exit_code=0, stderr=""
+    )
+
+    assert kind == ERROR_KIND_RELEVANCE
+    assert error is not None
+    assert "no SMBIOS/DMI tables" in error
+
+
+def test_classify_passes_an_ordinary_relevance_error_through_untouched():
+    detail = "This expression could not be parsed."
+
+    error, kind = classify_qna_outcome(ParsedQnaOutput(errors=[detail]), exit_code=0, stderr="")
+
+    assert (error, kind) == (detail, ERROR_KIND_RELEVANCE)

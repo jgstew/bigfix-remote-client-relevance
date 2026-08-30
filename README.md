@@ -360,6 +360,14 @@ docker run --privileged --rm tonistiigi/binfmt --install all
 Without this, exec calls into the container can fail with a raw Docker API
 error (e.g. a 500) rather than a qna-level message this tool can parse.
 
+Hardware inspectors that read SMBIOS/DMI — `number of processors` among them —
+cannot answer in a container whose *host* kernel exposes no DMI tables. A
+container shares the host's `/sys`, so this has nothing to do with running as
+root and nothing to do with the emulated architecture: an Apple Silicon
+container VM boots from a device tree and has no SMBIOS at all, and neither
+`--privileged` nor an x86_64 image conjures one. Evaluate that relevance on an
+x86_64 Linux host, or over SSH against real hardware.
+
 `--engine` picks the container engine: `auto` (default, prefers Docker and
 falls back to podman only if Docker is unreachable), `docker`, or `podman`.
 
