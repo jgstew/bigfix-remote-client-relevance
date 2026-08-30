@@ -319,8 +319,8 @@ def candidate_podman_sockets(
     if not platform.startswith("win"):
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
         if runtime_dir is None:
-            # os.getuid does not exist on Windows at all -- not even in the
-            # type stubs -- so it's looked up dynamically rather than called
+            # os.getuid does not exist on Windows at all, not even in the type
+            # stubs -- so it's looked up dynamically rather than called
             # directly; this also covers being asked about "linux" candidates
             # while actually running on Windows (as the tests do, to stay
             # deterministic regardless of which OS runs the suite). Either

@@ -12,6 +12,7 @@ repos:
     hooks:
       - id: check-yaml
       - id: check-toml
+      - id: check-json
       - id: check-added-large-files
         args: ["--maxkb=500"]
       - id: check-ast
@@ -22,11 +23,45 @@ repos:
       - id: trailing-whitespace
       - id: mixed-line-ending
       - id: detect-private-key
+      # Leftover breakpoint()/pdb.set_trace() in a commit.
+      - id: debug-statements
+      # Structural guards. None of these have anything to catch today - no
+      # submodules, symlinks or executable files are tracked - which is the
+      # point: they keep it that way rather than clean up a backlog.
+      - id: forbid-submodules
+      # check-symlinks is deliberately NOT here: it matches only `type:
+      # symlink` files, and with none tracked the meta `check-hooks-apply` hook
+      # below (correctly) rejects it as a hook that can never fire.
+      # destroyed-symlinks matches every file, so it applies regardless.
+      # check-illegal-windows-names is out for the same reason: it inspects
+      # only newly-added files, so it reports "no files to check" on a
+      # --all-files run and check-hooks-apply flags it.
+      - id: destroyed-symlinks
+      - id: check-shebang-scripts-are-executable
+      # DESIGN.md cites GitHub URLs throughout; a link to a branch rather than
+      # a commit rots silently.
+      - id: check-vcs-permalinks
+      # Every file under tests/ already follows test_*.py; this keeps a new one
+      # from being silently skipped by pytest's collection.
+      - id: name-tests-test
+        args: ["--pytest-test-first"]
       # Block direct commits to the integration branches; work on a feature
       # branch and open a PR instead. Bypass for a deliberate exception with
       # `git commit --no-verify`.
       # - id: no-commit-to-branch
       #   args: ["--branch=main", "--branch=master"]
+
+  # Broader than `detect-private-key` above, which only matches PEM headers:
+  # this catches cloud keys, tokens and connection strings too. hosts.toml
+  # carries real SSH endpoints and is gitignored, so the realistic failure is
+  # one of its values arriving in a fixture or a force-added file rather than a
+  # PEM block. Deferred to pre-push rather than every commit - it scans the
+  # whole staged content, not just the diff. Clean on the tree today.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
+    hooks:
+      - id: gitleaks
+        stages: [pre-push, manual]
 
   # ruff replaces black + flake8 + isort: `ruff-check` lints (and fixes),
   # `ruff-format` is the formatter. Config lives in pyproject.toml.
@@ -86,6 +121,15 @@ repos:
     hooks:
       - id: codespell
 
+  # Enforces .editorconfig itself, which until now nothing checked - notably
+  # the `end_of_line = crlf` rule for .bat/.cmd files. `mixed-line-ending`
+  # above only fires on a file that mixes both endings, so a wholly-LF one
+  # would have gone through. Config in .editorconfig-checker.json.
+  - repo: https://github.com/editorconfig-checker/editorconfig-checker.python
+    rev: e8b4e28241a9ae8296ba6e4a491b5da4eda73283 # 3.11.1
+    hooks:
+      - id: editorconfig-checker
+
   - repo: https://github.com/adrienverge/yamllint.git
     rev: cba56bcde1fdd01c1deb3f945e69764c291a6530 # v1.38.0
     hooks:
@@ -102,17 +146,16 @@ repos:
 
   - repo: https://github.com/pre-commit/pygrep-hooks
     rev: 3a6eb0fadf60b3cccfd80bad9dbb6fae7e47b316 # v1.10.0
+    # Pure regex greps, milliseconds to run, so there is nothing to gain from
+    # deferring them: at `stages: [manual]` a developer only heard about a
+    # blanket `# type: ignore` once CI ran, which is the wrong end of the loop
+    # for a one-character fix.
     hooks:
       - id: python-check-blanket-noqa
-        stages: [manual]
       - id: python-no-log-warn
-        stages: [manual]
       - id: python-use-type-annotations
-        stages: [manual]
       - id: python-no-eval
-        stages: [manual]
       - id: python-check-blanket-type-ignore
-        stages: [manual]
 
   - repo: https://github.com/abravalheri/validate-pyproject
     rev: 17e12779811926f000bdfa1795f9e3735dd71ac3 # 0.26
@@ -128,6 +171,23 @@ repos:
         stages: [manual]
       - id: check-dependabot
         stages: [manual]
+
+  # The third leg of the workflow-checking stool, and the one that was missing:
+  # check-github-workflows (above) validates the schema, zizmor (below) audits
+  # security, and neither looks at what the workflows actually *do* - the
+  # `${{ }}` expressions, the step/job references, the action input names, and
+  # the shell in `run:` blocks. Clean on the tree today.
+  #
+  # actionlint delegates `run:` block linting to shellcheck and silently skips
+  # it when shellcheck is not on PATH - so a developer without it still gets
+  # the expression and reference checks, while CI (GitHub runners ship
+  # shellcheck) gets the shell checks too. `brew install shellcheck` to get the
+  # full check locally.
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+    hooks:
+      - id: actionlint
+        stages: [pre-push, manual]
 
   - repo: https://github.com/woodruffw/zizmor-pre-commit
     # Find security issues in GitHub Actions CI/CD setups.
@@ -207,12 +267,12 @@ repos:
         stages: [pre-push, manual]
         entry: uv run --frozen pyright
       - id: pytest
-        name: pytest (see config in pyproject.toml)
+        name: pytest + coverage floor (see config in pyproject.toml)
         language: system
         pass_filenames: false
         always_run: true
         stages: [pre-push, manual]
-        entry: uv run --frozen pytest
+        entry: uv run --frozen pytest --cov --cov-fail-under=90
 
   - repo: meta
     hooks:

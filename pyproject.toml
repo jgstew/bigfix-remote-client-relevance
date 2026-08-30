@@ -46,6 +46,7 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=5",
   "pyright>=1.1.400",
   "ruff>=0.5",
   "mypy>=1.10",
@@ -94,6 +95,21 @@ markers = [
   "ssh_localhost: needs sshd on localhost with key auth for the current user",
   "ssh_windows: needs a real Windows endpoint (set BFRCR_WINDOWS_SSH_HOST=user@host)",
   "network: reaches support.bigfix.com / software.bigfix.com (opt in with BFRCR_NETWORK_TESTS=1)",
+]
+
+# Measure the package only. Including tests/ in the report would let the
+# integration tests -- which tests/conftest.py auto-skips on a machine without
+# Docker/sshd/a qna binary -- pull the total down by 10+ points purely from
+# their own unexecuted bodies, which says nothing about how well src/ is
+# covered.
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
 ]
 
 [tool.ruff]
