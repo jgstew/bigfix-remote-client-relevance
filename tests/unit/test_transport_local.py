@@ -684,7 +684,7 @@ def test_dmi_unavailable_explains_absent_tables():
 
     assert explained is not None
     assert "no SMBIOS/DMI tables" in explained
-    assert "not a privilege problem" in explained
+    assert "neither root nor --arch" in explained
     # qna's own detail survives, for anyone diagnosing further.
     assert "CreateDmiInfoSysF" in explained
 
@@ -695,7 +695,7 @@ def test_dmi_unavailable_points_at_elevation_when_denied():
 
     assert explained is not None
     assert "--become" in explained
-    assert "not a privilege problem" not in explained
+    assert "neither root nor --arch" not in explained
 
 
 def test_dmi_unavailable_ignores_unrelated_errors():

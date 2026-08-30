@@ -420,25 +420,14 @@ def dmi_unavailable(error: str) -> str | None:
 
     if errno == _ENOENT:
         remedy = (
-            "the kernel exposes no SMBIOS/DMI tables, so hardware inspectors "
-            "cannot answer here. This is not a privilege problem -- the files "
-            "are absent, not unreadable, and root, --become and --privileged "
-            "make no difference. A container sees the host kernel's /sys, so "
-            "emulating a different architecture does not change it either "
-            "(an Apple Silicon container VM boots from a device tree and has "
-            "no SMBIOS at all). Evaluate DMI-dependent relevance on an x86_64 "
-            "Linux host, or over ssh against real hardware or a VM that "
-            "exposes SMBIOS"
+            "this host kernel exposes no SMBIOS/DMI tables, so hardware inspectors "
+            "cannot answer -- absent, not unreadable, so neither root nor --arch "
+            "helps; use an x86_64 Linux host or an ssh target with real firmware"
         )
     elif errno == _EACCES:
-        remedy = (
-            "the SMBIOS/DMI tables are there but readable only by root. Rerun "
-            "with --become, or as root"
-        )
+        remedy = "the SMBIOS/DMI tables are readable only by root here; rerun with --become"
     else:
-        remedy = (
-            "qna could not read the SMBIOS/DMI tables, so hardware inspectors cannot answer here"
-        )
+        remedy = "qna could not read the SMBIOS/DMI tables, so hardware inspectors cannot answer"
 
     return f"{remedy} ({error})"
 
