@@ -285,3 +285,23 @@ def test_update_inventory_arch_unknown_host_raises(tmp_path):
         update_inventory_arch(path, "nope", "arm64")
 
     assert "nope" in str(excinfo.value)
+
+
+def test_a_host_can_set_its_own_idle_ttl(tmp_path):
+    """A long-lived lab container may want to stay warm far longer than the
+    default; an ephemeral one may want to go away sooner."""
+    path = tmp_path / "hosts.toml"
+    path.write_text(
+        """
+[hosts.warm-ubuntu]
+transport = "container"
+image = "ubuntu:24.04"
+keep_alive = true
+idle_ttl_s = 1800
+""",
+        encoding="utf-8",
+    )
+
+    (target,) = load_inventory(path)
+
+    assert target.idle_ttl_s == 1800

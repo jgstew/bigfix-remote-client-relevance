@@ -160,7 +160,77 @@ async for result in evaluate_client_relevance_stream("name of operating system",
 It yields in completion order; `evaluate_client_relevance` waits for the whole
 fan-out and returns target-then-version order.
 
-One `ClientRelevanceResult` comes back per (target × version), carrying
+### Several expressions at once
+
+`evaluate_many` takes an array of relevance statements and an inventory of
+hosts, and evaluates the whole grid — `targets × versions × expressions`:
+
+```python
+from bigfix_remote_client_relevance import Target, evaluate_many, load_inventory
+
+results = await evaluate_many(
+    [
+        "name of operating system",
+        "version of client",
+        "number of processes",
+    ],
+    load_inventory("hosts.toml"),
+    qna_version="11.0",
+)
+
+for result in results:
+    print(result.host, result.client_relevance, result.answers)
+```
+
+Each (target, version) pair builds **one** transport and runs every expression
+through it: for a container that is one image pull, one prepared-image lookup
+and one `docker run` instead of N, and for SSH one connection instead of N.
+Container targets carrying more than one expression are kept warm for the batch
+automatically. Every result carries the expression that produced it in
+`client_relevance`, so nothing has to be matched up by position.
+
+Measured on `ubuntu:22.04` at `qna 11.0`, x86_64 under emulation on Apple
+Silicon (medians of three runs, `scripts/bench_warm.py`):
+
+| expressions | one call each | `evaluate_many` | saving |
+| ---: | ---: | ---: | ---: |
+| 1 | 6.2s | 5.4s | 1.1× |
+| 3 | 20.4s | 8.4s | 2.4× |
+| 10 | 66.1s | 17.6s | 3.7× |
+
+Nearly all of that is the batching itself — sharing the transport, the version
+resolution and the image work. Keeping the container warm on top of that is
+worth little *within* one process, where a prepared image makes `docker run`
+cheap; it earns its keep across separate invocations (see below).
+
+`evaluate_many_stream` is the completion-order form, the same way
+`evaluate_client_relevance_stream` is for the single-expression call.
+
+### Warm containers
+
+Every container this tool starts carries a deadline of its own and removes
+itself once it has been idle for two minutes (`DEFAULT_IDLE_TTL_S`). Use
+pushes that deadline out, and the window always covers the evaluation about to
+run, so a container in active use never expires under it. Two things follow:
+
+- Nothing leaks. A `SIGKILL`, a dead daemon connection or a lost removal used
+  to strand a `sleep infinity` container for the life of the machine; now the
+  container reclaims itself.
+- A `keep_alive` container **outlives its process on purpose**. The next
+  invocation — a script polling every couple of minutes, say — finds it by
+  label and adopts it rather than starting another. Because several processes
+  can be sharing one container, none of them can safely stop it when *it* is
+  done — another may be mid-evaluation inside it — so the deadline is the only
+  thing that reclaims a warm container. Set `idle_ttl_s` per host in
+  `hosts.toml` to widen or narrow that window.
+
+```python
+from bigfix_remote_client_relevance import stop_warm_containers
+
+await stop_warm_containers()  # reclaim them now rather than in two minutes
+```
+
+One `ClientRelevanceResult` comes back per (target × version × expression), carrying
 `answers`, `answer_types`, `error` / `error_kind`, the resolved `qna_version`,
 and the full `raw_qna_output` for debugging. Failures are reported inside
 results rather than raised, so one unreachable host never breaks a fan-out.

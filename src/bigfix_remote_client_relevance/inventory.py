@@ -62,6 +62,22 @@ def load_inventory(path: str | Path) -> list[Target]:
     return targets
 
 
+def _optional_float(value: object) -> float | None:
+    """A numeric inventory setting, or None when it is absent or unusable.
+
+    Unusable rather than fatal: an idle window is a tuning knob, and a
+    mistyped one should fall back to the default, not refuse to load the
+    whole inventory.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        logger.warning("ignoring non-numeric idle_ttl_s %r", value)
+        return None
+
+
 def _target_from_entry(
     name: str, config: dict[str, object], defaults: dict[str, object], path: Path
 ) -> Target:
@@ -105,6 +121,7 @@ def _target_from_entry(
         platform=str(platform) if platform is not None else None,
         qna_version=version if isinstance(version, (str, list)) else None,
         keep_alive=bool(setting("keep_alive", False)),
+        idle_ttl_s=_optional_float(setting("idle_ttl_s", None)),
         auto_setup=bool(setting("auto_setup", True)),
         verify_host_key=bool(setting("verify_host_key", True)),
     )

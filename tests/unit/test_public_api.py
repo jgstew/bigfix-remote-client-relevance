@@ -47,6 +47,8 @@ EXPECTED_ROOT_EXPORTS = [
     "count_work",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",
+    "evaluate_many",
+    "evaluate_many_stream",
     "find_qna_path",
     "format_result",
     "format_results",
@@ -54,6 +56,7 @@ EXPECTED_ROOT_EXPORTS = [
     "parse_qna_output",
     "result_to_dict",
     "results_to_dicts",
+    "stop_warm_containers",
     "worst_exit_code",
 ]
 

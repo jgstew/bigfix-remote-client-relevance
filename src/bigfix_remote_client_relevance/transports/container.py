@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import os
 import posixpath
@@ -26,6 +27,8 @@ import shlex
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 from pathlib import Path
 from typing import Protocol, TypeVar, cast
 
@@ -90,7 +93,71 @@ QNA_MOUNT = "/opt/bigfix_qna"
 DEFAULT_QNA_COMMAND = "qna"
 
 # A container that must stay alive between commands needs a foreground process.
+# Only used when a deadline is explicitly opted out of -- see DEFAULT_IDLE_TTL_S.
 KEEP_ALIVE_COMMAND = "sleep infinity"
+
+DEFAULT_IDLE_TTL_S = 120.0
+"""How long a container outlives its last use before removing itself.
+
+Short, because this is the *only* thing that reclaims a warm container. A
+container being shared across processes cannot be stopped when any one of them
+finishes with it -- another may be part-way through an evaluation in it -- so
+"stop when done" is not available and the deadline does the whole job. Two
+minutes is long enough to cover a script that queries on a short interval and
+short enough that an abandoned container is not sitting around for long.
+
+Every container this tool starts carries a deadline, not just a warm one. The
+`finally` blocks that stop transient and build containers cover an exception;
+they do not cover a SIGKILL, a daemon connection that dies mid-run, or a
+removal call that is simply lost. Whatever the host process fails to clean up,
+the container cleans up itself -- which is also the only mechanism available to
+a warm container, since by design it outlives the process that started it.
+"""
+
+_DEADLINE_FILE = "/tmp/.bfrcr-deadline"
+
+# Every container this tool starts carries _WARM_LABEL, so strays of either
+# kind can be found again; only a kept-alive one carries _WARM_KEY_LABEL, and
+# only a container carrying that key is ever adopted.
+_WARM_LABEL = "bfrcr.warm"
+_WARM_KEY_LABEL = "bfrcr.key"
+
+# Coarse: five seconds of overshoot on a two-minute idle window is free, and
+# the poll is what the container spends its idle life doing.
+_DEADLINE_POLL_S = 5
+
+# The deadline has to outlast the evaluation about to run, not just the idle
+# time after it: `timeout_s` can legitimately exceed the idle window, and a
+# container that expired mid-evaluation would fail it for a reason that has
+# nothing to do with the relevance. The margin covers the exec round trips
+# around the evaluation itself.
+_DEADLINE_MARGIN_S = 30
+
+
+def _deadline_epoch(ttl_s: float) -> str:
+    """Shell computing "now + ttl", in POSIX sh arithmetic."""
+    return f"$(( $(date +%s) + {max(1, int(ttl_s))} ))"
+
+
+def deadline_command(ttl_s: float) -> list[str]:
+    """PID 1 for a self-expiring container.
+
+    Returned as argv rather than a string: Docker splits a bare command string
+    on whitespace with no shell, which is why the one-word
+    :data:`KEEP_ALIVE_COMMAND` works as-is and this cannot.
+    """
+    script = (
+        f'd={_DEADLINE_FILE}; echo {_deadline_epoch(ttl_s)} > "$d" || exit 1; '
+        f'while [ "$(date +%s)" -lt "$(cat "$d" 2>/dev/null || echo 0)" ]; '
+        f"do sleep {_DEADLINE_POLL_S}; done"
+    )
+    return ["sh", "-c", script]
+
+
+def renew_command(ttl_s: float) -> str:
+    """Push a running container's deadline out to "now + ttl"."""
+    return f"echo {_deadline_epoch(ttl_s)} > {_DEADLINE_FILE}"
+
 
 # Same probe TransportSSH runs: kernel on line one, os-release tokens on line
 # two. The container's answer is authoritative, so it is classified strictly.
@@ -225,7 +292,17 @@ class ContainerEngine(Protocol):
         *,
         mounts: dict[str, str] | None = None,
         platform: str | None = None,
+        ttl_s: float | None = None,
+        labels: dict[str, str] | None = None,
     ) -> str: ...
+
+    async def renew(self, container_id: str, *, ttl_s: float | None = None) -> bool: ...
+
+    async def find_warm(self, key: str) -> str | None: ...
+
+    async def list_warm(self) -> list[str]: ...
+
+    async def prune_warm(self) -> int: ...
 
     async def exec_in(
         self,
@@ -354,12 +431,16 @@ class DockerEngine:
         auto_setup: bool = True,
         setup: EngineSetup | None = None,
         engine_name: str = "Docker",
+        idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
     ) -> None:
         self._client = client
         self._socket_candidates = socket_candidates
         self._auto_setup = auto_setup
         self._setup = setup or EngineSetup()
         self._engine_name = engine_name
+        # Every container this engine creates self-expires unless this is
+        # explicitly None -- see DEFAULT_IDLE_TTL_S.
+        self._idle_ttl_s = idle_ttl_s
 
     def _connect(self, urls: list[str], tried: list[str]) -> object | None:
         """The first URL that answers, or ``None``."""
@@ -552,20 +633,105 @@ class DockerEngine:
         *,
         mounts: dict[str, str] | None = None,
         platform: str | None = None,
+        ttl_s: float | None = None,
+        labels: dict[str, str] | None = None,
     ) -> str:
+        """Start a detached container that removes itself once idle.
+
+        ``ttl_s`` overrides the engine-wide idle window for this one container
+        -- a prepared-image build legitimately outlives the default and must
+        not have PID 1 exit out from under it.
+        """
+        ttl = self._idle_ttl_s if ttl_s is None else ttl_s
+        command = KEEP_ALIVE_COMMAND if ttl is None else deadline_command(ttl)
+        all_labels = {_WARM_LABEL: "0", "bfrcr.ttl": str(int(ttl or 0))}
+        all_labels.update(labels or {})
+
         def _start() -> str:
             client = self._get_client()
             container = client.containers.run(  # type: ignore[attr-defined]
                 image,
-                command=KEEP_ALIVE_COMMAND,
+                command=command,
                 detach=True,
                 volumes=_to_volumes(mounts or {}),
                 platform=platform,
                 auto_remove=False,
+                labels=all_labels,
             )
             return str(container.id)
 
         return await self._guard(_start)
+
+    async def renew(self, container_id: str, *, ttl_s: float | None = None) -> bool:
+        """Push a running container's deadline out, so use keeps it alive.
+
+        Best-effort by design: this is housekeeping around an evaluation that
+        has already been asked for, and a container whose deadline could not be
+        renewed still answers -- it just expires sooner.
+        """
+        ttl = self._idle_ttl_s if ttl_s is None else ttl_s
+        if ttl is None:
+            return True
+        try:
+            _stdout, _stderr, code = await self.exec_in(container_id, renew_command(ttl))
+        except (ContainerEngineError, OSError, TimeoutError) as exc:
+            logger.debug("could not renew the deadline on %s: %s", container_id, exc)
+            return False
+        return code == 0
+
+    def _container_ids(self, *, all_states: bool, filters: dict[str, object]) -> list[str]:
+        client = self._get_client()
+        found = client.containers.list(all=all_states, filters=filters)  # type: ignore[attr-defined]
+        return [str(container.id) for container in found]
+
+    async def find_warm(self, key: str) -> str | None:
+        """A running container this tool left warm under ``key``, if any."""
+
+        def _find() -> str | None:
+            ids = self._container_ids(
+                all_states=False, filters={"label": f"{_WARM_KEY_LABEL}={key}", "status": "running"}
+            )
+            return ids[0] if ids else None
+
+        try:
+            return await self._guard(_find, retry=True)
+        except ContainerEngineError as exc:
+            # Adoption is an optimization; failing to look is not failing.
+            logger.debug("could not look for a warm container: %s", exc)
+            return None
+
+    async def list_warm(self) -> list[str]:
+        """Every running container this tool is keeping warm."""
+
+        def _list() -> list[str]:
+            return self._container_ids(
+                all_states=False, filters={"label": f"{_WARM_LABEL}=1", "status": "running"}
+            )
+
+        return await self._guard(_list, retry=True)
+
+    async def prune_warm(self) -> int:
+        """Remove containers of ours that have already expired.
+
+        A self-expired container is *stopped*, not gone -- `auto_remove` is
+        deliberately off so a container that died for some other reason can
+        still be inspected. Reclaiming them here is what keeps them from
+        accumulating across runs.
+        """
+
+        def _list() -> list[str]:
+            return self._container_ids(
+                all_states=True, filters={"label": _WARM_LABEL, "status": "exited"}
+            )
+
+        try:
+            expired = await self._guard(_list, retry=True)
+        except ContainerEngineError as exc:
+            logger.debug("could not list expired containers: %s", exc)
+            return 0
+        for container_id in expired:
+            await self.stop(container_id)
+        return len(expired)
 
     async def exec_in(
         self,
@@ -597,7 +763,14 @@ class DockerEngine:
             )
             if stage.exit_code not in (0, None):
                 raise ContainerEngineError("could not stage stdin inside the container")
-            result = container.exec_run(["sh", "-lc", f"{command} < {handle}"], demux=True)
+            # The handle is removed by the same shell that consumed it, so a
+            # long-lived warm container's /tmp does not grow one file per
+            # evaluation. `$?` is captured first so the removal cannot mask
+            # the command's own exit code.
+            result = container.exec_run(
+                ["sh", "-lc", f"{command} < {handle}; __rc=$?; rm -f {handle}; exit $__rc"],
+                demux=True,
+            )
             stdout, stderr = result.output
             return (
                 (stdout or b"").decode("utf-8", errors="replace"),
@@ -711,6 +884,7 @@ class PodmanEngine(DockerEngine):
         socket_candidates: list[str] | None = None,
         auto_setup: bool = True,
         setup: EngineSetup | None = None,
+        idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
     ) -> None:
         super().__init__(
             client,
@@ -718,6 +892,7 @@ class PodmanEngine(DockerEngine):
             auto_setup=auto_setup,
             setup=setup or PodmanEngineSetup(),
             engine_name="podman",
+            idle_ttl_s=idle_ttl_s,
         )
 
     def _candidates(self) -> list[str]:
@@ -733,8 +908,39 @@ def _to_volumes(mounts: dict[str, str]) -> dict[str, dict[str, str]]:
     return volumes
 
 
+# Every exec stages its stdin to its own file. Keying on the container alone
+# was enough while one process owned one container for one evaluation at a
+# time; a warm container is adoptable by a *second* process, and two of them
+# staging to one path would have an evaluation answer the other's expression.
+_stdin_serial = itertools.count()
+
+
 def _stdin_path(container_id: str) -> str:
-    return f"/tmp/.bfrcr-stdin-{container_id[:12]}"
+    unique = f"{os.getpid():x}-{next(_stdin_serial):x}"
+    return f"/tmp/.bfrcr-stdin-{container_id[:12]}-{unique}"
+
+
+def _package_version() -> str:
+    """This package's version, or a stable placeholder from a source tree."""
+    try:
+        return _distribution_version("bigfix-remote-client-relevance")
+    except PackageNotFoundError:  # pragma: no cover - only outside an install
+        return "0.0.0+unknown"
+
+
+async def stop_warm_containers(engine: ContainerEngine | None = None) -> int:
+    """Remove every container this tool is currently keeping warm.
+
+    The deadline reclaims them on its own; this is for anyone who wants the
+    engine clean now rather than in two minutes -- ending a session, or
+    freeing memory on a laptop.
+    """
+    reclaimer: ContainerEngine = engine if engine is not None else DockerEngine()
+    running = await reclaimer.list_warm()
+    for container_id in running:
+        await reclaimer.stop(container_id)
+    await reclaimer.prune_warm()
+    return len(running)
 
 
 class TransportContainer:
@@ -752,11 +958,18 @@ class TransportContainer:
         rebuild_image: bool = False,
         auto_setup: bool = True,
         coordinator: ImageCoordinator | None = None,
+        idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
     ) -> None:
         self.image = image
         self.arch = arch
         self._engine = engine or DockerEngine(auto_setup=auto_setup)
         self._keep_alive = keep_alive
+        # How long a container of ours survives its last use. None opts out
+        # entirely -- an escape hatch for an image whose shell cannot run the
+        # deadline loop, and the only case where aclose() has to do the
+        # reclaiming itself.
+        self._idle_ttl_s = idle_ttl_s
+        self._pruned = False
         self._target = target
         self._probed: str | None = None
         self._extractor = extractor or ensure_extracted
@@ -815,9 +1028,22 @@ class TransportContainer:
             )
 
     async def aclose(self) -> None:
-        if self._container_id is not None:
-            await self._engine.stop(self._container_id)
+        """Release the container, without necessarily removing it.
+
+        A kept-alive container with a deadline is deliberately left running:
+        that is the whole point of warming one, and the next process (or the
+        next run minutes later) adopts it instead of paying to start another.
+        Its own deadline reclaims it once nobody comes back. Without a
+        deadline there is nothing to do that later, so this has to.
+        """
+        if self._container_id is None:
+            return
+        if self._keep_alive and self._idle_ttl_s is not None:
+            logger.debug("leaving %s warm for %ss", self._container_id[:12], int(self._idle_ttl_s))
             self._container_id = None
+            return
+        await self._engine.stop(self._container_id)
+        self._container_id = None
 
     async def _ensure_image_once(self) -> None:
         """Pull the base image, at most once per image across a whole run."""
@@ -930,7 +1156,9 @@ class TransportContainer:
             needs_container = self._keep_alive or needs_sanity
 
             if needs_container:
-                container_id = await self._acquire_container(mounts, image=image_to_run)
+                container_id = await self._acquire_container(
+                    mounts, image=image_to_run, timeout_s=timeout_s
+                )
                 if not self._keep_alive:
                     transient_container = container_id
                 if needs_sanity:
@@ -1017,15 +1245,78 @@ class TransportContainer:
                 "it to let the image be probed"
             )
 
-    async def _acquire_container(self, mounts: dict[str, str], *, image: str | None = None) -> str:
+    def _deadline_for(self, timeout_s: float) -> float | None:
+        """The window that covers the evaluation about to run, then the idle
+        time after it -- see :data:`_DEADLINE_MARGIN_S`."""
+        if self._idle_ttl_s is None:
+            return None
+        return max(self._idle_ttl_s, timeout_s + _DEADLINE_MARGIN_S)
+
+    async def _acquire_container(
+        self, mounts: dict[str, str], *, image: str | None = None, timeout_s: float = 30.0
+    ) -> str:
+        run_image = image or self._run_image
+        ttl = self._deadline_for(timeout_s)
         if self._keep_alive and self._container_id is not None:
+            # Use is what keeps a warm container alive; an idle one expires.
+            await self._engine.renew(self._container_id, ttl_s=ttl)
             return self._container_id
+
+        labels: dict[str, str] | None = None
+        if self._keep_alive:
+            key = self._warm_key(run_image, mounts)
+            adopted = await self._adopt(key, ttl_s=ttl)
+            if adopted is not None:
+                self._container_id = adopted
+                return adopted
+            labels = {_WARM_LABEL: "1", _WARM_KEY_LABEL: key}
+
         container_id = await self._engine.start(
-            image or self._run_image, mounts=mounts, platform=self.platform
+            run_image,
+            mounts=mounts,
+            platform=self.platform,
+            ttl_s=ttl,
+            labels=labels,
         )
         if self._keep_alive:
             self._container_id = container_id
         return container_id
+
+    def _warm_key(self, image: str, mounts: dict[str, str]) -> str:
+        """What makes two warm containers interchangeable.
+
+        The package version is in the hash on purpose: a container an older
+        release left behind may have been started with a different deadline
+        loop or staging convention, and adopting it would be reusing an
+        interface, not just a container.
+        """
+        parts = [
+            image,
+            self.platform or "",
+            ";".join(f"{source}={target}" for source, target in sorted(mounts.items())),
+            _package_version(),
+        ]
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+    async def _adopt(self, key: str, *, ttl_s: float | None) -> str | None:
+        """A warm container left by an earlier run, if one is still answering."""
+        if not self._pruned:
+            # Self-expired containers are stopped, not removed. Reclaiming
+            # them while we are already talking to the daemon is what keeps
+            # them from accumulating run over run.
+            self._pruned = True
+            await self._engine.prune_warm()
+        found = await self._engine.find_warm(key)
+        if found is None:
+            return None
+        # The renew doubles as the liveness check: a container can die between
+        # the label lookup and the first exec, and adopting a corpse would
+        # fail the evaluation for a reason that has nothing to do with it.
+        if not await self._engine.renew(found, ttl_s=ttl_s):
+            logger.debug("warm container %s did not answer; starting a fresh one", found[:12])
+            return None
+        logger.info("reusing warm container %s for %s", found[:12], self.image)
+        return found
 
     async def _prepare_qna_image(
         self, qna: ResolvedQna, spec: TargetSpec, *, timeout_s: float
@@ -1071,6 +1362,9 @@ class TransportContainer:
             self._run_image,
             mounts={str(tree): f"{_BUILD_STAGING_MOUNT}:ro"},
             platform=self.platform,
+            # A build that fetches packages routinely outlives the default idle
+            # window; PID 1 exiting mid-build would strand a half-built image.
+            ttl_s=timeout_s + DEFAULT_IDLE_TTL_S,
         )
         try:
             _stdout, stderr, exit_code = await self._engine.exec_in(

@@ -134,3 +134,61 @@ def test_a_fanout_labels_every_section():
 
 def test_no_results_renders_empty():
     assert format_results([]) == ""
+
+
+# --- labelling a batch, where one host answers several expressions ----------
+
+
+def test_a_label_can_name_the_expression_that_produced_it():
+    """A batch puts several results under one host and version; without the
+    expression the sections are indistinguishable."""
+    from bigfix_remote_client_relevance.render import label
+
+    result = ClientRelevanceResult(
+        host="host0",
+        transport="ssh",
+        client_relevance="name of operating system",
+        platform="ubuntu",
+    )
+
+    assert "name of operating system" in label(result, with_expression=True)
+    assert "name of operating system" not in label(result)
+
+
+def test_a_long_expression_is_shortened_in_the_label():
+    from bigfix_remote_client_relevance.render import label
+
+    result = ClientRelevanceResult(host="host0", transport="ssh", client_relevance="x" * 200)
+
+    text = label(result, with_expression=True)
+    assert len(text) < 120
+    assert text.endswith("…")
+
+
+def test_a_batch_names_the_expression_in_each_section():
+    """Three results under one host and version print three identical headers
+    otherwise -- the reader cannot tell which answer is which."""
+    results = [
+        ClientRelevanceResult(
+            host="host0", transport="ssh", client_relevance=expression, answers=["x"]
+        )
+        for expression in ("name of operating system", "version of client")
+    ]
+
+    text = format_results(results)
+
+    assert "name of operating system" in text
+    assert "version of client" in text
+
+
+def test_a_single_expression_fan_out_keeps_its_plain_headers():
+    """A fan-out over hosts already distinguishes its sections by host, and
+    repeating the one expression the caller just typed is noise."""
+    results = [
+        ClientRelevanceResult(
+            host=host, transport="ssh", client_relevance="name of operating system", answers=["x"]
+        )
+        for host in ("host0", "host1")
+    ]
+
+    assert "name of operating system" not in format_results(results)

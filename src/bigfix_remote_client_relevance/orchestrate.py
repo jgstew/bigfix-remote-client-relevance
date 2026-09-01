@@ -104,6 +104,12 @@ class Target:
     """Per-target override of the run-wide version spec."""
 
     keep_alive: bool = False
+    idle_ttl_s: float | None = None
+    """Container only. How long a container survives its last use before
+    removing itself; None takes the transport's own default. A kept-alive
+    container is reclaimed by this and nothing else, since it deliberately
+    outlives the process that started it."""
+
     rebuild_image: bool = False
     """Container only. Force a fresh prepared image instead of reusing a cached one."""
 
@@ -161,6 +167,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
         )
     if target.kind == "container":
         from bigfix_remote_client_relevance.transports.container import (
+            DEFAULT_IDLE_TTL_S,
             ContainerEngine,
             ContainerEngineError,
             DockerEngine,
@@ -194,6 +201,10 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             arch=target.arch or "x86_64",
             engine=engine,
             keep_alive=target.keep_alive,
+            # None here means "unset", not "no deadline" -- an inventory host
+            # that says nothing about its idle window gets the default one,
+            # the same as a container built without the argument at all.
+            idle_ttl_s=DEFAULT_IDLE_TTL_S if target.idle_ttl_s is None else target.idle_ttl_s,
             target=target.platform,
             rebuild_image=target.rebuild_image,
             auto_setup=target.auto_setup,
@@ -243,19 +254,46 @@ def _version_specs(target: Target, run_wide: str | Sequence[str] | None) -> list
     return list(chosen) or [None]
 
 
-def count_work(targets: Sequence[Target], qna_version: str | Sequence[str] | None = None) -> int:
+def count_work(
+    targets: Sequence[Target],
+    qna_version: str | Sequence[str] | None = None,
+    expressions: Sequence[str] | int | None = None,
+) -> int:
     """How many results a fan-out over these arguments will produce.
 
     Exposed because a streaming caller has to decide how to format its first
     result before it knows how many follow, and this is not simply
     ``len(targets)``: per-host ``qna_version`` overrides mean each target can
-    contribute a different number of pairs.
+    contribute a different number of pairs, and a batch multiplies each pair by
+    its expressions.
     """
-    return sum(len(_version_specs(target, qna_version)) for target in targets)
+    if expressions is None:
+        per_pair = 1
+    elif isinstance(expressions, int):
+        per_pair = expressions
+    else:
+        per_pair = len(expressions)
+    return sum(len(_version_specs(target, qna_version)) for target in targets) * per_pair
+
+
+async def _release(transport: object) -> None:
+    """Hand a transport back once its work is done.
+
+    Optional by design: ``local`` and ``fastquery`` hold nothing that needs
+    releasing and expose no ``aclose``. A failure here is logged, never
+    raised -- a run that produced its answers must not fail on cleanup.
+    """
+    closer = getattr(transport, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception as exc:  # noqa: BLE001 - cleanup never fails a run
+        logger.debug("releasing a transport failed: %s", exc)
 
 
 async def _evaluate_stream_indexed(
-    client_relevance: str,
+    expressions: Sequence[str],
     targets: Sequence[Target],
     *,
     qna_version: str | Sequence[str] | None = None,
@@ -265,12 +303,20 @@ async def _evaluate_stream_indexed(
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
 ) -> AsyncIterator[tuple[int, ClientRelevanceResult]]:
-    """Shared core: yield ``(work_index, result)`` as each pair finishes.
+    """Shared core: yield ``(work_index, result)`` as each cell finishes.
 
-    ``work_index`` is the pair's position in target-then-version order, kept
-    so callers that need that ordering (:func:`evaluate_client_relevance`) can
-    reconstruct it even though completion order is whatever finishes first.
-    Every failure mode is reported inside a result rather than raised.
+    The unit of *work* is a **group** -- one (target, version) pair -- and the
+    unit of *result* is a cell, one expression within a group. A group builds
+    its transport, probes, and prepares once, then runs every expression
+    through that one transport in sequence: that is what makes a batch cheaper
+    than the same expressions run separately, and for a container it is the
+    difference between one `docker run` and N.
+
+    ``work_index`` is the cell's position in target-then-version-then-expression
+    order, kept so callers that need that ordering
+    (:func:`evaluate_client_relevance`) can reconstruct it even though
+    completion order is whatever finishes first. Every failure mode is reported
+    inside a result rather than raised.
     """
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
@@ -295,7 +341,9 @@ async def _evaluate_stream_indexed(
         (target, spec) for target in targets for spec in _version_specs(target, qna_version)
     ]
 
-    def _failure(target: Target, kind: str, message: str) -> ClientRelevanceResult:
+    def _failure(
+        target: Target, kind: str, message: str, client_relevance: str
+    ) -> ClientRelevanceResult:
         return ClientRelevanceResult(
             host=target.label,
             transport=target.kind,
@@ -304,6 +352,16 @@ async def _evaluate_stream_indexed(
             error_kind=kind,
         )
 
+    def _group_failure(target: Target, kind: str, message: str) -> list[ClientRelevanceResult]:
+        """The same failure, once per expression.
+
+        A group that never gets as far as evaluating still owes one result per
+        cell: ``count_work`` is the denominator a progress indicator commits to
+        before the first result arrives, and a short run would silently
+        misreport rather than fail.
+        """
+        return [_failure(target, kind, message, expression) for expression in expressions]
+
     async def _resolve(target: Target, spec: str | None) -> ResolvedQna:
         # One task per (spec, arch): targets sharing both share the download.
         key = (spec, f"{target.platform or target.kind}-{target.arch}")
@@ -311,111 +369,184 @@ async def _evaluate_stream_indexed(
             resolutions[key] = asyncio.create_task(resolver(spec, target))
         return await resolutions[key]
 
-    async def _one(target: Target, spec: str | None) -> ClientRelevanceResult:
-        started = time.monotonic()
+    async def _group(
+        target: Target, spec: str | None, emit: Callable[[int, ClientRelevanceResult], Any]
+    ) -> None:
+        """Evaluate every expression against one (target, version) pair."""
         resolved: ResolvedQna | None = None
         # Captured before any probe-before-resolve replaces target.platform,
         # so the corrective reprobe below only fires for a platform the
         # caller actually set (never for one this run just probed itself).
         configured_platform = target.platform
 
+        if len(expressions) > 1 and target.kind == "container" and not target.keep_alive:
+            # Without this the second expression starts a second container and
+            # the batch saves nothing. A single expression is left one-shot:
+            # there is nothing to amortize, and one-shot is the more hermetic
+            # default.
+            target = dataclasses.replace(target, keep_alive=True)
+
         try:
             transport = transport_factory(target)
         except Exception as exc:  # noqa: BLE001 - one bad target never fails the run
             logger.debug("transport construction failed for %s: %s", target.label, exc)
-            return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+            for index, result in enumerate(
+                _group_failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+            ):
+                emit(index, result)
+            return
 
-        prepare = getattr(transport, "prepare", None)
-        # Only image-backed transports have an image phase to budget; an SSH
-        # sweep must not be serialized by a container-pull limit.
-        image_budget: AbstractAsyncContextManager[Any] = (
-            image_semaphore if prepare is not None else contextlib.nullcontext()
-        )
-
-        if spec is not None and target.kind == "fastquery":
-            # Endpoints evaluate with their installed agent; refuse before
-            # doing any work rather than resolving a version nothing can use.
-            return _failure(
-                target,
-                ERROR_KIND_RESOLVE,
-                f"cannot pin qna version {spec!r} for the fastquery transport: "
-                "endpoints evaluate with their installed BES agent",
+        try:
+            prepare = getattr(transport, "prepare", None)
+            # Only image-backed transports have an image phase to budget; an SSH
+            # sweep must not be serialized by a container-pull limit.
+            image_budget: AbstractAsyncContextManager[Any] = (
+                image_semaphore if prepare is not None else contextlib.nullcontext()
             )
 
-        # The resolver picks the artifact (deb vs rpm) from the platform, so an
-        # unset one must be probed BEFORE resolution -- gated on spec being set,
-        # since for ssh/container this is a real round trip not worth paying for
-        # a host that's never going to resolve a version anyway (e.g.
-        # `qna_version = []`, probing whatever's installed). Local's probe is
-        # the exception: it's just a `sys.platform` check, no round trip, so it
-        # runs unconditionally -- otherwise an unpinned local entry would never
-        # get its platform written back (`--update-inventory`) or shown in its
-        # header (`render.label`), the entire reason `resolve_platform` was
-        # added to it in the first place. For a container the probe can trigger
-        # the image pull, so it shares the image budget.
-        probe = getattr(transport, "resolve_platform", None)
-        if (
-            target.platform is None
-            and probe is not None
-            and (spec is not None or target.kind == "local")
-        ):
-            try:
-                async with image_budget:
-                    probed = await probe(timeout_s=timeout_s)
-                target = dataclasses.replace(target, platform=probed)
-            except UnknownTargetError as exc:
-                return _failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
-            except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
-                logger.debug("platform probe failed for %s: %s", target.label, exc)
-                return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+            if spec is not None and target.kind == "fastquery":
+                # Endpoints evaluate with their installed agent; refuse before
+                # doing any work rather than resolving a version nothing can use.
+                for index, result in enumerate(
+                    _group_failure(
+                        target,
+                        ERROR_KIND_RESOLVE,
+                        f"cannot pin qna version {spec!r} for the fastquery transport: "
+                        "endpoints evaluate with their installed BES agent",
+                    )
+                ):
+                    emit(index, result)
+                return
 
-        # Same probe-before-resolve idea, for arch: ssh/local targets expose
-        # resolve_arch (container does not -- its arch is always an explicit,
-        # intentional per-run choice, never an unknown to infer). Unlike
-        # platform, a failed arch probe never fails the target -- "x86_64",
-        # the common case for BigFix clients, is always a reasonable
-        # fallback, so there is no analog to UnknownTargetError here.
-        arch_probe = getattr(transport, "resolve_arch", None)
-        if (
-            target.arch is None
-            and arch_probe is not None
-            and (spec is not None or target.kind == "local")
-        ):
-            try:
-                async with image_budget:
-                    probed_arch = await arch_probe(timeout_s=timeout_s)
-            except Exception as exc:  # noqa: BLE001 - arch always has a safe fallback
-                logger.debug("arch probe failed for %s: %s", target.label, exc)
-                probed_arch = "x86_64"
-            target = dataclasses.replace(target, arch=probed_arch)
+            # The resolver picks the artifact (deb vs rpm) from the platform, so an
+            # unset one must be probed BEFORE resolution -- gated on spec being set,
+            # since for ssh/container this is a real round trip not worth paying for
+            # a host that's never going to resolve a version anyway (e.g.
+            # `qna_version = []`, probing whatever's installed). Local's probe is
+            # the exception: it's just a `sys.platform` check, no round trip, so it
+            # runs unconditionally -- otherwise an unpinned local entry would never
+            # get its platform written back (`--update-inventory`) or shown in its
+            # header (`render.label`), the entire reason `resolve_platform` was
+            # added to it in the first place. For a container the probe can trigger
+            # the image pull, so it shares the image budget.
+            probe = getattr(transport, "resolve_platform", None)
+            if (
+                target.platform is None
+                and probe is not None
+                and (spec is not None or target.kind == "local")
+            ):
+                try:
+                    async with image_budget:
+                        probed = await probe(timeout_s=timeout_s)
+                    target = dataclasses.replace(target, platform=probed)
+                except UnknownTargetError as exc:
+                    for index, result in enumerate(
+                        _group_failure(target, ERROR_KIND_BOOTSTRAP, str(exc))
+                    ):
+                        emit(index, result)
+                    return
+                except Exception as exc:  # noqa: BLE001 - a bad probe never kills a run
+                    logger.debug("platform probe failed for %s: %s", target.label, exc)
+                    for index, result in enumerate(
+                        _group_failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+                    ):
+                        emit(index, result)
+                    return
 
-        if spec is not None:
-            try:
-                resolved = await _resolve(target, spec)
-            except ResolveError as exc:
-                return _failure(target, ERROR_KIND_RESOLVE, str(exc))
-            except Exception as exc:  # noqa: BLE001 - resolution never kills a run
-                logger.debug("resolution failed for %s: %s", spec, exc)
-                return _failure(target, ERROR_KIND_RESOLVE, f"could not resolve {spec!r}: {exc}")
+            # Same probe-before-resolve idea, for arch: ssh/local targets expose
+            # resolve_arch (container does not -- its arch is always an explicit,
+            # intentional per-run choice, never an unknown to infer). Unlike
+            # platform, a failed arch probe never fails the target -- "x86_64",
+            # the common case for BigFix clients, is always a reasonable
+            # fallback, so there is no analog to UnknownTargetError here.
+            arch_probe = getattr(transport, "resolve_arch", None)
+            if (
+                target.arch is None
+                and arch_probe is not None
+                and (spec is not None or target.kind == "local")
+            ):
+                try:
+                    async with image_budget:
+                        probed_arch = await arch_probe(timeout_s=timeout_s)
+                except Exception as exc:  # noqa: BLE001 - arch always has a safe fallback
+                    logger.debug("arch probe failed for %s: %s", target.label, exc)
+                    probed_arch = "x86_64"
+                target = dataclasses.replace(target, arch=probed_arch)
 
-        if prepare is not None:
-            # Pulling and building under their own budget. Failures are not
-            # fatal: this is an optimization, and the evaluation below hits the
-            # same code path and reports the failure in its own vocabulary.
-            try:
-                async with image_budget:
-                    await prepare(qna=resolved, timeout_s=timeout_s)
-            except Exception as exc:  # noqa: BLE001 - the evaluation will report it
-                logger.debug("image preparation failed for %s: %s", target.label, exc)
+            if spec is not None:
+                try:
+                    resolved = await _resolve(target, spec)
+                except ResolveError as exc:
+                    for index, result in enumerate(
+                        _group_failure(target, ERROR_KIND_RESOLVE, str(exc))
+                    ):
+                        emit(index, result)
+                    return
+                except Exception as exc:  # noqa: BLE001 - resolution never kills a run
+                    logger.debug("resolution failed for %s: %s", spec, exc)
+                    for index, result in enumerate(
+                        _group_failure(
+                            target, ERROR_KIND_RESOLVE, f"could not resolve {spec!r}: {exc}"
+                        )
+                    ):
+                        emit(index, result)
+                    return
 
+            if prepare is not None:
+                # Pulling and building under their own budget. Failures are not
+                # fatal: this is an optimization, and the evaluation below hits the
+                # same code path and reports the failure in its own vocabulary.
+                try:
+                    async with image_budget:
+                        await prepare(qna=resolved, timeout_s=timeout_s)
+                except Exception as exc:  # noqa: BLE001 - the evaluation will report it
+                    logger.debug("image preparation failed for %s: %s", target.label, exc)
+
+            for index, expression in enumerate(expressions):
+                emit(
+                    index,
+                    await _evaluate_one(
+                        transport,
+                        target,
+                        expression,
+                        resolved=resolved,
+                        spec=spec,
+                        configured_platform=configured_platform,
+                    ),
+                )
+        finally:
+            # Nothing else in the process holds this transport, so an
+            # unreleased one leaks whatever it opened -- an SSH connection,
+            # or (worse, because it outlives the process) a kept-alive
+            # container.
+            await _release(transport)
+
+    async def _evaluate_one(
+        transport: Transport,
+        target: Target,
+        client_relevance: str,
+        *,
+        resolved: ResolvedQna | None,
+        spec: str | None,
+        configured_platform: str | None,
+    ) -> ClientRelevanceResult:
+        """One expression, against an already-prepared transport.
+
+        The semaphore is held around the evaluation itself rather than the
+        whole group, so a ten-expression batch does not occupy a concurrency
+        slot for the length of its serial run.
+        """
+        started = time.monotonic()
         async with semaphore:
             try:
                 result = await transport.evaluate_client_relevance(
                     client_relevance, qna=resolved, timeout_s=timeout_s
                 )
-            except Exception as exc:  # noqa: BLE001 - one bad target never fails the run
+            except Exception as exc:  # noqa: BLE001 - one bad cell never fails the run
                 logger.debug("transport failed for %s: %s", target.label, exc)
-                return _failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}")
+                return _failure(
+                    target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}", client_relevance
+                )
 
         # Whatever platform/arch this run actually used -- explicit, freshly
         # probed, or (platform only, below) corrected -- so the CLI can write
@@ -455,35 +586,46 @@ async def _evaluate_stream_indexed(
         return result
 
     logger.info(
-        "evaluating client relevance across %d target/version pair(s), max_parallel=%d",
+        "evaluating %d client-relevance expression(s) across %d target/version pair(s), "
+        "max_parallel=%d",
+        len(expressions),
         len(work),
         max_parallel,
     )
 
-    async def _one_indexed(
-        index: int, target: Target, spec: str | None
-    ) -> tuple[int, ClientRelevanceResult]:
-        return index, await _one(target, spec)
+    # A queue rather than as_completed: a group now produces several results,
+    # and the whole point of the streaming form is that each one is handed
+    # over the moment it lands rather than when its group finishes.
+    queue: asyncio.Queue[tuple[int, ClientRelevanceResult] | None] = asyncio.Queue()
 
-    # Plain tasks + as_completed, not a TaskGroup: TaskGroup only releases its
-    # results once every task has finished, which is exactly the "all at
-    # once" behavior a streaming caller wants to avoid. This is safe because
-    # _one() never lets an exception escape -- every failure mode above comes
-    # back as a result, not a raise -- so there is nothing here for
-    # TaskGroup's cancel-siblings-on-error behavior to actually add.
+    async def _run_group(base: int, target: Target, spec: str | None) -> None:
+        def emit(offset: int, result: ClientRelevanceResult) -> None:
+            queue.put_nowait((base + offset, result))
+
+        try:
+            await _group(target, spec, emit)
+        finally:
+            # One sentinel per group, so the drain below knows when every
+            # group has had its say -- including a cancelled one.
+            queue.put_nowait(None)
+
     tasks = [
-        asyncio.create_task(_one_indexed(index, target, spec))
+        asyncio.create_task(_run_group(index * len(expressions), target, spec))
         for index, (target, spec) in enumerate(work)
     ]
     try:
-        for coro in asyncio.as_completed(tasks):
-            yield await coro
+        pending_groups = len(tasks)
+        while pending_groups:
+            item = await queue.get()
+            if item is None:
+                pending_groups -= 1
+                continue
+            yield item
     finally:
         # A consumer that stops early -- `break`, an exception, or an
         # abandoned generator -- would otherwise leave the remaining
         # evaluations running against live SSH connections and containers
-        # with nobody to collect them. TaskGroup gave us this for free; on
-        # plain tasks it has to be written out.
+        # with nobody to collect them.
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -511,7 +653,7 @@ async def evaluate_client_relevance_stream(
     them).
     """
     async for _index, result in _evaluate_stream_indexed(
-        client_relevance,
+        [client_relevance],
         targets,
         qna_version=qna_version,
         max_parallel=max_parallel,
@@ -543,7 +685,7 @@ async def evaluate_client_relevance(
     """
     by_index: dict[int, ClientRelevanceResult] = {}
     async for index, result in _evaluate_stream_indexed(
-        client_relevance,
+        [client_relevance],
         targets,
         qna_version=qna_version,
         max_parallel=max_parallel,
@@ -554,6 +696,80 @@ async def evaluate_client_relevance(
     ):
         by_index[index] = result
     return [by_index[i] for i in range(len(by_index))]
+
+
+async def evaluate_many_stream(
+    expressions: Sequence[str],
+    targets: Sequence[Target],
+    *,
+    qna_version: str | Sequence[str] | None = None,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
+    pull_parallel: int = DEFAULT_PULL_PARALLEL,
+    timeout_s: float = 30.0,
+    transport_factory: TransportFactory | None = None,
+    resolver: Resolver | None = None,
+) -> AsyncIterator[ClientRelevanceResult]:
+    """Evaluate every expression on every target, for every version.
+
+    Yields each ``ClientRelevanceResult`` as soon as its cell finishes, in
+    completion order. See :func:`evaluate_many` for what a batch buys.
+    """
+    async for _index, result in _evaluate_stream_indexed(
+        expressions,
+        targets,
+        qna_version=qna_version,
+        max_parallel=max_parallel,
+        pull_parallel=pull_parallel,
+        timeout_s=timeout_s,
+        transport_factory=transport_factory,
+        resolver=resolver,
+    ):
+        yield result
+
+
+async def evaluate_many(
+    expressions: Sequence[str],
+    targets: Sequence[Target],
+    *,
+    qna_version: str | Sequence[str] | None = None,
+    max_parallel: int = DEFAULT_MAX_PARALLEL,
+    pull_parallel: int = DEFAULT_PULL_PARALLEL,
+    timeout_s: float = 30.0,
+    transport_factory: TransportFactory | None = None,
+    resolver: Resolver | None = None,
+) -> list[ClientRelevanceResult]:
+    """Evaluate several expressions across several targets in one pass.
+
+    Returns one result per (target, version, expression), in that order. Each
+    result carries the expression that produced it in ``client_relevance``, so
+    no positional bookkeeping is needed to attribute an answer.
+
+    What this saves over calling :func:`evaluate_client_relevance` once per
+    expression is the per-expression *setup*: each (target, version) pair
+    builds one transport, probes it, and prepares its image once, then runs
+    every expression through it. For a container that is one image
+    pull/prepared-image lookup and one ``docker run`` instead of N; for SSH it
+    is one connection instead of N, since :class:`TransportSSH` multiplexes
+    evaluations over the connection it already has. Container targets carrying
+    more than one expression are kept alive for the batch automatically.
+
+    Every failure mode is reported inside a result rather than raised, and a
+    group that dies before evaluating anything still answers once per
+    expression, so the result count always matches :func:`count_work`.
+    """
+    by_index: dict[int, ClientRelevanceResult] = {}
+    async for index, result in _evaluate_stream_indexed(
+        expressions,
+        targets,
+        qna_version=qna_version,
+        max_parallel=max_parallel,
+        pull_parallel=pull_parallel,
+        timeout_s=timeout_s,
+        transport_factory=transport_factory,
+        resolver=resolver,
+    ):
+        by_index[index] = result
+    return [by_index[i] for i in sorted(by_index)]
 
 
 def worst_exit_code(results: Sequence[ClientRelevanceResult]) -> int:
@@ -584,5 +800,7 @@ __all__ = [
     "default_transport_factory",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",
+    "evaluate_many",
+    "evaluate_many_stream",
     "worst_exit_code",
 ]

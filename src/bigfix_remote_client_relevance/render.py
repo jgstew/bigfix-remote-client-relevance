@@ -36,7 +36,12 @@ def display_host(result: ClientRelevanceResult) -> str:
     return result.host
 
 
-def label(result: ClientRelevanceResult) -> str:
+# Long enough to tell two inspectors apart, short enough that a section header
+# stays one terminal line next to the host and version it already carries.
+_LABEL_EXPRESSION_CHARS = 60
+
+
+def label(result: ClientRelevanceResult, *, with_expression: bool = False) -> str:
     """Full header text: ``transport:platform:host``, then the qna version --
     e.g. ``ssh:windows:192.168.4.115 (qna 11.0.6.137)``, or
     ``local:macos:this-mac-builtin`` for a local inventory entry -- echoing
@@ -74,15 +79,25 @@ def label(result: ClientRelevanceResult) -> str:
         text = display_host(result)
     if result.qna_version:
         text = f"{text} (qna {result.qna_version})"
+    if with_expression:
+        # A batch puts several results under one host and version; only the
+        # expression tells them apart. Off by default, since the single-
+        # expression case would just repeat what the caller already typed.
+        expression = " ".join(result.client_relevance.split())
+        if len(expression) > _LABEL_EXPRESSION_CHARS:
+            expression = expression[: _LABEL_EXPRESSION_CHARS - 1] + "\u2026"
+        text = f"{text} {expression}"
     return text
 
 
-def format_result(result: ClientRelevanceResult, *, labelled: bool = False) -> str:
+def format_result(
+    result: ClientRelevanceResult, *, labelled: bool = False, with_expression: bool = False
+) -> str:
     """One result's section. Shared by the batch and streaming renderers, so
     the two can never drift into printing the same result differently."""
     lines: list[str] = []
     if labelled:
-        lines.append(f"== {label(result)}")
+        lines.append(f"== {label(result, with_expression=with_expression)}")
     lines.extend(result.answers)
     if result.error:
         # Errors are rendered inline as part of a labelled section; the CLI's
@@ -92,9 +107,19 @@ def format_result(result: ClientRelevanceResult, *, labelled: bool = False) -> s
 
 
 def format_results(results: Sequence[ClientRelevanceResult]) -> str:
-    """Answers for a single result; host-labelled sections for a fan-out."""
+    """Answers for a single result; host-labelled sections for a fan-out.
+
+    A batch puts several results under the same host and version, so the
+    headers name the expression too -- but only when there is more than one in
+    play. Repeating the single expression the caller just typed, once per host,
+    would be noise.
+    """
     multiple = len(results) > 1
-    return "\n".join(format_result(result, labelled=multiple) for result in results)
+    several_expressions = len({result.client_relevance for result in results}) > 1
+    return "\n".join(
+        format_result(result, labelled=multiple, with_expression=several_expressions)
+        for result in results
+    )
 
 
 __all__ = ["display_host", "format_result", "format_results", "label"]

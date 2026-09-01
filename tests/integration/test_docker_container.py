@@ -242,3 +242,74 @@ async def test_without_auto_setup_a_missing_library_is_reported_not_installed(tm
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
     assert "libdbus-1.so.3" in (result.error or "")
     assert "no qna in image" not in (result.error or "")
+
+
+# --- warm containers, against a real daemon ---------------------------------
+
+
+async def test_a_warm_container_survives_the_transport_that_started_it(stub_qna_image):
+    """The cross-process reuse case, in one process: the first transport
+    leaves the container running, the second finds and adopts it."""
+    from bigfix_remote_client_relevance.transports.container import stop_warm_containers
+
+    first = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
+    await first.evaluate_client_relevance("TRUE")
+    warmed = first._container_id
+    await first.aclose()
+
+    second = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
+    try:
+        result = await second.evaluate_client_relevance("TRUE")
+        adopted = second._container_id
+    finally:
+        await second.aclose()
+        await stop_warm_containers(DockerEngine())
+
+    assert result.error_kind is None
+    assert warmed is not None
+    assert adopted == warmed, "the second transport started its own container"
+
+
+async def test_a_container_removes_itself_once_its_deadline_passes(stub_qna_image):
+    """The only cleanup that survives losing the host process."""
+    import asyncio
+
+    import docker
+
+    engine = DockerEngine(idle_ttl_s=3)
+    container_id = await engine.start(stub_qna_image)
+    client = docker.from_env()
+    try:
+        assert client.containers.get(container_id).status == "running"
+
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if client.containers.get(container_id).status != "running":
+                break
+
+        assert client.containers.get(container_id).status != "running", (
+            "the deadline loop never exited"
+        )
+    finally:
+        await engine.stop(container_id)
+
+
+async def test_use_keeps_a_container_past_its_original_deadline(stub_qna_image):
+    """Extending the window is what makes the periodic serial case work."""
+    import asyncio
+
+    import docker
+
+    engine = DockerEngine(idle_ttl_s=6)
+    container_id = await engine.start(stub_qna_image)
+    client = docker.from_env()
+    try:
+        for _ in range(4):
+            await asyncio.sleep(2)
+            assert await engine.renew(container_id)
+
+        assert client.containers.get(container_id).status == "running", (
+            "renewing must push the deadline out, not merely reset a fixed one"
+        )
+    finally:
+        await engine.stop(container_id)

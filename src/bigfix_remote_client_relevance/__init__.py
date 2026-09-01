@@ -17,8 +17,14 @@ from a submodule is never required:
   :func:`evaluate_client_relevance_stream` — the fan-out, batched or in
   completion order. Neither raises for a target failure; a bad host comes back
   as a :class:`ClientRelevanceResult` with ``error_kind`` set.
-* :func:`count_work` — the ``targets x versions`` total, i.e. the denominator
-  for a progress indicator over the streaming form.
+* :func:`evaluate_many` and :func:`evaluate_many_stream` — the same fan-out
+  over several expressions at once, one transport per (target, version) pair
+  rather than one per expression. Container targets are kept warm for the
+  batch, so a dozen expressions cost one container start rather than a dozen.
+* :func:`count_work` — the ``targets x versions x expressions`` total, i.e.
+  the denominator for a progress indicator over the streaming form.
+* :func:`stop_warm_containers` — reclaim every container this tool is keeping
+  warm, without waiting for its idle deadline.
 * :func:`result_to_dict` / :func:`results_to_dicts` and
   :data:`RESULT_JSON_SCHEMA` — the JSON wire shape and its schema.
 * :func:`format_result` / :func:`format_results` — the same human-readable text
@@ -45,6 +51,8 @@ from bigfix_remote_client_relevance.orchestrate import (
     count_work,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
+    evaluate_many,
+    evaluate_many_stream,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
@@ -69,7 +77,10 @@ from bigfix_remote_client_relevance.serialize import (
     results_to_dicts,
 )
 from bigfix_remote_client_relevance.transports import Transport
-from bigfix_remote_client_relevance.transports.container import TransportContainer
+from bigfix_remote_client_relevance.transports.container import (
+    TransportContainer,
+    stop_warm_containers,
+)
 from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 from bigfix_remote_client_relevance.transports.local import TransportLocal
 from bigfix_remote_client_relevance.transports.ssh import TransportSSH
@@ -110,6 +121,8 @@ __all__ = [
     "count_work",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",
+    "evaluate_many",
+    "evaluate_many_stream",
     "find_qna_path",
     "format_result",
     "format_results",
@@ -117,5 +130,6 @@ __all__ = [
     "parse_qna_output",
     "result_to_dict",
     "results_to_dicts",
+    "stop_warm_containers",
     "worst_exit_code",
 ]

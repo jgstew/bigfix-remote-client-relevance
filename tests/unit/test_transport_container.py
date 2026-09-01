@@ -57,6 +57,11 @@ class FakeEngine:
     pulled: list[str] = field(default_factory=list)
     started: list[dict[str, object]] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
+    renewed: list[tuple[str, float | None]] = field(default_factory=list)
+    # key -> container id, standing in for the daemon's own label index.
+    warm: dict[str, str] = field(default_factory=dict)
+    renew_fails: bool = False
+    pruned: int = 0
     one_shots: list[dict[str, object]] = field(default_factory=list)
     execs: list[ExecCall] = field(default_factory=list)
     digest: str = "sha256:basedigest"
@@ -168,9 +173,33 @@ class FakeEngine:
         *,
         mounts: dict[str, str] | None = None,
         platform: str | None = None,
+        ttl_s: float | None = None,
+        labels: dict[str, str] | None = None,
     ) -> str:
-        self.started.append({"image": image, "mounts": mounts or {}, "platform": platform})
+        self.started.append(
+            {
+                "image": image,
+                "mounts": mounts or {},
+                "platform": platform,
+                "ttl_s": ttl_s,
+                "labels": dict(labels or {}),
+            }
+        )
         return f"container-{len(self.started)}"
+
+    async def renew(self, container_id: str, *, ttl_s: float | None = None) -> bool:
+        self.renewed.append((container_id, ttl_s))
+        return not self.renew_fails
+
+    async def find_warm(self, key: str) -> str | None:
+        return self.warm.get(key)
+
+    async def list_warm(self) -> list[str]:
+        return list(self.warm.values())
+
+    async def prune_warm(self) -> int:
+        self.pruned += 1
+        return 0
 
     async def exec_in(
         self,
@@ -1675,9 +1704,6 @@ async def test_keep_alive_reuses_one_container():
     assert len(engine.execs) >= 2
     assert engine.stopped == [], "keep-alive container must survive between evals"
 
-    await transport.aclose()
-    assert len(engine.stopped) == 1
-
 
 async def test_one_shot_is_the_default():
     engine = FakeEngine(responses=[EVAL_OK])
@@ -2007,3 +2033,315 @@ def test_podman_engine_setup_defaults_to_podman_engine_setup():
     engine = PodmanEngine()
 
     assert isinstance(engine._setup, PodmanEngineSetup)
+
+
+# --- stdin staging must not collide between concurrent execs ----------------
+
+
+class FakeExecResult:
+    def __init__(self, exit_code: int = 0, output: tuple[bytes, bytes] = (b"", b"")) -> None:
+        self.exit_code = exit_code
+        self.output = output
+
+
+class FakeExecContainer:
+    """Records every exec_run command, so staging paths can be inspected."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def exec_run(self, argv: list[str], demux: bool = False) -> FakeExecResult:
+        self.commands.append(argv[-1])
+        return FakeExecResult()
+
+
+class FakeExecClient:
+    def __init__(self, container: FakeExecContainer) -> None:
+        self.containers = self
+        self._container = container
+
+    def get(self, container_id: str) -> FakeExecContainer:
+        return self._container
+
+    def ping(self) -> bool:
+        return True
+
+
+def _staging_paths(commands: list[str]) -> list[str]:
+    """The `/tmp/.bfrcr-stdin-...` handle each staging command wrote to."""
+    return [
+        match.group(0)
+        for command in commands
+        if (match := re.search(r"/tmp/\.bfrcr-stdin-\S+", command)) and command.startswith("printf")
+    ]
+
+
+async def test_stdin_staging_paths_are_unique_per_exec():
+    """Two evaluations sharing one container must not stage stdin to the same
+    path: a warm container is adoptable by a second process, and colliding
+    handles would have one evaluation answer the other's expression."""
+    container = FakeExecContainer()
+    engine = engine_with(FakeExecClient(container))
+
+    await engine.exec_in("abc123456789", "qna -t", input="first")
+    await engine.exec_in("abc123456789", "qna -t", input="second")
+
+    paths = _staging_paths(container.commands)
+    assert len(paths) == 2
+    assert paths[0] != paths[1], f"both execs staged stdin to {paths[0]}"
+
+
+async def test_stdin_staging_file_is_removed_after_the_exec():
+    """Nothing accumulates in a long-lived warm container's /tmp."""
+    container = FakeExecContainer()
+    engine = engine_with(FakeExecClient(container))
+
+    await engine.exec_in("abc123456789", "qna -t", input="hello")
+
+    handle = _staging_paths(container.commands)[0]
+    assert any(f"rm -f {handle}" in command for command in container.commands)
+
+
+# --- every container carries its own deadline -------------------------------
+
+
+class FakeStartedContainer:
+    def __init__(self, container_id: str = "started-1") -> None:
+        self.id = container_id
+
+
+class FakeRunClient:
+    """Just enough of the docker SDK to drive start()."""
+
+    def __init__(self) -> None:
+        self.containers = self
+        self.runs: list[dict[str, object]] = []
+
+    def run(self, image: str, **kwargs: object) -> FakeStartedContainer:
+        self.runs.append({"image": image, **kwargs})
+        return FakeStartedContainer()
+
+    def ping(self) -> bool:
+        return True
+
+
+async def test_every_container_starts_with_a_self_expiring_deadline():
+    """A `finally` covers an exception, not a SIGKILL or a lost removal. The
+    only cleanup that survives losing the process is one inside the container."""
+    from bigfix_remote_client_relevance.transports.container import DEFAULT_IDLE_TTL_S
+
+    client = FakeRunClient()
+
+    await engine_with(client).start("ubuntu:22.04")
+
+    command = client.runs[0]["command"]
+    assert isinstance(command, list), "a deadline loop needs a shell, so argv not a bare string"
+    assert command[:2] == ["sh", "-c"]
+    assert str(int(DEFAULT_IDLE_TTL_S)) in command[2]
+    assert "date +%s" in command[2]
+
+
+async def test_a_container_is_labelled_so_strays_can_be_found():
+    from bigfix_remote_client_relevance.transports.container import DEFAULT_IDLE_TTL_S
+
+    client = FakeRunClient()
+
+    await engine_with(client).start("ubuntu:22.04")
+
+    labels = client.runs[0]["labels"]
+    assert isinstance(labels, dict)
+    assert labels["bfrcr.warm"] == "0"
+    assert labels["bfrcr.ttl"] == str(int(DEFAULT_IDLE_TTL_S))
+
+
+async def test_a_longer_ttl_can_be_asked_for():
+    """A prepared-image build routinely outlives five minutes and must not
+    have PID 1 exit out from under it."""
+    client = FakeRunClient()
+
+    await engine_with(client).start("ubuntu:22.04", ttl_s=900)
+
+    assert "900" in str(client.runs[0]["command"])
+
+
+async def test_the_deadline_can_be_opted_out_of():
+    """The escape hatch for an image whose shell cannot run the loop."""
+    from bigfix_remote_client_relevance.transports.container import (
+        KEEP_ALIVE_COMMAND,
+        DockerEngine,
+    )
+
+    client = FakeRunClient()
+
+    await DockerEngine(client=client, idle_ttl_s=None).start("ubuntu:22.04")
+
+    assert client.runs[0]["command"] == KEEP_ALIVE_COMMAND
+
+
+async def test_renewing_pushes_the_deadline_forward():
+    container = FakeExecContainer()
+
+    await engine_with(FakeExecClient(container)).renew("abc123456789", ttl_s=300)
+
+    assert any("date +%s" in command and "300" in command for command in container.commands)
+
+
+async def test_a_prepared_image_build_gets_a_ttl_past_the_build_timeout(resolved, extracted):
+    """Regression guard: the build container must outlive _BUILD_TIMEOUT_S."""
+    from bigfix_remote_client_relevance.transports.container import _BUILD_TIMEOUT_S
+
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, extractor=extracted)
+
+    await transport.evaluate_client_relevance("true", qna=resolved)
+
+    assert engine.started, "the build container was never started"
+    ttl = engine.started[0]["ttl_s"]
+    assert ttl is not None
+    assert float(str(ttl)) >= _BUILD_TIMEOUT_S
+
+
+# --- warm containers, adopted across processes ------------------------------
+
+
+def warm_key_of(engine: FakeEngine) -> str:
+    """The key the transport labelled its warm container with."""
+    labels = engine.started[0]["labels"]
+    assert isinstance(labels, dict)
+    return labels["bfrcr.key"]
+
+
+async def test_a_warm_container_is_labelled_with_its_key():
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
+
+    await transport.evaluate_client_relevance("true")
+
+    labels = engine.started[0]["labels"]
+    assert isinstance(labels, dict)
+    assert labels["bfrcr.warm"] == "1"
+    assert labels["bfrcr.key"]
+
+
+async def test_a_warm_container_left_by_another_process_is_adopted():
+    """The whole point of the idle TTL: the next invocation, minutes later and
+    in a different process, reuses the container rather than paying for one."""
+    first = FakeEngine(responses=[EVAL_OK])
+    await TransportContainer(
+        "ubuntu:22.04", engine=first, keep_alive=True
+    ).evaluate_client_relevance("true")
+    key = warm_key_of(first)
+
+    second = FakeEngine(responses=[EVAL_OK], warm={key: "container-1"})
+    transport = TransportContainer("ubuntu:22.04", engine=second, keep_alive=True)
+    await transport.evaluate_client_relevance("true")
+
+    assert second.started == [], "an adoptable container must not be duplicated"
+    assert second.execs, "the adopted container must actually be used"
+
+
+async def test_the_warm_key_distinguishes_images():
+    keys = []
+    for image in ("ubuntu:22.04", "almalinux:9"):
+        engine = FakeEngine(responses=[EVAL_OK])
+        await TransportContainer(image, engine=engine, keep_alive=True).evaluate_client_relevance(
+            "true"
+        )
+        keys.append(warm_key_of(engine))
+
+    assert keys[0] != keys[1]
+
+
+async def test_the_warm_key_distinguishes_architectures():
+    keys = []
+    for arch in ("x86_64", "arm64"):
+        engine = FakeEngine(responses=[EVAL_OK])
+        await TransportContainer(
+            "ubuntu:22.04", engine=engine, arch=arch, keep_alive=True
+        ).evaluate_client_relevance("true")
+        keys.append(warm_key_of(engine))
+
+    assert keys[0] != keys[1]
+
+
+async def test_an_adopted_container_that_does_not_answer_is_replaced():
+    """A container can die between the label lookup and the first exec."""
+    engine = FakeEngine(responses=[EVAL_OK], warm={"whatever": "ghost"}, renew_fails=True)
+    engine.warm = {}
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
+    await transport.evaluate_client_relevance("true")
+    key = warm_key_of(engine)
+
+    dead = FakeEngine(responses=[EVAL_OK], warm={key: "ghost"}, renew_fails=True)
+    await TransportContainer(
+        "ubuntu:22.04", engine=dead, keep_alive=True
+    ).evaluate_client_relevance("true")
+
+    assert dead.renewed and dead.renewed[0][0] == "ghost", "adoption must check liveness first"
+    assert len(dead.started) == 1, "a container that fails its liveness check must be replaced"
+
+
+async def test_using_a_warm_container_pushes_its_deadline_out():
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
+
+    await transport.evaluate_client_relevance("true")
+    await transport.evaluate_client_relevance("true")
+
+    assert engine.renewed, "a warm container that is being used must not expire under it"
+
+
+async def test_aclose_leaves_a_warm_container_for_the_next_process():
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
+
+    await transport.evaluate_client_relevance("true")
+    await transport.aclose()
+
+    assert engine.stopped == [], "the deadline owns a warm container's life, not aclose()"
+
+
+async def test_aclose_stops_a_keep_alive_container_that_cannot_self_expire():
+    """With no deadline there is nothing to reclaim it later, so aclose must."""
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True, idle_ttl_s=None)
+
+    await transport.evaluate_client_relevance("true")
+    await transport.aclose()
+
+    assert len(engine.stopped) == 1
+
+
+async def test_stop_warm_containers_reclaims_them_all():
+    from bigfix_remote_client_relevance.transports.container import stop_warm_containers
+
+    engine = FakeEngine(warm={"a": "container-a", "b": "container-b"})
+
+    stopped = await stop_warm_containers(engine)
+
+    assert stopped == 2
+    assert sorted(engine.stopped) == ["container-a", "container-b"]
+
+
+async def test_a_slow_evaluation_cannot_expire_the_container_under_itself():
+    """The idle window is shorter than a generous --timeout, so the deadline
+    has to cover the evaluation about to run, not just the idle time after it."""
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True, idle_ttl_s=120)
+
+    await transport.evaluate_client_relevance("true", timeout_s=600)
+
+    ttl = engine.started[0]["ttl_s"]
+    assert ttl is not None
+    assert float(str(ttl)) > 600, "the container would expire mid-evaluation"
+
+
+async def test_a_reused_container_is_renewed_to_cover_the_next_evaluation():
+    engine = FakeEngine(responses=[EVAL_OK])
+    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True, idle_ttl_s=120)
+
+    await transport.evaluate_client_relevance("true", timeout_s=30)
+    await transport.evaluate_client_relevance("true", timeout_s=600)
+
+    assert engine.renewed[-1][1] is not None
+    assert float(str(engine.renewed[-1][1])) > 600

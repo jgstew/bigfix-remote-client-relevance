@@ -1404,3 +1404,211 @@ async def test_container_arch_is_never_probed():
     )
 
     assert results[0].arch == "amd64"
+
+
+# --- transports are closed, always ------------------------------------------
+
+
+class ClosableTransport(FakeTransport):
+    """A transport that records whether the fan-out ever released it."""
+
+    def __init__(self, host: str, *, fail: bool = False) -> None:
+        super().__init__(host)
+        self.closed = 0
+        self._fail = fail
+
+    async def evaluate_client_relevance(self, client_relevance, **kwargs):
+        if self._fail:
+            raise RuntimeError("boom")
+        return await super().evaluate_client_relevance(client_relevance, **kwargs)
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+async def test_the_fan_out_closes_every_transport_it_built():
+    """Without this a keep_alive container is stranded for the life of the
+    machine -- nothing else in the process holds a reference to it."""
+    built: list[ClosableTransport] = []
+
+    def factory(target: Target) -> ClosableTransport:
+        transport = ClosableTransport(target.name)
+        built.append(transport)
+        return transport
+
+    await evaluate_client_relevance("true", SSH_TARGETS, transport_factory=factory)
+
+    assert len(built) == 3
+    assert [t.closed for t in built] == [1, 1, 1]
+
+
+async def test_a_failed_evaluation_still_closes_its_transport():
+    built: list[ClosableTransport] = []
+
+    def factory(target: Target) -> ClosableTransport:
+        transport = ClosableTransport(target.name, fail=True)
+        built.append(transport)
+        return transport
+
+    results = await evaluate_client_relevance(
+        "true", [Target(kind="ssh", name="host0")], transport_factory=factory
+    )
+
+    assert results[0].error_kind == ERROR_KIND_TRANSPORT
+    assert built[0].closed == 1
+
+
+async def test_a_transport_without_aclose_is_left_alone():
+    """local and fastquery have no aclose; the fan-out must not require one."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="local", name="local")],
+        transport_factory=lambda t: FakeTransport(t.name),
+    )
+
+    assert results[0].error_kind is None
+
+
+# --- expressions as a third axis --------------------------------------------
+
+
+async def test_many_expressions_share_one_transport():
+    """The point of the batch API: one container, N expressions -- not N
+    containers each paying for a pull, a prepared-image lookup and a start."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    built: list[FakeTransport] = []
+
+    def factory(target: Target) -> FakeTransport:
+        transport = FakeTransport(target.name)
+        built.append(transport)
+        return transport
+
+    results = await evaluate_many(
+        ["one", "two", "three"],
+        [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")],
+        transport_factory=factory,
+    )
+
+    assert len(built) == 1, "each expression must not get its own transport"
+    assert [r.client_relevance for r in results] == ["one", "two", "three"]
+
+
+async def test_results_are_ordered_target_then_version_then_expression():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    results = await evaluate_many(
+        ["a", "b"],
+        [Target(kind="ssh", name="host0"), Target(kind="ssh", name="host1")],
+        qna_version=["11.0", "10.0"],
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver({"11.0": "11.0.6.137", "10.0": "10.0.9.1"}),
+    )
+
+    assert [(r.host, r.qna_version, r.client_relevance) for r in results] == [
+        ("host0", "11.0.6.137", "a"),
+        ("host0", "11.0.6.137", "b"),
+        ("host0", "10.0.9.1", "a"),
+        ("host0", "10.0.9.1", "b"),
+        ("host1", "11.0.6.137", "a"),
+        ("host1", "11.0.6.137", "b"),
+        ("host1", "10.0.9.1", "a"),
+        ("host1", "10.0.9.1", "b"),
+    ]
+
+
+async def test_a_batch_against_a_container_keeps_it_warm():
+    """Otherwise the second expression starts a second container and the
+    batching saves nothing at all."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    seen: list[bool] = []
+
+    def factory(target: Target) -> FakeTransport:
+        seen.append(target.keep_alive)
+        return FakeTransport(target.name)
+
+    await evaluate_many(
+        ["a", "b"],
+        [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")],
+        transport_factory=factory,
+    )
+
+    assert seen == [True]
+
+
+async def test_a_single_expression_container_is_left_one_shot():
+    """One expression has nothing to amortize, so the hermetic default wins."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    seen: list[bool] = []
+
+    def factory(target: Target) -> FakeTransport:
+        seen.append(target.keep_alive)
+        return FakeTransport(target.name)
+
+    await evaluate_many(
+        ["a"],
+        [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")],
+        transport_factory=factory,
+    )
+
+    assert seen == [False]
+
+
+async def test_one_failing_expression_does_not_stop_the_others():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class PickyTransport(FakeTransport):
+        async def evaluate_client_relevance(self, client_relevance, **kwargs):
+            if client_relevance == "bad":
+                raise RuntimeError("boom")
+            return await super().evaluate_client_relevance(client_relevance, **kwargs)
+
+    results = await evaluate_many(
+        ["good", "bad", "also good"],
+        [Target(kind="ssh", name="host0")],
+        transport_factory=lambda t: PickyTransport(t.name),
+    )
+
+    assert [r.error_kind for r in results] == [None, ERROR_KIND_TRANSPORT, None]
+    assert results[1].client_relevance == "bad"
+
+
+async def test_a_group_that_never_starts_still_answers_for_every_expression():
+    """count_work is the denominator a progress indicator commits to before
+    the first result, so a dead target must not silently produce fewer."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    def factory(target: Target):
+        raise RuntimeError("no engine")
+
+    results = await evaluate_many(
+        ["a", "b", "c"], [Target(kind="ssh", name="host0")], transport_factory=factory
+    )
+
+    assert len(results) == 3
+    assert [r.client_relevance for r in results] == ["a", "b", "c"]
+    assert all(r.error_kind == ERROR_KIND_TRANSPORT for r in results)
+
+
+async def test_count_work_accounts_for_the_expression_axis():
+    targets = [Target(kind="ssh", name="host0"), Target(kind="ssh", name="host1")]
+
+    assert count_work(targets, ["11.0", "10.0"]) == 4
+    assert count_work(targets, ["11.0", "10.0"], ["a", "b", "c"]) == 12
+    assert count_work(targets) == 2
+
+
+async def test_the_batch_stream_yields_as_each_expression_lands():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many_stream
+
+    seen: list[str] = []
+    async for result in evaluate_many_stream(
+        ["a", "b"],
+        [Target(kind="ssh", name="host0")],
+        transport_factory=lambda t: FakeTransport(t.name),
+    ):
+        seen.append(result.client_relevance)
+
+    assert sorted(seen) == ["a", "b"]

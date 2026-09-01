@@ -495,6 +495,33 @@ Four concrete transports, all class-named `Transport<Kind>`:
   4. `keep_alive=True` reuses a long-lived container (via `docker exec`)
      for hot repeat evals against the same image; default is one-shot for
      hermetic answers.
+  5. **Every** container carries its own deadline (`DEFAULT_IDLE_TTL_S`,
+     120s, always widened to cover the evaluation about to run): PID 1 is a POSIX-sh loop watching a deadline file rather than
+     `sleep infinity`, and every exec pushes the deadline out. The deadline
+     has to live *inside* the container, because the cases it exists for are
+     exactly the ones where no host-side timer survives — a `SIGKILL`, a dead
+     daemon connection, a lost removal, and (by design) a warm container that
+     outlives the process that started it. The `finally` blocks that stop
+     transient and build containers stay as the fast path; the deadline is the
+     backstop. A prepared-image build gets a longer window than the default,
+     since a build that fetches packages legitimately outlives two minutes.
+  6. A `keep_alive` container is labelled `bfrcr.warm=1` plus a `bfrcr.key`
+     hashed over (resolved image ref, docker platform, mounts, package
+     version), so a *later invocation in a different process* can find and
+     adopt it instead of starting another — the "run this every few minutes"
+     case. Adoption renews the deadline first, which doubles as a liveness
+     check: a container that does not answer is replaced rather than exec'd
+     into. The package version is in the key so a newer release never adopts a
+     container an older one started under different conventions. Two processes
+     racing to warm the same key both start one; the loser simply idles out,
+     which is cheaper than a lock file. `aclose()` therefore *leaves* a warm
+     container running — its deadline owns its life — and only stops one that
+     has no deadline to reclaim it. "Stop it when done" is not available once
+     a container is shareable: the process finishing with it cannot know
+     whether another is mid-evaluation inside it, and refcounting across
+     processes would need exactly the coordination the label lookup avoids.
+     That is why the idle window is short (two minutes) rather than generous —
+     it is the whole reclamation mechanism, not a safety net behind one.
 - **Arch coverage:** `--arch` defaults to `x86_64` — the common case for
   BigFix clients, regardless of the controller's own architecture — and is
   repeatable, so `--container ubuntu:24.04 --arch amd64 --arch arm64`
@@ -637,6 +664,22 @@ resolution entirely and work offline once the artifact is cached.
 - Escape hatch: `--fetch-on-target` restores the old
   download-on-the-target behavior for cases where the target has better
   internet than its link to the controller.
+
+**Multi-expression eval on the same target:** the fan-out grid is
+`targets x versions x expressions`. `evaluate_many` / `evaluate_many_stream`
+take a sequence of expressions; the unit of *work* is a group — one (target,
+version) pair — and the unit of *result* is a cell, one expression within a
+group. A group builds its transport, probes it and prepares its image **once**,
+then runs its expressions through that one transport in sequence. That is the
+whole saving: measured on `ubuntu:22.04` at qna 11.0, ten expressions cost 66s
+run separately and 18s batched (3.7x). A group that dies before evaluating
+anything still emits one result per expression, so the count always matches
+`count_work(targets, qna_version, expressions)` — the denominator a streaming
+progress indicator commits to before the first result arrives. Container
+targets carrying more than one expression are kept alive for the batch, since
+otherwise the second expression starts a second container and the batching
+saves nothing. `evaluate_client_relevance` is the same machinery with a
+one-element expression list, so the two can never drift.
 
 **Multi-version eval on the same target:** `qna_version` fans out —
 `orchestrate.py` takes `str | Sequence[str]` and the CLI flag is
