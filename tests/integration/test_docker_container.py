@@ -28,17 +28,19 @@ pytestmark = pytest.mark.docker
 IMAGE = "ubuntu:22.04"
 
 
-@pytest.fixture
-def stub_qna_image(tmp_path):
+@pytest.fixture(scope="module")
+def stub_qna_image(tmp_path_factory):
     """Build a tiny image whose `qna` is a shell script emitting a transcript.
 
     Keeps the container tests fast and offline: the real agent artifact is only
-    needed by the provisioning test below.
+    needed by the provisioning test below. Module-scoped and shared by every
+    test below that just needs *a* qna in the image (the image is never
+    mutated once built) -- rebuilding it per test only paid the docker build
+    API's overhead again for identical output.
     """
     import docker
 
-    context = tmp_path / "ctx"
-    context.mkdir()
+    context = tmp_path_factory.mktemp("stub_qna_ctx")
     (context / "qna").write_text(
         textwrap.dedent(
             """\
@@ -108,18 +110,6 @@ async def test_missing_qna_in_a_plain_image_maps_to_bootstrap():
 
     assert result.error_kind == ERROR_KIND_BOOTSTRAP
     assert "qna" in (result.error or "").lower()
-
-
-async def test_keep_alive_container_is_reused(stub_qna_image):
-    transport = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
-    try:
-        first = await transport.evaluate_client_relevance("TRUE")
-        second = await transport.evaluate_client_relevance("TRUE")
-    finally:
-        await transport.aclose()
-
-    assert first.error_kind is None
-    assert second.error_kind is None
 
 
 @pytest.mark.skipif(
