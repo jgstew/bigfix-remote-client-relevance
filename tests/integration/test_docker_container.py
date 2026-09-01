@@ -247,27 +247,23 @@ async def test_without_auto_setup_a_missing_library_is_reported_not_installed(tm
 # --- warm containers, against a real daemon ---------------------------------
 
 
-async def test_a_warm_container_survives_the_transport_that_started_it(stub_qna_image):
-    """The cross-process reuse case, in one process: the first transport
-    leaves the container running, the second finds and adopts it."""
-    from bigfix_remote_client_relevance.transports.container import stop_warm_containers
+async def test_a_kept_container_is_reused_then_stopped(stub_qna_image):
+    """One container for the whole batch, gone when the batch is."""
+    import docker
 
-    first = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
-    await first.evaluate_client_relevance("TRUE")
-    warmed = first._container_id
-    await first.aclose()
-
-    second = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
+    transport = TransportContainer(stub_qna_image, engine=DockerEngine(), keep_alive=True)
     try:
-        result = await second.evaluate_client_relevance("TRUE")
-        adopted = second._container_id
+        first = await transport.evaluate_client_relevance("TRUE")
+        second = await transport.evaluate_client_relevance("TRUE")
+        container_id = transport._container_id
     finally:
-        await second.aclose()
-        await stop_warm_containers(DockerEngine())
+        await transport.aclose()
 
-    assert result.error_kind is None
-    assert warmed is not None
-    assert adopted == warmed, "the second transport started its own container"
+    assert first.error_kind is None
+    assert second.error_kind is None
+    assert container_id is not None
+    with pytest.raises(docker.errors.NotFound):
+        docker.from_env().containers.get(container_id)
 
 
 async def test_a_container_removes_itself_once_its_deadline_passes(stub_qna_image):

@@ -49,12 +49,12 @@ image = "registry.access.redhat.com/ubi9/ubi"
 transport = "container"
 image = "opensuse/leap:15"
 
-# A container kept warm between runs. It removes itself once it has been idle
-# for `idle_ttl_s` seconds (default 120); every use pushes that deadline out,
-# and the next invocation adopts the running container instead of starting
-# another -- worth it for a host you query on a schedule.
-[hosts.ubuntu-24-04-warm]
+# `keep_alive` reuses one container across a batch of expressions rather than
+# starting one per expression; it is stopped when the run finishes. Every
+# container also removes itself after `idle_ttl_s` seconds idle (default 120)
+# as a backstop, for the case where a run is killed before it can clean up.
+[hosts.ubuntu-24-04-batch]
 transport = "container"
 image = "ubuntu:24.04"
 keep_alive = true
-idle_ttl_s = 1800
+idle_ttl_s = 300

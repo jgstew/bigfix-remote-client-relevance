@@ -1612,3 +1612,24 @@ async def test_the_batch_stream_yields_as_each_expression_lands():
         seen.append(result.client_relevance)
 
     assert sorted(seen) == ["a", "b"]
+
+
+async def test_a_batch_releases_its_container_when_the_batch_is_done():
+    """Kept alive for the batch, not beyond it: nothing outside this process
+    shares the container, so nothing else will ever release it."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    built: list[ClosableTransport] = []
+
+    def factory(target: Target) -> ClosableTransport:
+        transport = ClosableTransport(target.name)
+        built.append(transport)
+        return transport
+
+    await evaluate_many(
+        ["a", "b", "c"],
+        [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")],
+        transport_factory=factory,
+    )
+
+    assert [t.closed for t in built] == [1]

@@ -19,12 +19,13 @@ from a submodule is never required:
   as a :class:`ClientRelevanceResult` with ``error_kind`` set.
 * :func:`evaluate_many` and :func:`evaluate_many_stream` — the same fan-out
   over several expressions at once, one transport per (target, version) pair
-  rather than one per expression. Container targets are kept warm for the
-  batch, so a dozen expressions cost one container start rather than a dozen.
+  rather than one per expression. A container target is kept alive for the
+  length of the batch, so a dozen expressions cost one container start rather
+  than a dozen.
 * :func:`count_work` — the ``targets x versions x expressions`` total, i.e.
   the denominator for a progress indicator over the streaming form.
-* :func:`stop_warm_containers` — reclaim every container this tool is keeping
-  warm, without waiting for its idle deadline.
+* :func:`reclaim_stray_containers` — clear containers a killed run left
+  behind, without waiting for their deadlines.
 * :func:`result_to_dict` / :func:`results_to_dicts` and
   :data:`RESULT_JSON_SCHEMA` — the JSON wire shape and its schema.
 * :func:`format_result` / :func:`format_results` — the same human-readable text
@@ -79,7 +80,7 @@ from bigfix_remote_client_relevance.serialize import (
 from bigfix_remote_client_relevance.transports import Transport
 from bigfix_remote_client_relevance.transports.container import (
     TransportContainer,
-    stop_warm_containers,
+    reclaim_stray_containers,
 )
 from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 from bigfix_remote_client_relevance.transports.local import TransportLocal
@@ -128,8 +129,8 @@ __all__ = [
     "format_results",
     "load_inventory",
     "parse_qna_output",
+    "reclaim_stray_containers",
     "result_to_dict",
     "results_to_dicts",
-    "stop_warm_containers",
     "worst_exit_code",
 ]

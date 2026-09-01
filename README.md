@@ -185,49 +185,52 @@ for result in results:
 Each (target, version) pair builds **one** transport and runs every expression
 through it: for a container that is one image pull, one prepared-image lookup
 and one `docker run` instead of N, and for SSH one connection instead of N.
-Container targets carrying more than one expression are kept warm for the batch
-automatically. Every result carries the expression that produced it in
+Container targets carrying more than one expression are kept alive for the
+batch automatically. Every result carries the expression that produced it in
 `client_relevance`, so nothing has to be matched up by position.
 
 Measured on `ubuntu:22.04` at `qna 11.0`, x86_64 under emulation on Apple
-Silicon (medians of three runs, `scripts/bench_warm.py`):
+Silicon (medians of three runs, `scripts/bench_batch.py`):
 
 | expressions | one call each | `evaluate_many` | saving |
 | ---: | ---: | ---: | ---: |
-| 1 | 6.2s | 5.4s | 1.1× |
-| 3 | 20.4s | 8.4s | 2.4× |
-| 10 | 66.1s | 17.6s | 3.7× |
+| 1 | 5.6s | 6.1s | 0.9× |
+| 3 | 18.9s | 7.9s | 2.4× |
+| 10 | 74.4s | 18.2s | 4.1× |
 
-Nearly all of that is the batching itself — sharing the transport, the version
-resolution and the image work. Keeping the container warm on top of that is
-worth little *within* one process, where a prepared image makes `docker run`
-cheap; it earns its keep across separate invocations (see below).
+One expression is a wash — there is nothing to amortize, and the batch pays a
+little extra to keep a container it only uses once. From three up, the saving
+is the shared setup: one transport, one version resolution, one image
+preparation instead of N. Reusing the container on top of that measured as
+roughly neutral, since `docker run` on an already-prepared image is cheap; it is
+kept for the batch because starting one per expression would undo the batching,
+not because the reuse itself is where the time goes.
 
 `evaluate_many_stream` is the completion-order form, the same way
 `evaluate_client_relevance_stream` is for the single-expression call.
 
-### Warm containers
+### Container lifetime
 
-Every container this tool starts carries a deadline of its own and removes
-itself once it has been idle for two minutes (`DEFAULT_IDLE_TTL_S`). Use
-pushes that deadline out, and the window always covers the evaluation about to
-run, so a container in active use never expires under it. Two things follow:
+A container target evaluating more than one expression is kept alive for the
+length of that batch — one `docker run` for the whole grid rather than one per
+expression — and stopped as soon as the batch is done. A single expression is
+left one-shot, which is the more hermetic default and has nothing to amortize
+anyway. Containers are never shared between processes: two runs of this tool
+each get their own.
 
-- Nothing leaks. A `SIGKILL`, a dead daemon connection or a lost removal used
-  to strand a `sleep infinity` container for the life of the machine; now the
-  container reclaims itself.
-- A `keep_alive` container **outlives its process on purpose**. The next
-  invocation — a script polling every couple of minutes, say — finds it by
-  label and adopts it rather than starting another. Because several processes
-  can be sharing one container, none of them can safely stop it when *it* is
-  done — another may be mid-evaluation inside it — so the deadline is the only
-  thing that reclaims a warm container. Set `idle_ttl_s` per host in
-  `hosts.toml` to widen or narrow that window.
+Every container also carries a deadline of its own and removes itself once it
+has been idle for two minutes (`DEFAULT_IDLE_TTL_S`). That is a backstop, not
+the normal path — a run that finishes stops its own containers. It exists
+because a `finally` covers an exception but not a `SIGKILL`, a dead daemon
+connection, or a removal call that is simply lost, and any of those used to
+strand a `sleep infinity` container for the life of the machine. The window
+always covers the evaluation about to run, so a slow `timeout_s` can never
+expire a container under itself.
 
 ```python
-from bigfix_remote_client_relevance import stop_warm_containers
+from bigfix_remote_client_relevance import reclaim_stray_containers
 
-await stop_warm_containers()  # reclaim them now rather than in two minutes
+await reclaim_stray_containers()  # clear what a killed run left behind
 ```
 
 One `ClientRelevanceResult` comes back per (target × version × expression), carrying

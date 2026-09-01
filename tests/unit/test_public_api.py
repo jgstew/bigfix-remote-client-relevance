@@ -54,9 +54,9 @@ EXPECTED_ROOT_EXPORTS = [
     "format_results",
     "load_inventory",
     "parse_qna_output",
+    "reclaim_stray_containers",
     "result_to_dict",
     "results_to_dicts",
-    "stop_warm_containers",
     "worst_exit_code",
 ]
 

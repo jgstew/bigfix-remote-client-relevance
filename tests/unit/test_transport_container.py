@@ -58,8 +58,9 @@ class FakeEngine:
     started: list[dict[str, object]] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
     renewed: list[tuple[str, float | None]] = field(default_factory=list)
-    # key -> container id, standing in for the daemon's own label index.
-    warm: dict[str, str] = field(default_factory=dict)
+    # Running containers this tool started, as the daemon's label index
+    # would report them.
+    managed: list[str] = field(default_factory=list)
     renew_fails: bool = False
     pruned: int = 0
     one_shots: list[dict[str, object]] = field(default_factory=list)
@@ -191,13 +192,10 @@ class FakeEngine:
         self.renewed.append((container_id, ttl_s))
         return not self.renew_fails
 
-    async def find_warm(self, key: str) -> str | None:
-        return self.warm.get(key)
+    async def list_managed(self) -> list[str]:
+        return list(self.managed)
 
-    async def list_warm(self) -> list[str]:
-        return list(self.warm.values())
-
-    async def prune_warm(self) -> int:
+    async def prune_expired(self) -> int:
         self.pruned += 1
         return 0
 
@@ -2078,8 +2076,8 @@ def _staging_paths(commands: list[str]) -> list[str]:
 
 async def test_stdin_staging_paths_are_unique_per_exec():
     """Two evaluations sharing one container must not stage stdin to the same
-    path: a warm container is adoptable by a second process, and colliding
-    handles would have one evaluation answer the other's expression."""
+    path: a batch runs many through one container, and colliding handles would
+    have one evaluation answer another expression's input."""
     container = FakeExecContainer()
     engine = engine_with(FakeExecClient(container))
 
@@ -2092,7 +2090,7 @@ async def test_stdin_staging_paths_are_unique_per_exec():
 
 
 async def test_stdin_staging_file_is_removed_after_the_exec():
-    """Nothing accumulates in a long-lived warm container's /tmp."""
+    """Nothing accumulates in a long-lived container's /tmp."""
     container = FakeExecContainer()
     engine = engine_with(FakeExecClient(container))
 
@@ -2150,7 +2148,7 @@ async def test_a_container_is_labelled_so_strays_can_be_found():
 
     labels = client.runs[0]["labels"]
     assert isinstance(labels, dict)
-    assert labels["bfrcr.warm"] == "0"
+    assert labels["bfrcr.managed"] == "1"
     assert labels["bfrcr.ttl"] == str(int(DEFAULT_IDLE_TTL_S))
 
 
@@ -2201,108 +2199,35 @@ async def test_a_prepared_image_build_gets_a_ttl_past_the_build_timeout(resolved
     assert float(str(ttl)) >= _BUILD_TIMEOUT_S
 
 
-# --- warm containers, adopted across processes ------------------------------
+# --- a container kept for one batch, in one process -------------------------
 
 
-def warm_key_of(engine: FakeEngine) -> str:
-    """The key the transport labelled its warm container with."""
-    labels = engine.started[0]["labels"]
-    assert isinstance(labels, dict)
-    return labels["bfrcr.key"]
-
-
-async def test_a_warm_container_is_labelled_with_its_key():
-    engine = FakeEngine(responses=[EVAL_OK])
-    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
-
-    await transport.evaluate_client_relevance("true")
-
-    labels = engine.started[0]["labels"]
-    assert isinstance(labels, dict)
-    assert labels["bfrcr.warm"] == "1"
-    assert labels["bfrcr.key"]
-
-
-async def test_a_warm_container_left_by_another_process_is_adopted():
-    """The whole point of the idle TTL: the next invocation, minutes later and
-    in a different process, reuses the container rather than paying for one."""
-    first = FakeEngine(responses=[EVAL_OK])
-    await TransportContainer(
-        "ubuntu:22.04", engine=first, keep_alive=True
-    ).evaluate_client_relevance("true")
-    key = warm_key_of(first)
-
-    second = FakeEngine(responses=[EVAL_OK], warm={key: "container-1"})
-    transport = TransportContainer("ubuntu:22.04", engine=second, keep_alive=True)
-    await transport.evaluate_client_relevance("true")
-
-    assert second.started == [], "an adoptable container must not be duplicated"
-    assert second.execs, "the adopted container must actually be used"
-
-
-async def test_the_warm_key_distinguishes_images():
-    keys = []
-    for image in ("ubuntu:22.04", "almalinux:9"):
-        engine = FakeEngine(responses=[EVAL_OK])
-        await TransportContainer(image, engine=engine, keep_alive=True).evaluate_client_relevance(
-            "true"
-        )
-        keys.append(warm_key_of(engine))
-
-    assert keys[0] != keys[1]
-
-
-async def test_the_warm_key_distinguishes_architectures():
-    keys = []
-    for arch in ("x86_64", "arm64"):
-        engine = FakeEngine(responses=[EVAL_OK])
-        await TransportContainer(
-            "ubuntu:22.04", engine=engine, arch=arch, keep_alive=True
-        ).evaluate_client_relevance("true")
-        keys.append(warm_key_of(engine))
-
-    assert keys[0] != keys[1]
-
-
-async def test_an_adopted_container_that_does_not_answer_is_replaced():
-    """A container can die between the label lookup and the first exec."""
-    engine = FakeEngine(responses=[EVAL_OK], warm={"whatever": "ghost"}, renew_fails=True)
-    engine.warm = {}
-    transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
-    await transport.evaluate_client_relevance("true")
-    key = warm_key_of(engine)
-
-    dead = FakeEngine(responses=[EVAL_OK], warm={key: "ghost"}, renew_fails=True)
-    await TransportContainer(
-        "ubuntu:22.04", engine=dead, keep_alive=True
-    ).evaluate_client_relevance("true")
-
-    assert dead.renewed and dead.renewed[0][0] == "ghost", "adoption must check liveness first"
-    assert len(dead.started) == 1, "a container that fails its liveness check must be replaced"
-
-
-async def test_using_a_warm_container_pushes_its_deadline_out():
+async def test_using_a_kept_container_pushes_its_deadline_out():
+    """The deadline is a backstop, not a limit on how long a batch may run."""
     engine = FakeEngine(responses=[EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
 
     await transport.evaluate_client_relevance("true")
     await transport.evaluate_client_relevance("true")
 
-    assert engine.renewed, "a warm container that is being used must not expire under it"
+    assert engine.renewed, "a container still in use must not expire under the batch"
 
 
-async def test_aclose_leaves_a_warm_container_for_the_next_process():
+async def test_aclose_stops_the_container_it_kept():
+    """Nothing shares a container across processes, so whoever kept it alive
+    is the one that has to put it down -- the deadline is only for the case
+    where this never runs."""
     engine = FakeEngine(responses=[EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True)
 
     await transport.evaluate_client_relevance("true")
     await transport.aclose()
 
-    assert engine.stopped == [], "the deadline owns a warm container's life, not aclose()"
+    assert len(engine.stopped) == 1
 
 
 async def test_aclose_stops_a_keep_alive_container_that_cannot_self_expire():
-    """With no deadline there is nothing to reclaim it later, so aclose must."""
+    """With no deadline there is nothing to reclaim it later either."""
     engine = FakeEngine(responses=[EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, keep_alive=True, idle_ttl_s=None)
 
@@ -2312,14 +2237,16 @@ async def test_aclose_stops_a_keep_alive_container_that_cannot_self_expire():
     assert len(engine.stopped) == 1
 
 
-async def test_stop_warm_containers_reclaims_them_all():
-    from bigfix_remote_client_relevance.transports.container import stop_warm_containers
+async def test_stray_containers_are_reclaimed():
+    """What a SIGKILLed run leaves behind: the deadline stops them, and this
+    clears the stopped records they leave in the engine."""
+    from bigfix_remote_client_relevance.transports.container import reclaim_stray_containers
 
-    engine = FakeEngine(warm={"a": "container-a", "b": "container-b"})
+    engine = FakeEngine(managed=["container-a", "container-b"])
 
-    stopped = await stop_warm_containers(engine)
+    reclaimed = await reclaim_stray_containers(engine)
 
-    assert stopped == 2
+    assert reclaimed == 2
     assert sorted(engine.stopped) == ["container-a", "container-b"]
 
 
