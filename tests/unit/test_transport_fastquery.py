@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from bigfix_remote_client_relevance.results import ERROR_KIND_BOOTSTRAP, ResolvedQna
 from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
@@ -52,3 +54,15 @@ async def test_no_exception_escapes():
 
     assert result.error_kind is not None
     assert result.client_relevance == "true"
+
+
+async def test_resolve_arch_raises_since_evaluate_is_unimplemented():
+    """Wired ahead of the transport itself: probe_arch_via_relevance just calls
+    evaluate_client_relevance, which always errors today, so this always
+    raises -- orchestrate.py's generic fallback ("x86_64") applies, exactly
+    as if resolve_arch did not exist. No change needed here once Fast Query
+    is actually implemented."""
+    transport = TransportFastQuery(FakeBesapiClient())
+
+    with pytest.raises(RuntimeError):
+        await transport.resolve_arch()

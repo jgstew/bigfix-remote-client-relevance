@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
 import requests
 
 from bigfix_remote_client_relevance.results import (
@@ -101,26 +102,43 @@ async def test_success_maps_all_fields():
     assert body == {"relevance": "name of operating system"}
 
 
-async def test_arch_is_reported_as_a_decorative_x86_64():
-    """Not a demand this runs under x86_64 -- there's nothing to configure --
-    just a label reflecting the overwhelmingly common case for a BigFix agent,
-    matching this project's fallback default elsewhere (e.g. TransportContainer,
-    orchestrate.py's own arch-probe fallback)."""
+async def test_evaluate_does_not_set_arch_itself():
+    """arch comes from resolve_arch, called externally by orchestrate.py --
+    not something evaluate_client_relevance decides on its own."""
     session = FakeSession(queue=[ok_response(answers=["x"], result_type="string", time_ms=1)])
     transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
 
     result = await transport.evaluate_client_relevance("true")
 
-    assert result.arch == "x86_64"
+    assert result.arch is None
 
 
-async def test_arch_is_reported_even_on_a_relevance_error():
+async def test_resolve_arch_probes_via_relevance():
+    session = FakeSession(queue=[ok_response(answers=["x86_64"], result_type="string", time_ms=1)])
+    transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
+
+    arch = await transport.resolve_arch(timeout_s=5.0)
+
+    assert arch == "x86_64"
+    _url, body, timeout = session.calls[0]
+    assert body == {"relevance": "architecture of the operating system"}
+    assert timeout == 5.0
+
+
+async def test_resolve_arch_raises_on_a_relevance_error():
     session = FakeSession(queue=[relevance_error_response("bad")])
     transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
 
-    result = await transport.evaluate_client_relevance("this is not valid relevance ]]]")
+    with pytest.raises(RuntimeError):
+        await transport.resolve_arch()
 
-    assert result.arch == "x86_64"
+
+async def test_resolve_arch_raises_when_unreachable():
+    session = FakeSession(queue=[requests.ConnectionError("nope")])
+    transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
+
+    with pytest.raises(RuntimeError):
+        await transport.resolve_arch()
 
 
 async def test_explicit_host_overrides_url_hostname():

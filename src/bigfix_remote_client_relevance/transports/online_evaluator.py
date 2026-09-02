@@ -50,6 +50,7 @@ from bigfix_remote_client_relevance.results import (
     ParsedQnaOutput,
     ResolvedQna,
 )
+from bigfix_remote_client_relevance.transports import probe_arch_via_relevance
 from bigfix_remote_client_relevance.transports.local import classify_qna_outcome
 
 logger = logging.getLogger(__name__)
@@ -64,15 +65,6 @@ _EVALUATE_PATH = "/api/relevance/evaluate"
 _RETRYABLE_STATUS = 502
 
 _RETRY_DELAY_S = 0.5
-
-# Shown in headers as `@x86_64` purely for display -- this transport can't
-# choose or verify the remote environment's architecture (there is nothing to
-# configure), and BigFix's own docs only say the eval runs "on a Linux RHEL
-# system." x86_64 is the overwhelmingly common case for a BigFix agent -- the
-# same fallback used elsewhere in this project (TransportContainer's own
-# default, orchestrate.py's arch-probe fallback) -- so it is reported as a
-# fixed, non-configurable label rather than left blank.
-_DECORATIVE_ARCH = "x86_64"
 
 
 class TransportOnlineEvaluator:
@@ -116,6 +108,23 @@ class TransportOnlineEvaluator:
         self._session = session or requests.Session()
         self._max_retries = max_retries
 
+    async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
+        """Probe this service's own architecture via relevance.
+
+        Unlike :class:`~.local.TransportLocal` (``sys.platform``) or
+        :class:`~.ssh.TransportSSH` (``uname -m``), an online evaluator
+        exposes no side channel to ask -- the probe *is* an ordinary
+        evaluation, sent through the same :meth:`evaluate_client_relevance`
+        every other expression goes through. orchestrate.py calls this
+        automatically (via duck-typed ``resolve_arch`` detection) whenever a
+        target's ``arch`` is unset, and writes the result back into
+        ``remote_clients.toml`` when running with ``--inventory`` --
+        `--update-inventory` (on by default) -- so a given service is probed
+        at most once: the next run finds ``arch`` already set and skips this
+        entirely.
+        """
+        return await probe_arch_via_relevance(self.evaluate_client_relevance, timeout_s=timeout_s)
+
     async def evaluate_client_relevance(
         self,
         client_relevance: str,
@@ -132,7 +141,6 @@ class TransportOnlineEvaluator:
                 "transport": TRANSPORT_NAME,
                 "client_relevance": client_relevance,
                 "qna_path": self._url,
-                "arch": _DECORATIVE_ARCH,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
             base.update(overrides)

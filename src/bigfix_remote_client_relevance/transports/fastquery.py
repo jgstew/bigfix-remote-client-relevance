@@ -24,6 +24,7 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
+from bigfix_remote_client_relevance.transports import probe_arch_via_relevance
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,18 @@ class TransportFastQuery:
         """
         self._besapi_client = besapi_client
         self._computer_query = computer_query
+
+    async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
+        """Probe a target's architecture via relevance, once implemented.
+
+        Wired now, ahead of the transport itself, so it needs no change when
+        Fast Query lands: :func:`~..transports.probe_arch_via_relevance` just
+        calls :meth:`evaluate_client_relevance`, which today always errors
+        (see class docstring) -- so this always raises for now, and
+        orchestrate.py's generic arch-probe machinery falls back to its usual
+        ``"x86_64"`` default, exactly as if this method did not exist.
+        """
+        return await probe_arch_via_relevance(self.evaluate_client_relevance, timeout_s=timeout_s)
 
     async def evaluate_client_relevance(
         self,

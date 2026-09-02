@@ -1384,6 +1384,58 @@ async def test_ssh_arch_is_not_probed_with_no_version_to_resolve():
     assert results[0].arch is None
 
 
+async def test_online_evaluator_arch_is_probed_with_no_version_to_resolve():
+    """Unlike ssh, online_evaluator probes even with no version pending --
+    it can never reach this point with a spec set (refused earlier), so
+    gating on `spec is not None` the way ssh does would mean it never
+    probes at all."""
+    transport = FakeArchProbingTransport("web-eval", "x86_64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="online_evaluator", name="web-eval", base_url="https://example.invalid")],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 1
+    assert results[0].arch == "x86_64"
+
+
+async def test_online_evaluator_arch_probe_is_skipped_once_configured():
+    """The point of writing the probed arch back to remote_clients.toml: the
+    next run has target.arch already set and never probes again."""
+    transport = FakeArchProbingTransport("web-eval", "x86_64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [
+            Target(
+                kind="online_evaluator",
+                name="web-eval",
+                base_url="https://example.invalid",
+                arch="x86_64",
+            )
+        ],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 0
+    assert results[0].arch == "x86_64"
+
+
+async def test_fastquery_arch_is_probed_with_no_version_to_resolve():
+    transport = FakeArchProbingTransport("deployment", "x86_64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="deployment")],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 1
+    assert results[0].arch == "x86_64"
+
+
 async def test_arch_probe_failure_falls_back_to_x86_64_instead_of_failing():
     """Unlike platform, a bad arch probe has a safe fallback -- it must never
     turn into ERROR_KIND_BOOTSTRAP or any other target failure. x86_64, not

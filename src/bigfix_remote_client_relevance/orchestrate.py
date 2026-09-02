@@ -490,11 +490,24 @@ async def _evaluate_stream_indexed(
             # platform, a failed arch probe never fails the target -- "x86_64",
             # the common case for BigFix clients, is always a reasonable
             # fallback, so there is no analog to UnknownTargetError here.
+            #
+            # online_evaluator and fastquery also probe unconditionally (not
+            # gated on `spec is not None` the way ssh is): neither can ever
+            # reach here with spec set -- both refuse a version spec earlier
+            # and return before this point -- so `spec is not None` would
+            # never be true for them anyway; probing whenever `arch` is
+            # unset is what makes it happen (and get written back to
+            # remote_clients.toml, via the same --update-inventory as
+            # platform) at all, since spec never carries the same signal
+            # local's "always cheap, so always probe" reasoning relies on.
+            # For both, the probe itself is relevance ("architecture of the
+            # operating system" -- see probe_arch_via_relevance) sent as an
+            # ordinary evaluation, since neither has any other side channel.
             arch_probe = getattr(transport, "resolve_arch", None)
             if (
                 target.arch is None
                 and arch_probe is not None
-                and (spec is not None or target.kind == "local")
+                and (spec is not None or target.kind in ("local", "online_evaluator", "fastquery"))
             ):
                 try:
                     async with image_budget:

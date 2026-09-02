@@ -17,6 +17,7 @@ Contract shared by all implementations:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Protocol, runtime_checkable
 
 from bigfix_remote_client_relevance.results import ClientRelevanceResult, ResolvedQna
@@ -46,4 +47,34 @@ class Transport(Protocol):
         ...
 
 
-__all__ = ["Transport"]
+ARCH_PROBE_RELEVANCE = "architecture of the operating system"
+"""Client relevance used by :func:`probe_arch_via_relevance`."""
+
+
+async def probe_arch_via_relevance(
+    evaluate: Callable[..., Awaitable[ClientRelevanceResult]], *, timeout_s: float = 30.0
+) -> str:
+    """Probe a target's architecture using relevance itself.
+
+    For transports with no other side channel to ask -- unlike
+    :class:`~.local.TransportLocal` (``sys.platform``) or
+    :class:`~.ssh.TransportSSH` (``uname -m``),
+    :class:`~.online_evaluator.TransportOnlineEvaluator` and
+    :class:`~.fastquery.TransportFastQuery` have nothing but relevance itself
+    to ask, so the probe *is* an ordinary evaluation. ``evaluate`` is the
+    transport's own bound ``evaluate_client_relevance``.
+
+    Raises on any failure -- a relevance error, a transport error, or an
+    empty answer -- so orchestrate.py's generic arch-probe machinery (which
+    calls this through each transport's ``resolve_arch``) falls back to its
+    usual ``"x86_64"`` default instead of this helper inventing its own.
+    """
+    result = await evaluate(ARCH_PROBE_RELEVANCE, timeout_s=timeout_s)
+    if result.error_kind is not None:
+        raise RuntimeError(f"arch probe failed: {result.error}")
+    if not result.answers:
+        raise RuntimeError("arch probe returned no answer")
+    return result.answers[0]
+
+
+__all__ = ["ARCH_PROBE_RELEVANCE", "Transport", "probe_arch_via_relevance"]
