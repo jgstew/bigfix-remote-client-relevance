@@ -1450,6 +1450,33 @@ async def test_container_arch_is_never_probed():
     assert results[0].arch == "amd64"
 
 
+class FakeSelfReportingArchTransport(FakeTransport):
+    """A transport (like online_evaluator) that labels its own result's arch
+    directly, with no resolve_arch probe hook and no Target.arch involved."""
+
+    def __init__(self, host: str, arch: str, **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._arch = arch
+
+    async def evaluate_client_relevance(self, client_relevance, **kwargs):
+        result = await super().evaluate_client_relevance(client_relevance, **kwargs)
+        result.arch = self._arch
+        return result
+
+
+async def test_transport_reported_arch_survives_with_no_target_arch_or_probe():
+    """online_evaluator has no resolve_arch and Target.arch is never set for it
+    -- its own decorative arch label must not be clobbered back to None by the
+    generic target.arch write-back."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="online_evaluator", name="web-eval", base_url="https://example.invalid")],
+        transport_factory=lambda t: FakeSelfReportingArchTransport(t.name, "x86_64"),
+    )
+
+    assert results[0].arch == "x86_64"
+
+
 # --- transports are closed, always ------------------------------------------
 
 

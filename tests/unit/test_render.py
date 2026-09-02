@@ -117,6 +117,86 @@ def test_an_already_qualified_ssh_host_is_not_double_prefixed():
     assert text.startswith("== ssh:box\n")
 
 
+# --- arch suffix: local, ssh, and online_evaluator only ---------------------
+
+
+def test_local_label_appends_arch_when_known():
+    text = format_result(
+        make_result(host="this-mac", platform="macos", arch="arm64"), labelled=True
+    )
+
+    assert text.startswith("== local:macos:this-mac@arm64\n")
+
+
+def test_local_label_omits_arch_when_unknown():
+    text = format_result(make_result(host="this-mac", platform="macos"), labelled=True)
+
+    assert text.startswith("== local:macos:this-mac\n")
+    assert "@" not in text.splitlines()[0]
+
+
+def test_ssh_label_appends_arch_when_known():
+    text = format_result(
+        make_result(host="0.0.0.0", transport="ssh", platform="windows", arch="x86_64"),
+        labelled=True,
+    )
+
+    assert text.startswith("== ssh:windows:0.0.0.0@x86_64\n")
+
+
+def test_online_evaluator_label_appends_arch_when_known():
+    text = format_result(
+        make_result(host="web-eval-rhel", transport="online_evaluator", arch="x86_64"),
+        labelled=True,
+    )
+
+    assert text.startswith("== web-eval-rhel@x86_64\n")
+
+
+def test_online_evaluator_label_omits_arch_when_unknown():
+    text = format_result(
+        make_result(host="web-eval-rhel", transport="online_evaluator"), labelled=True
+    )
+
+    assert text.startswith("== web-eval-rhel\n")
+    assert "@" not in text.splitlines()[0]
+
+
+def test_arch_suffix_precedes_the_qna_version():
+    text = format_result(
+        make_result(
+            host="this-mac",
+            platform="macos",
+            arch="arm64",
+            qna_version="11.0.6.137",
+        ),
+        labelled=True,
+    )
+
+    assert text.startswith("== local:macos:this-mac@arm64 (qna 11.0.6.137)\n")
+
+
+def test_fastquery_does_not_get_an_arch_suffix():
+    """Only local, ssh, and online_evaluator were asked for the @arch suffix."""
+    text = format_result(
+        make_result(host="deployment", transport="fastquery", arch="x86_64"), labelled=True
+    )
+
+    assert text.startswith("== fastquery:deployment\n")
+    assert "@" not in text.splitlines()[0]
+
+
+def test_container_arch_is_not_doubled():
+    """Container already bakes its arch into the host string; must not double it."""
+    text = format_result(
+        make_result(host="container:ubuntu:22.04@x86_64", transport="container", arch="x86_64"),
+        labelled=True,
+    )
+
+    assert text.startswith("== container:ubuntu:22.04@x86_64\n")
+    assert text.count("@") == 1
+
+
 # --- fan-outs ---------------------------------------------------------------
 
 

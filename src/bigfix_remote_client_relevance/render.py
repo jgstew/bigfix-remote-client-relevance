@@ -40,6 +40,13 @@ def display_host(result: ClientRelevanceResult) -> str:
 # stays one terminal line next to the host and version it already carries.
 _LABEL_EXPRESSION_CHARS = 60
 
+# Transports whose header gets an `@arch` suffix when the arch is known.
+# Container already bakes its arch into `result.host` itself
+# (`container:<image>@<arch>`), so it is deliberately not repeated here.
+# fastquery is also left out: nothing currently populates its arch, and
+# nothing asked for it to display one.
+_ARCH_SUFFIXED_TRANSPORTS = frozenset({"local", "ssh", "online_evaluator"})
+
 
 def label(result: ClientRelevanceResult, *, with_expression: bool = False) -> str:
     """Full header text: ``transport:platform:host``, then the qna version --
@@ -65,6 +72,15 @@ def label(result: ClientRelevanceResult, *, with_expression: bool = False) -> st
     ``local:macos:local``, since it names nothing an inventory entry would.
     An already-transport-qualified host (see :func:`display_host`) is not
     double-prefixed.
+
+    ``local``, ``ssh``, and ``online_evaluator`` also get an ``@arch`` suffix
+    when the arch is known -- ``local:macos:this-mac@arm64``,
+    ``ssh:windows:0.0.0.0@x86_64``, or the bare ``web-eval-rhel@x86_64`` for
+    online_evaluator (which isn't in the transport:platform:host group above
+    and keeps its plain host). Echoes the same ``@arch`` shape
+    ``container:<image>@<arch>`` already uses, so container is deliberately
+    left out here -- its arch is already part of ``result.host``, not added
+    by this function.
     """
     if result.transport in ("ssh", "fastquery", "local"):
         prefix = f"{result.transport}:"
@@ -77,6 +93,8 @@ def label(result: ClientRelevanceResult, *, with_expression: bool = False) -> st
         text = ":".join(parts)
     else:
         text = display_host(result)
+    if result.transport in _ARCH_SUFFIXED_TRANSPORTS and result.arch:
+        text = f"{text}@{result.arch}"
     if result.qna_version:
         text = f"{text} (qna {result.qna_version})"
     if with_expression:

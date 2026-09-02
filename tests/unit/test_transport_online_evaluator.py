@@ -101,6 +101,28 @@ async def test_success_maps_all_fields():
     assert body == {"relevance": "name of operating system"}
 
 
+async def test_arch_is_reported_as_a_decorative_x86_64():
+    """Not a demand this runs under x86_64 -- there's nothing to configure --
+    just a label reflecting the overwhelmingly common case for a BigFix agent,
+    matching this project's fallback default elsewhere (e.g. TransportContainer,
+    orchestrate.py's own arch-probe fallback)."""
+    session = FakeSession(queue=[ok_response(answers=["x"], result_type="string", time_ms=1)])
+    transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
+
+    result = await transport.evaluate_client_relevance("true")
+
+    assert result.arch == "x86_64"
+
+
+async def test_arch_is_reported_even_on_a_relevance_error():
+    session = FakeSession(queue=[relevance_error_response("bad")])
+    transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
+
+    result = await transport.evaluate_client_relevance("this is not valid relevance ]]]")
+
+    assert result.arch == "x86_64"
+
+
 async def test_explicit_host_overrides_url_hostname():
     session = FakeSession(queue=[ok_response(answers=["x"], result_type="string", time_ms=1)])
     transport = TransportOnlineEvaluator(

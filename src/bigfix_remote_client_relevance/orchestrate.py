@@ -583,7 +583,15 @@ async def _evaluate_stream_indexed(
         # probed, or (platform only, below) corrected -- so the CLI can write
         # them back.
         result.platform = target.platform
-        result.arch = target.arch
+        # Local/ssh/container always have a concrete target.arch by this point
+        # (an explicit value, or a fresh probe above); online_evaluator and
+        # fastquery have neither, so overwriting with an unset target.arch
+        # would clobber a transport-reported label for no reason -- e.g.
+        # online_evaluator's own fixed, decorative "x86_64" (see
+        # TransportOnlineEvaluator). Trust the transport's own arch whenever
+        # the target never had one to begin with.
+        if target.arch is not None:
+            result.arch = target.arch
 
         if spec is not None and configured_platform is not None:
             # An explicit platform was trusted outright above and never

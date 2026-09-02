@@ -121,10 +121,12 @@ class ClientRelevanceResult:
     arch: str | None = None
     """The architecture this run actually used, when known -- an explicit
     ``Target.arch`` (always the case for a container, since its arch is a
-    per-run choice never inferred), or a fresh probe on an ssh/local target.
-    ``None`` for fastquery, or when never resolved. This is what the CLI's
-    ``--update-inventory`` writes back to ``remote_clients.toml``, alongside
-    ``platform``."""
+    per-run choice never inferred), a fresh probe on an ssh/local target, or a
+    fixed, decorative ``"x86_64"`` label from online_evaluator (which cannot
+    choose or verify the remote environment's architecture; not a runtime
+    setting). ``None`` for fastquery, or when never resolved. This is what the
+    CLI's ``--update-inventory`` writes back to ``remote_clients.toml``,
+    alongside ``platform``."""
 
     @property
     def ok(self) -> bool:
