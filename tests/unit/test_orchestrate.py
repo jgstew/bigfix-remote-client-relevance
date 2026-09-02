@@ -1384,11 +1384,36 @@ async def test_ssh_arch_is_not_probed_with_no_version_to_resolve():
     assert results[0].arch is None
 
 
-async def test_online_evaluator_arch_is_probed_with_no_version_to_resolve():
-    """Unlike ssh, online_evaluator probes even with no version pending --
-    it can never reach this point with a spec set (refused earlier), so
-    gating on `spec is not None` the way ssh does would mean it never
-    probes at all."""
+async def test_online_evaluator_arch_is_probed_when_inventory_backed():
+    """Unlike ssh, online_evaluator has no version-resolution round trip to
+    piggyback the probe on -- it can never reach this point with a spec set
+    (refused earlier) -- so it only probes when the result is actually worth
+    persisting: `inventory_backed`, set by the CLI only for --inventory
+    hosts under --update-inventory."""
+    transport = FakeArchProbingTransport("web-eval", "x86_64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [
+            Target(
+                kind="online_evaluator",
+                name="web-eval",
+                base_url="https://example.invalid",
+                inventory_backed=True,
+            )
+        ],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 1
+    assert results[0].arch == "x86_64"
+
+
+async def test_online_evaluator_arch_is_not_probed_for_an_ad_hoc_target():
+    """The whole point: an ad hoc `--online-evaluator URL` (or any Target a
+    library caller builds directly) has nowhere to persist a probed arch, so
+    the network round trip is not worth paying for -- inventory_backed
+    defaults to False."""
     transport = FakeArchProbingTransport("web-eval", "x86_64")
 
     results = await evaluate_client_relevance(
@@ -1397,8 +1422,8 @@ async def test_online_evaluator_arch_is_probed_with_no_version_to_resolve():
         transport_factory=lambda t: transport,
     )
 
-    assert transport.probed == 1
-    assert results[0].arch == "x86_64"
+    assert transport.probed == 0
+    assert results[0].arch is None
 
 
 async def test_online_evaluator_arch_probe_is_skipped_once_configured():
@@ -1414,6 +1439,7 @@ async def test_online_evaluator_arch_probe_is_skipped_once_configured():
                 name="web-eval",
                 base_url="https://example.invalid",
                 arch="x86_64",
+                inventory_backed=True,
             )
         ],
         transport_factory=lambda t: transport,
@@ -1423,7 +1449,20 @@ async def test_online_evaluator_arch_probe_is_skipped_once_configured():
     assert results[0].arch == "x86_64"
 
 
-async def test_fastquery_arch_is_probed_with_no_version_to_resolve():
+async def test_fastquery_arch_is_probed_when_inventory_backed():
+    transport = FakeArchProbingTransport("deployment", "x86_64")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="deployment", inventory_backed=True)],
+        transport_factory=lambda t: transport,
+    )
+
+    assert transport.probed == 1
+    assert results[0].arch == "x86_64"
+
+
+async def test_fastquery_arch_is_not_probed_for_an_ad_hoc_target():
     transport = FakeArchProbingTransport("deployment", "x86_64")
 
     results = await evaluate_client_relevance(
@@ -1432,8 +1471,8 @@ async def test_fastquery_arch_is_probed_with_no_version_to_resolve():
         transport_factory=lambda t: transport,
     )
 
-    assert transport.probed == 1
-    assert results[0].arch == "x86_64"
+    assert transport.probed == 0
+    assert results[0].arch is None
 
 
 async def test_arch_probe_failure_falls_back_to_x86_64_instead_of_failing():

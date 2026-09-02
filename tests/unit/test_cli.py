@@ -186,6 +186,44 @@ def test_online_evaluator_flag_selects_online_evaluator(captured):
     assert target.name == "developer.bigfix.com"
 
 
+def test_ad_hoc_online_evaluator_is_not_inventory_backed(captured):
+    """No --inventory, nowhere to persist a probed arch -- orchestrate.py's
+    arch-probe block relies on this to skip online_evaluator's/fastquery's
+    network round trip for an ad hoc target."""
+    result = invoke("--online-evaluator", "https://developer.bigfix.com", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].inventory_backed is False
+
+
+def test_inventory_host_is_marked_inventory_backed_by_default(captured, tmp_path):
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text(
+        '[hosts.a]\ntransport = "online_evaluator"\nbase_url = "https://example.invalid"\n',
+        encoding="utf-8",
+    )
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].inventory_backed is True
+
+
+def test_inventory_host_is_not_inventory_backed_with_no_update_inventory(captured, tmp_path):
+    """--no-update-inventory means a probed value would just be thrown away,
+    so it must not be probed for either -- same treatment as an ad hoc target."""
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text(
+        '[hosts.a]\ntransport = "online_evaluator"\nbase_url = "https://example.invalid"\n',
+        encoding="utf-8",
+    )
+
+    result = invoke("--inventory", str(inventory), "--no-update-inventory", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].inventory_backed is False
+
+
 def test_online_evaluator_composes_with_inventory(captured, tmp_path):
     inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")

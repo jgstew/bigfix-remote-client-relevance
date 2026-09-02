@@ -126,6 +126,20 @@ class Target:
     default, since pointing this at a live third-party service is an opt-in
     choice (see :class:`~...transports.online_evaluator.TransportOnlineEvaluator`)."""
 
+    inventory_backed: bool = False
+    """True only when this target was loaded from a `remote_clients.toml` the
+    CLI can write back to (``--inventory`` with ``--update-inventory``, the
+    default -- set by the CLI, never by :func:`~...inventory.load_inventory`
+    itself). Meaningless for every kind except ``online_evaluator`` and
+    ``fastquery``: unlike ``local`` (a free ``sys.platform`` check) or ``ssh``
+    (probed anyway while resolving a version), their arch probe is a real
+    network round trip whose only purpose is a value to persist -- see
+    ``_one()``'s arch-probe block. False for every ad hoc target (CLI flags,
+    or a `Target` built directly by a library caller) and for an inventory
+    host loaded with ``--no-update-inventory``, since a probed value would
+    just be thrown away there.
+    """
+
     extra: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -491,23 +505,31 @@ async def _evaluate_stream_indexed(
             # the common case for BigFix clients, is always a reasonable
             # fallback, so there is no analog to UnknownTargetError here.
             #
-            # online_evaluator and fastquery also probe unconditionally (not
-            # gated on `spec is not None` the way ssh is): neither can ever
-            # reach here with spec set -- both refuse a version spec earlier
-            # and return before this point -- so `spec is not None` would
-            # never be true for them anyway; probing whenever `arch` is
-            # unset is what makes it happen (and get written back to
-            # remote_clients.toml, via the same --update-inventory as
-            # platform) at all, since spec never carries the same signal
-            # local's "always cheap, so always probe" reasoning relies on.
-            # For both, the probe itself is relevance ("architecture of the
-            # operating system" -- see probe_arch_via_relevance) sent as an
-            # ordinary evaluation, since neither has any other side channel.
+            # online_evaluator and fastquery are different again: unlike ssh
+            # (whose probe earns its cost by picking the right artifact),
+            # theirs is a real network round trip whose only payoff is a
+            # value to display and persist -- there is no version to resolve
+            # for either (both refuse a spec earlier and return before this
+            # point), so `spec is not None` would never gate them the way it
+            # gates ssh. Paying for that round trip is only worth it when the
+            # result can actually be written back, so `inventory_backed`
+            # (set by the CLI only for `--inventory` hosts under
+            # `--update-inventory`) is the gate instead -- an ad hoc
+            # `--online-evaluator URL` never probes at all. For both, the
+            # probe itself is relevance ("architecture of the operating
+            # system" -- see probe_arch_via_relevance) sent as an ordinary
+            # evaluation, since neither has any other side channel.
             arch_probe = getattr(transport, "resolve_arch", None)
             if (
                 target.arch is None
                 and arch_probe is not None
-                and (spec is not None or target.kind in ("local", "online_evaluator", "fastquery"))
+                and (
+                    spec is not None
+                    or target.kind == "local"
+                    or (
+                        target.kind in ("online_evaluator", "fastquery") and target.inventory_backed
+                    )
+                )
             ):
                 try:
                     async with image_budget:

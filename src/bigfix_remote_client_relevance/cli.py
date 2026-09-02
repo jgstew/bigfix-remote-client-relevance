@@ -17,6 +17,7 @@ enforced here rather than left to convention.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import logging
@@ -547,6 +548,16 @@ def evaluate(
             inventory_targets = load_inventory(inventory)
         except InventoryError as exc:
             _fail(str(exc))
+        if update_inventory:
+            # Only an updatable inventory host is worth online_evaluator's or
+            # fastquery's arch probe -- a real network round trip whose only
+            # payoff is a value to persist (see orchestrate.py's arch-probe
+            # block). --no-update-inventory means a probed value would just
+            # be thrown away, so it stays False there, same as any ad hoc
+            # target built below.
+            inventory_targets = [
+                dataclasses.replace(target, inventory_backed=True) for target in inventory_targets
+            ]
         targets.extend(inventory_targets)
     targets.extend(
         Target(
