@@ -43,6 +43,7 @@ EXPECTED_ROOT_EXPORTS = [
     "TransportContainer",
     "TransportFastQuery",
     "TransportLocal",
+    "TransportOnlineEvaluator",
     "TransportSSH",
     "count_work",
     "evaluate_client_relevance",

@@ -76,7 +76,8 @@ class Target:
     """One place to evaluate: an SSH host, a container image, or this machine."""
 
     kind: str
-    """``"ssh"`` | ``"local"`` | ``"container"`` | ``"fastquery"``."""
+    """``"ssh"`` | ``"local"`` | ``"container"`` | ``"fastquery"`` |
+    ``"online_evaluator"``."""
 
     name: str
     """SSH alias, image name, or ``"local"``."""
@@ -118,6 +119,12 @@ class Target:
 
     verify_host_key: bool = True
     """SSH only. Off removes protection against interception; lab hosts only."""
+
+    base_url: str | None = None
+    """``online_evaluator`` only. Origin of the hosted relevance API, e.g.
+    ``"https://developer.bigfix.com"``. Required for that kind -- there is no
+    default, since pointing this at a live third-party service is an opt-in
+    choice (see :class:`~...transports.online_evaluator.TransportOnlineEvaluator`)."""
 
     extra: dict[str, object] = field(default_factory=dict)
 
@@ -214,6 +221,14 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
         return TransportFastQuery(target.extra.get("besapi_client"))
+    if target.kind == "online_evaluator":
+        from bigfix_remote_client_relevance.transports.online_evaluator import (
+            TransportOnlineEvaluator,
+        )
+
+        if not target.base_url:
+            raise ValueError("online_evaluator target needs base_url")
+        return TransportOnlineEvaluator(target.base_url, host=target.name)
     raise ValueError(f"unknown target kind {target.kind!r}")
 
 
@@ -413,6 +428,22 @@ async def _evaluate_stream_indexed(
                         ERROR_KIND_RESOLVE,
                         f"cannot pin qna version {spec!r} for the fastquery transport: "
                         "endpoints evaluate with their installed BES agent",
+                    )
+                ):
+                    emit(index, result)
+                return
+
+            if spec is not None and target.kind == "online_evaluator":
+                # Same reasoning as fastquery above: this transport's environment
+                # is fixed and remotely managed, so resolving a version here would
+                # just spend a round trip on a spec nothing downstream can use.
+                for index, result in enumerate(
+                    _group_failure(
+                        target,
+                        ERROR_KIND_RESOLVE,
+                        f"cannot pin qna version {spec!r} for the online_evaluator "
+                        "transport: it evaluates on a fixed, remotely-managed "
+                        "environment",
                     )
                 ):
                     emit(index, result)

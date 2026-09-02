@@ -84,6 +84,7 @@ from bigfix_remote_client_relevance.transports.container import (
 )
 from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 from bigfix_remote_client_relevance.transports.local import TransportLocal
+from bigfix_remote_client_relevance.transports.online_evaluator import TransportOnlineEvaluator
 from bigfix_remote_client_relevance.transports.ssh import TransportSSH
 
 try:
@@ -118,6 +119,7 @@ __all__ = [
     "TransportContainer",
     "TransportFastQuery",
     "TransportLocal",
+    "TransportOnlineEvaluator",
     "TransportSSH",
     "count_work",
     "evaluate_client_relevance",

@@ -795,6 +795,35 @@ def test_unspecified_ssh_become_is_false_even_on_macos(monkeypatch):
     assert transport._become is False
 
 
+def test_default_factory_builds_online_evaluator_transport():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.online_evaluator import (
+        TransportOnlineEvaluator,
+    )
+
+    target = Target(
+        kind="online_evaluator", name="web-eval", base_url="https://developer.bigfix.com"
+    )
+    transport = default_transport_factory(target)
+
+    assert isinstance(transport, TransportOnlineEvaluator)
+    assert transport._host == "web-eval"
+    assert transport._url == "https://developer.bigfix.com/api/relevance/evaluate"
+
+
+def test_default_factory_online_evaluator_needs_base_url():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    target = Target(kind="online_evaluator", name="web-eval")
+
+    try:
+        default_transport_factory(target)
+    except ValueError as exc:
+        assert "base_url" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a missing base_url")
+
+
 # --- two budgets: image work and evaluation ------------------------------------
 #
 # One semaphore throttled everything, but pulls and evaluations have very
@@ -1111,6 +1140,21 @@ async def test_one_target_failing_does_not_cancel_the_others():
     assert by_host["host1"] == ERROR_KIND_TRANSPORT
     assert by_host["host0"] is None
     assert by_host["host2"] is None
+
+
+async def test_online_evaluator_with_a_version_fails_at_resolution():
+    """Same reasoning as fastquery: the environment is fixed, pinning is an error."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="online_evaluator", name="web-eval", base_url="https://example.invalid")],
+        qna_version="11.0",
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 1
+    assert results[0].error_kind in {ERROR_KIND_RESOLVE, ERROR_KIND_BOOTSTRAP}
+    assert "version" in (results[0].error or "").lower()
 
 
 async def test_fastquery_with_a_version_fails_at_resolution():

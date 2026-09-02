@@ -86,7 +86,8 @@ class ClientRelevanceResult:
     """``"local"``, an SSH host, or ``"container:<image>@<arch>"``."""
 
     transport: str
-    """``"local"`` | ``"ssh"`` | ``"container"`` | ``"fastquery"``."""
+    """``"local"`` | ``"ssh"`` | ``"container"`` | ``"fastquery"`` |
+    ``"online_evaluator"``."""
 
     client_relevance: str
     """The expression as given by the caller, before any stdin normalization."""

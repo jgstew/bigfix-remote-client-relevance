@@ -176,6 +176,43 @@ def test_container_flag_selects_container(captured):
     assert target.image == "ubuntu:22.04"
 
 
+def test_online_evaluator_flag_selects_online_evaluator(captured):
+    result = invoke("--online-evaluator", "https://developer.bigfix.com", "true")
+
+    assert result.exit_code == 0, result.output
+    target = captured["targets"][0]
+    assert target.kind == "online_evaluator"
+    assert target.base_url == "https://developer.bigfix.com"
+    assert target.name == "developer.bigfix.com"
+
+
+def test_online_evaluator_composes_with_inventory(captured, tmp_path):
+    inventory = tmp_path / "hosts.toml"
+    inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
+
+    result = invoke(
+        "--inventory", str(inventory), "--online-evaluator", "https://developer.bigfix.com", "true"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {t.name for t in captured["targets"]} == {"a", "developer.bigfix.com"}
+
+
+def test_online_evaluator_rejects_qna_version(captured):
+    result = invoke(
+        "--online-evaluator", "https://developer.bigfix.com", "--qna-version", "11.0", "true"
+    )
+
+    assert result.exit_code != 0
+    assert "qna-version" in result.output.lower()
+
+
+def test_local_excludes_online_evaluator(captured):
+    result = invoke("--local", "--online-evaluator", "https://developer.bigfix.com", "true")
+
+    assert result.exit_code != 0
+
+
 def test_no_target_is_a_usage_error(captured, tmp_path, monkeypatch):
     # No hosts.toml here, so there's nothing to imply -- see
     # test_no_target_defaults_to_hosts_toml_when_present for the flip side.

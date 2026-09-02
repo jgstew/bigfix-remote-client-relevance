@@ -415,7 +415,7 @@ class Transport(Protocol):
     ) -> ClientRelevanceResult: ...
 ```
 
-Four concrete transports, all class-named `Transport<Kind>`:
+Five concrete transports, all class-named `Transport<Kind>`:
 
 - `TransportLocal(become=False, require_root_on_macos=True)` — subprocess
   against a local `qna` binary. Same code path as `EvaluateRelevance` today,
@@ -460,6 +460,32 @@ Four concrete transports, all class-named `Transport<Kind>`:
   reports the endpoint's installed agent version instead. This
   inflexibility is inherent to the transport, not a first-cut
   limitation.
+- `TransportOnlineEvaluator(base_url, host=None, session=None,
+  max_retries=1)` — speaks the small JSON contract behind BigFix's own
+  "Online Evaluator" (<https://developer.bigfix.com/relevance/evaluate/>),
+  reverse-engineered from its JS bundle and confirmed live: `POST
+  {base_url}/api/relevance/evaluate` with `{"relevance": "<expr>"}`, getting
+  back `{"answers": [...], "errors": [...], "time": <int ms>, "type":
+  "<string>"}`. The docs text says evaluation runs "on a Linux RHEL system" —
+  this is a hosted service that runs (or embeds) `qna` on one fixed box and
+  reports the outcome as JSON instead of qna's own `A:`/`E:`/`I:`/`T:` lines,
+  so `classify_qna_outcome` (shared with `TransportLocal`) still applies once
+  the JSON is reshaped into a `ParsedQnaOutput`. **`base_url` has no
+  default** — sending a client-relevance expression to a third-party service
+  is an opt-in choice, not an accident, and the endpoint this was
+  reverse-engineered from is undocumented, unauthenticated, and unsupported
+  (can change or disappear without notice). **Version pinning does not apply
+  here either**, for the same structural reason as Fast Query: the
+  environment is fixed and remotely managed, so a `ResolvedQna` is refused
+  (`error_kind: "bootstrap"`) and a version spec targeting it fails at
+  resolution time in `orchestrate.py`, mirroring the Fast Query check byte
+  for byte. One difference from Fast Query's per-answer types: this service
+  reports a single aggregate `type` for the whole result rather than one per
+  answer, so `answer_types` is that one value broadcast across every answer.
+  A 502 ("online evaluator is not available") gets one retry, since the
+  page's own error handling singles that status out as a known transient
+  failure of the backend; every other status, timeout, or connection error is
+  reported immediately.
 
 ### TransportContainer design
 - **Why it matters:** SSH covers Mac + Windows + whatever real Linux boxes
@@ -718,13 +744,17 @@ bigfix-remote-client-relevance HOST --qna-version 11.0 --qna-version 9.5 "..."
 bigfix-remote-client-relevance --local "..."
 bigfix-remote-client-relevance --container ubuntu:22.04 "..."
 bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60 -f probe.rel
+bigfix-remote-client-relevance --online-evaluator https://developer.bigfix.com "..."
 ```
 
 - Short alias `-f` is fine for `--client-relevance-file`.
 - `--container IMAGE` picks `TransportContainer`; `HOST` selects
-  `TransportSSH`; `--local` picks `TransportLocal`. Exactly one of the
-  three is required per invocation (or `--inventory hosts.toml` for a
-  mixed grid).
+  `TransportSSH`; `--local` picks `TransportLocal`; `--online-evaluator URL`
+  picks `TransportOnlineEvaluator` (no default URL — see its design note
+  above). Exactly one of the four is required per invocation (or
+  `--inventory hosts.toml` for a mixed grid); `--container` and
+  `--online-evaluator` both compose with `--inventory` the same way, adding
+  one ad hoc target to the fleet.
 - `--qna-version` accepts a version spec (`11.0` or `11.0.6.137`) and is
   repeatable for multi-version fan-out; `--refresh-versions` and
   `--fetch-on-target` are described in § qna binary cache & distribution.
@@ -766,6 +796,10 @@ user = "labadmin"
 [hosts.ubuntu-22]
 transport = "container"
 image = "ubuntu:22.04"
+
+[hosts.web-eval]
+transport = "online_evaluator"
+base_url = "https://developer.bigfix.com"
 ```
 
 ### MCP-ready contract (server itself out of scope)

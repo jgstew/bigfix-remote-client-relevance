@@ -23,6 +23,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 import typer
 
@@ -271,6 +272,23 @@ def evaluate(
             help="Evaluate inside a container image. Repeatable, and composes with --inventory.",
         ),
     ] = None,
+    online_evaluator: Annotated[
+        str | None,
+        typer.Option(
+            "--online-evaluator",
+            metavar="URL",
+            help=(
+                "Evaluate via a hosted HTTP relevance API speaking the "
+                "/api/relevance/evaluate contract (reverse-engineered from "
+                "https://developer.bigfix.com/relevance/evaluate/), e.g. "
+                "--online-evaluator https://developer.bigfix.com. This sends the "
+                "client relevance to a third-party service over the network -- "
+                "there is no default URL, so this is always an explicit choice. "
+                "Composes with --inventory, like --container; cannot pin a qna "
+                "version."
+            ),
+        ),
+    ] = None,
     inventory: Annotated[
         Path | None,
         typer.Option(
@@ -450,11 +468,11 @@ def evaluate(
     # inventory host's own `arch`) is how anyone wanting arm64 opts in.
     arch_list = arch or ["x86_64"]
 
-    # --container and --inventory compose: a fleet plus an ad-hoc image is a
-    # normal thing to want. --local is still on its own.
-    if local and (container or inventory):
-        _fail("--local cannot be combined with --container or --inventory")
-    modes = [bool(local), bool(container), bool(inventory)]
+    # --container, --online-evaluator and --inventory compose: a fleet plus an
+    # ad-hoc extra target is a normal thing to want. --local is still on its own.
+    if local and (container or online_evaluator or inventory):
+        _fail("--local cannot be combined with --container, --online-evaluator or --inventory")
+    modes = [bool(local), bool(container), bool(online_evaluator), bool(inventory)]
 
     if platform is not None and platform not in KNOWN_TARGETS:
         _fail(f"unknown platform {platform!r}; known: {', '.join(sorted(KNOWN_TARGETS))}")
@@ -467,6 +485,15 @@ def evaluate(
 
     if engine not in ("auto", "docker", "podman"):
         _fail(f"unknown engine {engine!r}; known: auto, docker, podman")
+
+    if qna_version and online_evaluator:
+        # Resolving a version here would spend a round trip on a spec the
+        # transport can never use -- same reasoning as fastquery, which
+        # orchestrate.py already refuses the same way.
+        _fail(
+            "--qna-version cannot be used with --online-evaluator: it evaluates on "
+            "a fixed, remotely-managed environment and cannot pin a version"
+        )
 
     if diff and (as_json or as_jsonl):
         # --json is one schema, a flat array of results, and it is the future
@@ -529,6 +556,14 @@ def evaluate(
         )
         for image, target_arch in itertools.product(container, arch_list)
     )
+    if online_evaluator:
+        targets.append(
+            Target(
+                kind="online_evaluator",
+                name=urlparse(online_evaluator).hostname or online_evaluator,
+                base_url=online_evaluator,
+            )
+        )
     if local:
         # `become` stays whatever the caller passed (True/False/unspecified);
         # default_transport_factory is where an unspecified value resolves,

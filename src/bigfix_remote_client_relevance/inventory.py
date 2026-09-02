@@ -12,6 +12,10 @@ Example::
     [hosts.ubuntu-22]
     transport = "container"
     image = "ubuntu:22.04"
+
+    [hosts.web-eval]
+    transport = "online_evaluator"
+    base_url = "https://developer.bigfix.com"
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from bigfix_remote_client_relevance.orchestrate import Target
 
 logger = logging.getLogger(__name__)
 
-KNOWN_TRANSPORTS = frozenset({"ssh", "local", "container", "fastquery"})
+KNOWN_TRANSPORTS = frozenset({"ssh", "local", "container", "fastquery", "online_evaluator"})
 
 DEFAULT_TRANSPORT = "ssh"
 
@@ -98,6 +102,10 @@ def _target_from_entry(
     if kind == "container" and not image:
         raise InventoryError(f"container host {name!r} in {path} needs an `image`")
 
+    base_url = setting("base_url")
+    if kind == "online_evaluator" and not base_url:
+        raise InventoryError(f"online_evaluator host {name!r} in {path} needs a `base_url`")
+
     user = setting("user")
     version = setting("qna_version")
     platform = setting("platform")
@@ -113,6 +121,7 @@ def _target_from_entry(
         # a macOS controller -- the same default the CLI's --local gets.
         become=bool(become_raw) if become_raw is not None else None,
         image=str(image) if image is not None else None,
+        base_url=str(base_url) if base_url is not None else None,
         # None (rather than a hardcoded default) when unset, same as
         # `platform` below: ssh/local targets get it probed (see
         # orchestrate._one()); a container needs an explicit one, which the
