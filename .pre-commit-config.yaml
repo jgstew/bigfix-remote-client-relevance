@@ -58,11 +58,12 @@ repos:
       #   args: ["--branch=main", "--branch=master"]
 
   # Broader than `detect-private-key` above, which only matches PEM headers:
-  # this catches cloud keys, tokens and connection strings too. hosts.toml
-  # carries real SSH endpoints and is gitignored, so the realistic failure is
-  # one of its values arriving in a fixture or a force-added file rather than a
-  # PEM block. Deferred to pre-push rather than every commit - it scans the
-  # whole staged content, not just the diff. Clean on the tree today.
+  # this catches cloud keys, tokens and connection strings too.
+  # remote_clients.toml carries real SSH endpoints and is gitignored, so the
+  # realistic failure is one of its values arriving in a fixture or a
+  # force-added file rather than a PEM block. Deferred to pre-push rather
+  # than every commit - it scans the whole staged content, not just the
+  # diff. Clean on the tree today.
   - repo: https://github.com/gitleaks/gitleaks
     rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
     hooks:

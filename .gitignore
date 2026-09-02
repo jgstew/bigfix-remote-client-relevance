@@ -216,5 +216,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-hosts.toml
+remote_clients.toml
 .DS_Store

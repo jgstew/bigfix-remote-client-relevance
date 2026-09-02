@@ -445,7 +445,7 @@ async def test_probe_engine_failure_becomes_a_transport_result():
 # the problem when it's wrong: the resolver picks the wrong artifact, it
 # fails to extract, and nothing else ever re-checks -- it fails identically
 # forever. A bootstrap failure with an explicit platform set is cheap to
-# double-check via a corrective reprobe, so hosts.toml can be told what's
+# double-check via a corrective reprobe, so remote_clients.toml can be told what's
 # actually wrong instead of just failing the same way on every future run.
 
 

@@ -50,6 +50,7 @@ EXPECTED_ROOT_EXPORTS = [
     "evaluate_client_relevance_stream",
     "evaluate_many",
     "evaluate_many_stream",
+    "find_inventory_path",
     "find_qna_path",
     "format_result",
     "format_results",

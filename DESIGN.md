@@ -192,7 +192,7 @@ Files in the repo are the source of truth; this section explains *why*.
 - **Interpreter support floor:** Python `>=3.11` (declared in
   `pyproject.toml` `[project] requires-python`). Buys three things the
   design leans on: stdlib `tomllib` (so `inventory.py` reads
-  `hosts.toml` with no `tomli` shim and zero conditional dependency),
+  `remote_clients.toml` with no `tomli` shim and zero conditional dependency),
   `asyncio.TaskGroup` + `ExceptionGroup` / `except*` (the natural shape
   for `orchestrate.py`'s targets × versions fan-out — structured
   cancellation and *all* per-target failures surfaced together rather
@@ -351,7 +351,7 @@ src/bigfix_remote_client_relevance/
                              # exit-code aggregation. The CLI and the
                              # future MCP tool both sit on this.
   cli.py                     # `bigfix-remote-client-relevance` entry
-  inventory.py               # optional hosts.toml loader
+  inventory.py               # optional remote_clients.toml loader
 tests/                       # sibling of src/, not inside the package
 ```
 
@@ -597,7 +597,7 @@ extracts qna out of the agent installer package without installing it —
 exactly what the existing `bigfix_run_qna_*.sh` scripts do today.
 
 **Version specs** (accepted anywhere a `qna_version` appears — API, CLI,
-`hosts.toml`):
+`remote_clients.toml`):
 | Spec | Meaning |
 |---|---|
 | *(unset)* | Newest patch of the newest stream (top of the release index). |
@@ -735,7 +735,7 @@ resolves to is `bigfix_remote_client_relevance.cli:main`).
 ```
 bigfix-remote-client-relevance HOST "name of operating system"
 bigfix-remote-client-relevance HOST --client-relevance-file probe.rel
-bigfix-remote-client-relevance --inventory hosts.toml \
+bigfix-remote-client-relevance --inventory remote_clients.toml \
     --client-relevance-file probe.rel --json
 bigfix-remote-client-relevance HOST --qna-version 11.0.4.60 "..."
 bigfix-remote-client-relevance HOST --qna-version 11.0 "..."   # newest 11.0.x patch
@@ -752,7 +752,7 @@ bigfix-remote-client-relevance --online-evaluator https://developer.bigfix.com "
   `TransportSSH`; `--local` picks `TransportLocal`; `--online-evaluator URL`
   picks `TransportOnlineEvaluator` (no default URL — see its design note
   above). Exactly one of the four is required per invocation (or
-  `--inventory hosts.toml` for a mixed grid); `--container` and
+  `--inventory remote_clients.toml` for a mixed grid); `--container` and
   `--online-evaluator` both compose with `--inventory` the same way, adding
   one ad hoc target to the fleet.
 - `--qna-version` accepts a version spec (`11.0` or `11.0.6.137`) and is
@@ -776,9 +776,31 @@ bigfix-remote-client-relevance --online-evaluator https://developer.bigfix.com "
   worst code across the fan-out wins; per-result detail is in the
   `--json` output.
 
+**Auto-discovery search path** (`inventory_paths.py`, used only for the
+zero-argument case — no `--local`/`--container`/`--online-evaluator`/
+`--inventory`/`HOST` — never for an explicit `--inventory PATH`), current
+directory first:
+
+1. `./remote_clients.toml`
+2. `~/.bigfix/remote_clients.toml` — per-user, a literal dotfolder in the
+   home directory on every OS (`Path.home()`, so it resolves correctly on
+   Windows too), matching the `~/.ssh` / `~/.aws` / `~/.docker` convention.
+3. The platform's all-users config directory, via
+   `platformdirs.site_config_dir("bigfix")` — `/etc/xdg/bigfix` on Linux,
+   `/Library/Application Support/bigfix` on macOS, `C:\ProgramData\bigfix`
+   on Windows.
+
+`.bigfix` and the all-users `"bigfix"` directory are both named for the
+shared, cross-project convention rather than this package's own name
+(`bigfix_remote_client_relevance`, used elsewhere for this package's own qna
+artifact cache and prereq-check state dirs) — other BigFix tools can store
+their own config under the same `.bigfix` folder later. Mirrors the
+`qna_paths.py` precedent (`default_candidates()` + `find_*_path()`, first
+match wins, `None` if nothing found) rather than inventing a new shape.
+
 Inventory format (`inventory.py`, loaded via `--inventory`):
 ```toml
-# hosts.toml
+# remote_clients.toml
 [defaults]
 qna_version = "11.0"        # version spec; overridable per host
 
@@ -949,7 +971,7 @@ answers cross an untrusted network.
   wins. Both the CLI's `--local`/`--no-become` and an inventory host with
   `transport = "local"` and no `become` line resolve through this one path,
   so a macOS box picks up the default whether reached by a flag or by
-  `hosts.toml` — the CLI itself does no platform-aware defaulting, it just
+  `remote_clients.toml` — the CLI itself does no platform-aware defaulting, it just
   forwards whatever `--become`/`--no-become`/neither produced. SSH always
   coerces `None` to `False` (`bool(target.become)`) with no platform
   awareness, since the remote OS isn't known without a round trip.

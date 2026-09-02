@@ -1,4 +1,4 @@
-"""Tests for the hosts.toml inventory loader."""
+"""Tests for the remote_clients.toml inventory loader."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ transport = "local"
 
 @pytest.fixture
 def inventory_file(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text(SAMPLE, encoding="utf-8")
     return path
 
@@ -68,7 +68,7 @@ def test_unset_become_is_left_unspecified_not_forced_false(inventory_file):
 
 
 def test_inventory_local_host_implies_become_on_macos(inventory_file, monkeypatch):
-    """The feature this was all for: a local host in hosts.toml with no
+    """The feature this was all for: a local host in remote_clients.toml with no
     `become` line still gets sudo on a macOS controller, same as --local."""
     import sys
 
@@ -112,7 +112,7 @@ def test_unset_arch_is_left_none_not_defaulted(inventory_file):
 
 
 def test_explicit_arch_is_carried_through(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.arm-box]\ntransport = "ssh"\narch = "arm64"\n', encoding="utf-8")
 
     targets = {t.name: t for t in load_inventory(path)}
@@ -138,7 +138,7 @@ def test_malformed_toml_reports_the_path(tmp_path):
 
 
 def test_unknown_transport_is_rejected(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.weird]\ntransport = "telepathy"\n', encoding="utf-8")
 
     with pytest.raises(InventoryError) as excinfo:
@@ -148,7 +148,7 @@ def test_unknown_transport_is_rejected(tmp_path):
 
 
 def test_container_host_without_an_image_is_rejected(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.nope]\ntransport = "container"\n', encoding="utf-8")
 
     with pytest.raises(InventoryError) as excinfo:
@@ -158,7 +158,7 @@ def test_container_host_without_an_image_is_rejected(tmp_path):
 
 
 def test_inventory_without_hosts_is_rejected(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[defaults]\nqna_version = "11.0"\n', encoding="utf-8")
 
     with pytest.raises(InventoryError):
@@ -166,7 +166,7 @@ def test_inventory_without_hosts_is_rejected(tmp_path):
 
 
 def test_transport_defaults_to_ssh(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text("[hosts.plain]\n", encoding="utf-8")
 
     targets = load_inventory(path)
@@ -182,7 +182,7 @@ def test_transport_defaults_to_ssh(tmp_path):
 
 
 def test_update_inventory_platform_adds_the_key_when_absent(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text(
         '[hosts.win-box]  # a comment worth keeping\ntransport = "ssh"\n', encoding="utf-8"
     )
@@ -196,7 +196,7 @@ def test_update_inventory_platform_adds_the_key_when_absent(tmp_path):
 
 
 def test_update_inventory_platform_overwrites_a_wrong_value(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.win-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8")
 
     update_inventory_platform(path, "win-box", "windows")
@@ -206,7 +206,7 @@ def test_update_inventory_platform_overwrites_a_wrong_value(tmp_path):
 
 
 def test_update_inventory_platform_leaves_other_hosts_untouched(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text(
         '[hosts.win-box]\ntransport = "ssh"\n\n[hosts.other]\ntransport = "ssh"\n',
         encoding="utf-8",
@@ -224,7 +224,7 @@ def test_update_inventory_platform_keeps_crlf_line_endings(tmp_path):
     Text-mode writing would translate tomlkit's reproduced CRLFs a second time,
     leaving \r\r\n behind -- which tomllib then refuses to read back.
     """
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_bytes(b'[hosts.win-box]  # kept\r\ntransport = "ssh"\r\n')
 
     update_inventory_platform(path, "win-box", "windows")
@@ -239,7 +239,7 @@ def test_update_inventory_platform_keeps_crlf_line_endings(tmp_path):
 
 
 def test_update_inventory_platform_unknown_host_raises(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
 
     with pytest.raises(InventoryError) as excinfo:
@@ -254,7 +254,7 @@ def test_update_inventory_platform_unknown_host_raises(tmp_path):
 
 
 def test_update_inventory_arch_adds_the_key_when_absent(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text(
         '[hosts.arm-box]  # a comment worth keeping\ntransport = "ssh"\n', encoding="utf-8"
     )
@@ -268,7 +268,7 @@ def test_update_inventory_arch_adds_the_key_when_absent(tmp_path):
 
 
 def test_update_inventory_arch_overwrites_a_wrong_value(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.arm-box]\ntransport = "ssh"\narch = "x86_64"\n', encoding="utf-8")
 
     update_inventory_arch(path, "arm-box", "arm64")
@@ -278,7 +278,7 @@ def test_update_inventory_arch_overwrites_a_wrong_value(tmp_path):
 
 
 def test_update_inventory_arch_unknown_host_raises(tmp_path):
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
 
     with pytest.raises(InventoryError) as excinfo:
@@ -290,7 +290,7 @@ def test_update_inventory_arch_unknown_host_raises(tmp_path):
 def test_a_host_can_set_its_own_idle_ttl(tmp_path):
     """A long-lived lab container may want to stay warm far longer than the
     default; an ephemeral one may want to go away sooner."""
-    path = tmp_path / "hosts.toml"
+    path = tmp_path / "remote_clients.toml"
     path.write_text(
         """
 [hosts.warm-ubuntu]

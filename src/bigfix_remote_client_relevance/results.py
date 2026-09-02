@@ -116,14 +116,14 @@ class ClientRelevanceResult:
     bootstrap failure with an explicit platform set) from a corrective
     re-probe that ignored it. ``None`` when no platform concept applies
     (fastquery) or none was ever resolved. This is what the CLI's
-    ``--update-inventory`` writes back to ``hosts.toml``."""
+    ``--update-inventory`` writes back to ``remote_clients.toml``."""
 
     arch: str | None = None
     """The architecture this run actually used, when known -- an explicit
     ``Target.arch`` (always the case for a container, since its arch is a
     per-run choice never inferred), or a fresh probe on an ssh/local target.
     ``None`` for fastquery, or when never resolved. This is what the CLI's
-    ``--update-inventory`` writes back to ``hosts.toml``, alongside
+    ``--update-inventory`` writes back to ``remote_clients.toml``, alongside
     ``platform``."""
 
     @property

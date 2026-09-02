@@ -34,6 +34,7 @@ from bigfix_remote_client_relevance.inventory import (
     update_inventory_arch,
     update_inventory_platform,
 )
+from bigfix_remote_client_relevance.inventory_paths import find_inventory_path
 from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
     DEFAULT_PULL_PARALLEL,
@@ -70,9 +71,8 @@ app = typer.Typer(
 # qna failure on the target.
 USAGE_EXIT_CODE = 64
 
-# Implied when no target is given and this file exists in the current
-# directory -- see the `not any(modes)` branch in `evaluate`.
-DEFAULT_INVENTORY_PATH = Path("hosts.toml")
+# Implied when no target is given and find_inventory_path() locates one --
+# see the `not any(modes)` branch in `evaluate`.
 
 
 def _configure_logging(verbosity: int, *, quiet: bool = False) -> None:
@@ -294,8 +294,10 @@ def evaluate(
         typer.Option(
             "--inventory",
             help=(
-                "Evaluate across the hosts in a hosts.toml file. Implied when "
-                "no target is given and hosts.toml exists in the current directory."
+                "Evaluate across the hosts in a remote_clients.toml file. Implied "
+                "when no target is given and one is found in the current "
+                "directory, ~/.bigfix/, or the all-users config directory, in "
+                "that order."
             ),
         ),
     ] = None,
@@ -305,8 +307,8 @@ def evaluate(
             "--update-inventory/--no-update-inventory",
             help=(
                 "Write a probed or corrected `platform`/`arch` back into "
-                "--inventory's hosts.toml, so future runs skip the probe and a "
-                "wrong entry stops failing silently forever."
+                "--inventory's remote_clients.toml, so future runs skip the probe "
+                "and a wrong entry stops failing silently forever."
             ),
         ),
     ] = True,
@@ -512,17 +514,20 @@ def evaluate(
     if not any(modes):
         # A bare `HOST` with no relevance and a bare relevance with no target
         # look identical here, so say what a complete invocation needs --
-        # unless a hosts.toml sits right here, in which case that's obviously
-        # what was meant and there's no need to spell out --inventory.
+        # unless find_inventory_path() locates a remote_clients.toml (current
+        # directory, then ~/.bigfix, then the all-users config directory),
+        # in which case that's obviously what was meant and there's no need
+        # to spell out --inventory.
         needed = 1 if client_relevance_file else 2
         if len(args) < needed:
-            if DEFAULT_INVENTORY_PATH.exists():
-                inventory = DEFAULT_INVENTORY_PATH
+            discovered = find_inventory_path()
+            if discovered is not None:
+                inventory = discovered
             else:
                 _fail(
                     "expected a target and a client relevance, e.g. "
                     '`HOST "name of operating system"`; or choose a target with '
-                    "--local, --container IMAGE, or --inventory hosts.toml"
+                    "--local, --container IMAGE, or --inventory remote_clients.toml"
                 )
         else:
             host = args[0]

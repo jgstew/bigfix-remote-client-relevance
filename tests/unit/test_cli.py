@@ -187,7 +187,7 @@ def test_online_evaluator_flag_selects_online_evaluator(captured):
 
 
 def test_online_evaluator_composes_with_inventory(captured, tmp_path):
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
 
     result = invoke(
@@ -214,9 +214,13 @@ def test_local_excludes_online_evaluator(captured):
 
 
 def test_no_target_is_a_usage_error(captured, tmp_path, monkeypatch):
-    # No hosts.toml here, so there's nothing to imply -- see
-    # test_no_target_defaults_to_hosts_toml_when_present for the flip side.
+    # Force the search to find nothing anywhere, regardless of whatever this
+    # machine's real ~/.bigfix or all-users config directory happens to hold
+    # -- see test_no_target_defaults_to_remote_clients_toml_when_present and
+    # test_no_target_falls_back_to_user_folder_when_cwd_has_none for the
+    # cases where the search does find something.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
 
     result = invoke("name of operating system")
 
@@ -224,15 +228,32 @@ def test_no_target_is_a_usage_error(captured, tmp_path, monkeypatch):
     assert "target" in result.output.lower() or "host" in result.output.lower()
 
 
-def test_no_target_defaults_to_hosts_toml_when_present(captured, tmp_path, monkeypatch):
+def test_no_target_defaults_to_remote_clients_toml_when_present(captured, tmp_path, monkeypatch):
+    """The plain current-directory case: unchanged behavior from before the search path."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "hosts.toml").write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
+    (tmp_path / "remote_clients.toml").write_text(
+        '[hosts.a]\ntransport = "ssh"\n', encoding="utf-8"
+    )
 
     result = invoke("name of operating system")
 
     assert result.exit_code == 0, result.output
     assert {t.name for t in captured["targets"]} == {"a"}
     assert captured["client_relevance"] == "name of operating system"
+
+
+def test_no_target_falls_back_to_user_folder_when_cwd_has_none(captured, tmp_path, monkeypatch):
+    """cli.py must call find_inventory_path() rather than re-implement the search itself."""
+    monkeypatch.chdir(tmp_path)
+    user_inventory = tmp_path / "user-config" / "remote_clients.toml"
+    user_inventory.parent.mkdir()
+    user_inventory.write_text('[hosts.b]\ntransport = "ssh"\n', encoding="utf-8")
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: user_inventory)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert {t.name for t in captured["targets"]} == {"b"}
 
 
 def test_two_target_modes_is_a_usage_error(captured):
@@ -242,7 +263,7 @@ def test_two_target_modes_is_a_usage_error(captured):
 
 
 def test_inventory_supplies_targets(captured, tmp_path):
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text(
         '[hosts.a]\ntransport = "ssh"\n[hosts.b]\ntransport = "container"\nimage = "ubuntu:22.04"\n',
         encoding="utf-8",
@@ -256,7 +277,7 @@ def test_inventory_supplies_targets(captured, tmp_path):
 
 # --- fan-out and explicit platforms -----------------------------------------
 #
-# Issue #1: four images used to require writing a hosts.toml, and forcing a
+# Issue #1: four images used to require writing a remote_clients.toml, and forcing a
 # platform for a one-shot query was impossible from the CLI at all.
 
 
@@ -291,7 +312,7 @@ def test_unknown_platform_is_a_usage_error(captured):
 
 
 def test_container_composes_with_inventory(captured, tmp_path):
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
 
     result = invoke("--inventory", str(inventory), "--container", "almalinux:9", "true")
@@ -301,7 +322,7 @@ def test_container_composes_with_inventory(captured, tmp_path):
 
 
 def test_platform_does_not_override_inventory_targets(captured, tmp_path):
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text(
         '[hosts.a]\ntransport = "container"\nimage = "almalinux:9"\nplatform = "rhel"\n',
         encoding="utf-8",
@@ -317,7 +338,7 @@ def test_platform_does_not_override_inventory_targets(captured, tmp_path):
     assert by_name["ubuntu:22.04"] == "ubuntu"
 
 
-# --- writing a probed/corrected platform back to hosts.toml ---------------
+# --- writing a probed/corrected platform back to remote_clients.toml ---------------
 #
 # update_inventory_platform itself is tested at the inventory-module level;
 # here only the CLI's decision of *when* to call it -- which host, which
@@ -337,7 +358,7 @@ def _spy_on_update_inventory_platform(monkeypatch):
 
 def test_update_inventory_writes_the_probed_platform(captured, tmp_path, monkeypatch):
     calls = _spy_on_update_inventory_platform(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
     captured["results"] = [
         ClientRelevanceResult(
@@ -353,7 +374,7 @@ def test_update_inventory_writes_the_probed_platform(captured, tmp_path, monkeyp
 
 def test_no_update_inventory_flag_skips_the_write(captured, tmp_path, monkeypatch):
     calls = _spy_on_update_inventory_platform(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.win-box]\ntransport = "ssh"\n', encoding="utf-8")
     captured["results"] = [
         ClientRelevanceResult(
@@ -371,7 +392,7 @@ def test_update_inventory_skips_a_host_whose_platform_already_matches(
     captured, tmp_path, monkeypatch
 ):
     calls = _spy_on_update_inventory_platform(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text(
         '[hosts.deb-box]\ntransport = "ssh"\nplatform = "ubuntu"\n', encoding="utf-8"
     )
@@ -397,7 +418,7 @@ def test_update_inventory_is_never_attempted_without_inventory(captured, monkeyp
     assert calls == []
 
 
-# --- writing a probed arch back to hosts.toml (same contract as platform) --
+# --- writing a probed arch back to remote_clients.toml (same contract as platform) --
 
 
 def _spy_on_update_inventory_arch(monkeypatch):
@@ -412,7 +433,7 @@ def _spy_on_update_inventory_arch(monkeypatch):
 
 def test_update_inventory_writes_the_probed_arch(captured, tmp_path, monkeypatch):
     calls = _spy_on_update_inventory_arch(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
     captured["results"] = [
         ClientRelevanceResult(
@@ -428,7 +449,7 @@ def test_update_inventory_writes_the_probed_arch(captured, tmp_path, monkeypatch
 
 def test_no_update_inventory_flag_skips_the_arch_write(captured, tmp_path, monkeypatch):
     calls = _spy_on_update_inventory_arch(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.arm-box]\ntransport = "ssh"\n', encoding="utf-8")
     captured["results"] = [
         ClientRelevanceResult(
@@ -444,7 +465,7 @@ def test_no_update_inventory_flag_skips_the_arch_write(captured, tmp_path, monke
 
 def test_update_inventory_skips_a_host_whose_arch_already_matches(captured, tmp_path, monkeypatch):
     calls = _spy_on_update_inventory_arch(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.x86-box]\ntransport = "ssh"\narch = "x86_64"\n', encoding="utf-8")
     captured["results"] = [
         ClientRelevanceResult(
@@ -461,7 +482,7 @@ def test_update_inventory_skips_a_host_whose_arch_already_matches(captured, tmp_
 def test_update_inventory_never_rewrites_a_container_hosts_arch(captured, tmp_path, monkeypatch):
     """Container arch is always an explicit, per-run choice, never probed."""
     calls = _spy_on_update_inventory_arch(monkeypatch)
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text(
         '[hosts.c]\ntransport = "container"\nimage = "ubuntu:22.04"\narch = "amd64"\n',
         encoding="utf-8",
@@ -481,7 +502,7 @@ def test_update_inventory_never_rewrites_a_container_hosts_arch(captured, tmp_pa
 def test_local_still_excludes_container_and_inventory(captured, tmp_path):
     assert invoke("--local", "--container", "ubuntu:22.04", "true").exit_code != 0
 
-    inventory = tmp_path / "hosts.toml"
+    inventory = tmp_path / "remote_clients.toml"
     inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
     assert invoke("--local", "--inventory", str(inventory), "true").exit_code != 0
 

@@ -1,5 +1,14 @@
-# Example inventory for --inventory hosts.toml (or an auto-discovered
-# ./hosts.toml — see README.md#inventory).
+# Example inventory for --inventory remote_clients.toml, or an
+# auto-discovered one -- see README.md#inventory. With no target given at
+# all, this file is searched for in three places, current directory first:
+#   1. ./remote_clients.toml
+#   2. ~/.bigfix/remote_clients.toml           (per-user)
+#   3. the platform's all-users config dir     (e.g. /etc/xdg/bigfix on
+#      Linux, /Library/Application Support/bigfix on macOS,
+#      C:\ProgramData\bigfix on Windows)
+# `.bigfix` and the all-users "bigfix" directory are deliberately shared,
+# cross-project names -- other BigFix tools can drop their own config there
+# too, not just this one.
 #
 # [defaults] applies to every [hosts.*] table below; any key repeated on a
 # host wins over the default for that host only.

@@ -42,6 +42,7 @@ from importlib.metadata import version as _version
 
 from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
+from bigfix_remote_client_relevance.inventory_paths import find_inventory_path
 from bigfix_remote_client_relevance.orchestrate import (
     EXIT_OK,
     EXIT_QNA,
@@ -126,6 +127,7 @@ __all__ = [
     "evaluate_client_relevance_stream",
     "evaluate_many",
     "evaluate_many_stream",
+    "find_inventory_path",
     "find_qna_path",
     "format_result",
     "format_results",

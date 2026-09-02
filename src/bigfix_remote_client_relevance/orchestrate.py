@@ -588,7 +588,7 @@ async def _evaluate_stream_indexed(
         if spec is not None and configured_platform is not None:
             # An explicit platform was trusted outright above and never
             # probed. If it made the run fail, that's exactly the failure
-            # mode a wrong hosts.toml entry produces (issue: a stale or
+            # mode a wrong remote_clients.toml entry produces (issue: a stale or
             # mistyped platform silently resolves the wrong artifact) --
             # cheap to double-check now that it's failed, on the same live
             # connection, rather than leaving it to fail identically forever.

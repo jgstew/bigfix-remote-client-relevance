@@ -1,4 +1,4 @@
-"""Load a hosts.toml inventory into orchestration targets.
+"""Load a remote_clients.toml inventory into orchestration targets.
 
 Example::
 

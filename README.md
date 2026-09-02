@@ -60,15 +60,16 @@ bigfix-remote-client-relevance mac-test --become "name of operating system"
 Fan out across an inventory and emit JSON:
 
 ```bash
-bigfix-remote-client-relevance --inventory hosts.toml -f probe.rel --json
+bigfix-remote-client-relevance --inventory remote_clients.toml -f probe.rel --json
 ```
 
 `--json` writes one document per (target × version) to stdout; logs go to
 stderr, so piping into `jq` always works.
 
 If no target is given at all — no `--local`, `--container`, `--inventory`,
-or `HOST` — and a `hosts.toml` exists in the current directory, it's used
-automatically, so the above also works as:
+or `HOST` — a `remote_clients.toml` is searched for automatically, current
+directory first, then `~/.bigfix/`, then the platform's all-users config
+directory (see § Inventory below), so the above also works as:
 
 ```bash
 bigfix-remote-client-relevance -f probe.rel --json
@@ -82,7 +83,7 @@ already finished. This applies to plain text and to `--jsonl`, which writes
 one compact JSON object per line:
 
 ```bash
-bigfix-remote-client-relevance --inventory hosts.toml --jsonl "version of client" | jq -c '{host, elapsed_ms}'
+bigfix-remote-client-relevance --inventory remote_clients.toml --jsonl "version of client" | jq -c '{host, elapsed_ms}'
 ```
 
 ```
@@ -118,8 +119,20 @@ through 0.1.2, which collided with "qna failed".)
 
 ### Inventory
 
+With no target given at all, `remote_clients.toml` is searched for in three
+places, current directory first, and the first one found wins:
+
+1. `./remote_clients.toml`
+2. `~/.bigfix/remote_clients.toml` — per-user, a literal dotfolder in the
+   home directory on every OS (same idea as `~/.ssh`, `~/.aws`, `~/.docker`).
+   `.bigfix` is a shared, cross-project folder name, not specific to this
+   tool.
+3. The platform's all-users config directory — `/etc/xdg/bigfix` on Linux,
+   `/Library/Application Support/bigfix` on macOS, `C:\ProgramData\bigfix`
+   on Windows.
+
 ```toml
-# hosts.toml
+# remote_clients.toml
 [defaults]
 qna_version = "11.0"        # version spec; overridable per host
 
@@ -174,7 +187,7 @@ results = await evaluate_many(
         "version of client",
         "number of processes",
     ],
-    load_inventory("hosts.toml"),
+    load_inventory("remote_clients.toml"),
     qna_version="11.0",
 )
 
