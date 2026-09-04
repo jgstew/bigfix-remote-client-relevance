@@ -205,7 +205,7 @@ repos:
 
   - repo: https://github.com/woodruffw/zizmor-pre-commit
     # Find security issues in GitHub Actions CI/CD setups.
-    rev: 451b56af716f9f0d0c2b816503a3fd0cf8b036fa # v1.29.0
+    rev: cef8b8350da46d8114c7e6b7272aebdccdf193ce # v1.30.0
     hooks:
       - id: zizmor
         stages: [pre-push, manual]
