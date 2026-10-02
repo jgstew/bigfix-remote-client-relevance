@@ -12,6 +12,7 @@ from bigfix_remote_client_relevance.bootstrap.release_site import (
     RELEASE_INDEX_URL,
     ResolveError,
     artifact_for,
+    previous_version,
     resolve_version_spec,
 )
 
@@ -301,3 +302,90 @@ def test_refresh_forces_a_refetch(fetch, tmp_path):
     resolve_version_spec("11.0", fetch=fetch, cache_dir=tmp_path, refresh=True)
 
     assert len(fetch.requested) > before
+
+
+# --- stepping back a release ----------------------------------------------------
+
+
+def test_previous_version_steps_back_one_patch(pages):
+    assert previous_version("11.0.6.137", fetch=RecordingFetcher(pages)) == "11.0.5.204"
+
+
+def test_previous_version_of_an_unlisted_newer_release_is_the_newest_listed(pages):
+    """The captured index predates 11.0.7, just as a cached one can."""
+    assert previous_version("11.0.7.61", fetch=RecordingFetcher(pages)) == "11.0.6.137"
+
+
+def test_previous_version_crosses_into_the_previous_stream(pages):
+    fetch = RecordingFetcher(pages)
+    oldest_11 = previous_version("11.0.0.1", fetch=fetch)
+
+    assert oldest_11 is not None
+    assert oldest_11.startswith("10.0.")
+
+
+def test_previous_version_is_none_past_the_oldest_release(pages):
+    assert previous_version("1.0.0.1", fetch=RecordingFetcher(pages)) is None
+
+
+def test_previous_version_needs_a_full_version(pages):
+    with pytest.raises(ResolveError):
+        previous_version("11.0", fetch=RecordingFetcher(pages))
+
+
+# --- known build splits ---------------------------------------------------------
+#
+# 11.0.7 replaced the raspbian armhf stand-in with native arm64 debs built for
+# debian13/ubuntu24 only, so any older debian/ubuntu arm64 runtime that cannot
+# start 11.0.7+ should step straight back past the split, not one patch at a time.
+
+
+def test_fallback_floor_jumps_past_the_arm64_deb_split():
+    from bigfix_remote_client_relevance.bootstrap.release_site import fallback_floor
+
+    assert fallback_floor("11.0.9.10", platform="debian", arch="arm64") == "11.0.7.0"
+    assert fallback_floor("11.0.7.61", platform="ubuntu", arch="aarch64") == "11.0.7.0"
+
+
+def test_fallback_floor_is_none_below_the_split():
+    from bigfix_remote_client_relevance.bootstrap.release_site import fallback_floor
+
+    assert fallback_floor("11.0.6.137", platform="debian", arch="arm64") is None
+
+
+def test_fallback_floor_is_none_for_unaffected_platforms_and_arches():
+    from bigfix_remote_client_relevance.bootstrap.release_site import fallback_floor
+
+    assert fallback_floor("11.0.9.10", platform="debian", arch="x86_64") is None
+    assert fallback_floor("11.0.9.10", platform="rhel", arch="arm64") is None
+
+
+# --- package family never crosses -----------------------------------------------
+#
+# A deb-family target must never be handed an rpm, nor the reverse -- not as a
+# primary pick, not as a fallback, not via a known build split.
+
+_DEB_PLATFORMS = ("ubuntu", "debian", "raspbian")
+_RPM_PLATFORMS = ("rhel", "suse")
+
+
+@pytest.mark.parametrize("version", ["11.0.6.137", "11.0.7.61"])
+@pytest.mark.parametrize("arch", ["x86_64", "arm64"])
+@pytest.mark.parametrize("platform", _DEB_PLATFORMS + _RPM_PLATFORMS)
+def test_artifacts_never_cross_package_families(pages, platform, arch, version):
+    try:
+        ref = artifact_for(version, platform=platform, arch=arch, fetch=RecordingFetcher(pages))
+    except ResolveError:
+        return  # no artifact at all is fine; the wrong family is not
+
+    expected = ".deb" if platform in _DEB_PLATFORMS else ".rpm"
+    assert ref.filename.endswith(expected), ref.filename
+
+
+def test_every_platform_pattern_names_its_own_package_family():
+    from bigfix_remote_client_relevance.bootstrap.release_site import _PLATFORM_PATTERNS
+
+    for platform in _DEB_PLATFORMS:
+        assert all(p.endswith(r"\.deb$") for p in _PLATFORM_PATTERNS[platform]), platform
+    for platform in _RPM_PLATFORMS:
+        assert all(p.endswith(r"\.rpm$") for p in _PLATFORM_PATTERNS[platform]), platform

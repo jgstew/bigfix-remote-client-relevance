@@ -333,6 +333,33 @@ def resolve_version_spec(
     return rows[0][1]
 
 
+def _version_key(full_version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in full_version.split("."))
+
+
+def previous_version(full_version: str, *, fetch: Fetcher | None = None) -> str | None:
+    """The newest listed agent release strictly older than ``full_version``.
+
+    ``full_version`` need not be listed itself -- a release newer than the
+    index knows about steps back to the newest one it does list -- and the
+    search crosses streams, so the oldest 11.0 release steps back into 10.0.
+    ``None`` when nothing older is listed.
+    """
+    if not _FULL_VERSION.match(full_version):
+        raise ResolveError(f"stepping back needs a full version, got {full_version!r}")
+
+    fetch = fetch or _default_fetch
+    soup = _soup(fetch(RELEASE_INDEX_URL), RELEASE_INDEX_URL)
+    target = _version_key(full_version)
+    older = [
+        version
+        for table in _stream_tables(soup).values()
+        for _slug, version in _agent_versions(table, _table_headers(table))
+        if _version_key(version) < target
+    ]
+    return max(older, key=_version_key, default=None)
+
+
 def _patch_page_url(full_version: str) -> str:
     major, minor, patch, _build = full_version.split(".")
     return urljoin(RELEASE_INDEX_URL, f"{major}.{minor}/patch{patch}/")
@@ -361,6 +388,25 @@ def _predates_native_arm64_debs(full_version: str) -> bool:
     """Whether ``full_version`` is older than the first official arm64 debs."""
     major, minor, patch, _build = (int(part) for part in full_version.split("."))
     return (major, minor, patch) < _FIRST_NATIVE_ARM64_DEB_VERSION
+
+
+def fallback_floor(full_version: str, *, platform: str, arch: str) -> str | None:
+    """A release to step back *below* in one go, when a known split applies.
+
+    11.0.7 replaced the raspbian armhf stand-in with native arm64 debs built
+    only for debian13/ubuntu24, so a debian/ubuntu arm64 runtime too old for
+    one 11.0.7+ build is too old for all of them: walking back a patch at a
+    time would only re-learn that. Returns ``"11.0.7.0"`` there -- the release
+    before it is what to try -- and ``None`` wherever no split is known.
+    """
+    if (
+        platform in _ARM64_RASPBIAN_FALLBACK_PLATFORMS
+        and _ARCH_DEB.get(arch) == "arm64"
+        and _FULL_VERSION.match(full_version)
+        and not _predates_native_arm64_debs(full_version)
+    ):
+        return ".".join(str(part) for part in (*_FIRST_NATIVE_ARM64_DEB_VERSION, 0))
+    return None
 
 
 def artifact_for(
@@ -447,6 +493,8 @@ __all__ = [
     "Fetcher",
     "ResolveError",
     "artifact_for",
+    "fallback_floor",
     "parse_checksums",
+    "previous_version",
     "resolve_version_spec",
 ]

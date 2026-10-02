@@ -34,6 +34,9 @@ from bigfix_remote_client_relevance.results import (
     ResolvedQna,
     parse_qna_output,
 )
+from bigfix_remote_client_relevance.transports.container_libs import (
+    incompatible_symbol_versions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +371,14 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
         logger.error("qna process %s did not die after kill", process.pid)
 
 
+def too_new_message(symbols: Sequence[str], stderr: str) -> str:
+    """The error for a qna build that needs a newer runtime than the host has."""
+    return (
+        f"qna build is too new for this host: it needs {', '.join(symbols)}, which the "
+        f"host's libraries do not provide; use an older qna version ({stderr.strip()})"
+    )
+
+
 def classify_qna_outcome(
     parsed: ParsedQnaOutput, exit_code: int, stderr: str
 ) -> tuple[str | None, str | None]:
@@ -379,6 +390,13 @@ def classify_qna_outcome(
     if parsed.errors:
         first = parsed.errors[0]
         return dmi_unavailable(first) or first, ERROR_KIND_RELEVANCE
+
+    # Checked before the generic exit-code case: this is not a qna crash but a
+    # build that cannot start here, and the orchestrator steps back a release
+    # on exactly this bootstrap error.
+    too_new = incompatible_symbol_versions(stderr)
+    if too_new and (exit_code != 0 or not parsed.has_recognizable_output):
+        return too_new_message(too_new, stderr), ERROR_KIND_BOOTSTRAP
 
     if exit_code != 0:
         detail = stderr.strip() or f"qna exited {exit_code} with no output"

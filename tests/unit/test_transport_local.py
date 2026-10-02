@@ -718,3 +718,15 @@ def test_classify_passes_an_ordinary_relevance_error_through_untouched():
     error, kind = classify_qna_outcome(ParsedQnaOutput(errors=[detail]), exit_code=0, stderr="")
 
     assert (error, kind) == (detail, ERROR_KIND_RELEVANCE)
+
+
+def test_classify_reports_a_too_new_binary_as_a_bootstrap_problem():
+    """No relevance or qna bug: the build needs a newer runtime than the host has."""
+    stderr = "qna: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by qna)"
+
+    error, kind = classify_qna_outcome(ParsedQnaOutput(), exit_code=1, stderr=stderr)
+
+    assert kind == ERROR_KIND_BOOTSTRAP
+    assert error is not None
+    assert "too new" in error
+    assert "GLIBC_2.34" in error

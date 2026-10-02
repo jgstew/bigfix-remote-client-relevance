@@ -272,3 +272,18 @@ def test_a_single_expression_fan_out_keeps_its_plain_headers():
     ]
 
     assert "name of operating system" not in format_results(results)
+
+
+def test_label_names_the_version_a_fallback_stepped_back_from():
+    text = format_result(
+        make_result(
+            host="container:debian:11",
+            transport="container",
+            arch="arm64",
+            qna_version="11.0.6.137",
+            qna_fallback_from="11.0.7.61",
+        ),
+        labelled=True,
+    )
+
+    assert "(qna 11.0.6.137, fell back from 11.0.7.61)" in text

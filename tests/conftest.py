@@ -20,6 +20,17 @@ import pytest
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+# --- isolation -------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolated_compat_memory(tmp_path, monkeypatch):
+    """Keep fallback memory out of the developer's real state directory."""
+    from bigfix_remote_client_relevance.bootstrap import compat_memory
+
+    monkeypatch.setattr(compat_memory, "default_path", lambda: tmp_path / "compat_memory.json")
+
+
 # --- fixture loaders -------------------------------------------------------
 
 

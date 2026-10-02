@@ -1795,3 +1795,300 @@ async def test_a_batch_releases_its_container_when_the_batch_is_done():
     )
 
     assert [t.closed for t in built] == [1]
+
+
+# --- stepping back when a qna build is too new for the target ------------------
+#
+# 11.0.7 dropped the arm64 builds that ran on older distros: on debian:11 the
+# only 11.0.7.61 candidates need GLIBC_2.38. The run should step back to the
+# newest release whose build actually starts there, rather than fail.
+
+TOO_NEW_STDERR = "qna: /lib/libc.so.6: version `GLIBC_2.38' not found (required by qna)"
+
+
+class FakeOldRuntimeTransport(FakeTransport):
+    """A host whose runtime only starts qna builds at or below ``newest_ok``."""
+
+    def __init__(self, host: str, newest_ok: tuple[int, ...]) -> None:
+        super().__init__(host)
+        self._newest_ok = newest_ok
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        self.calls.append(qna)
+        version = qna.version if qna else None
+        if version and tuple(int(p) for p in version.split(".")) > self._newest_ok:
+            return ClientRelevanceResult(
+                host=self.host,
+                transport="fake",
+                client_relevance=client_relevance,
+                error=f"qna {version} is too new for this host ({TOO_NEW_STDERR})",
+                error_kind=ERROR_KIND_BOOTSTRAP,
+                qna_version=version,
+            )
+        return ClientRelevanceResult(
+            host=self.host,
+            transport="fake",
+            client_relevance=client_relevance,
+            answers=["yes"],
+            qna_version=version,
+        )
+
+
+RELEASES = ["11.0.9.10", "11.0.8.5", "11.0.7.61", "11.0.6.137", "11.0.5.204", "11.0.4.60"]
+
+
+def _key(version: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in version.split("."))
+
+
+def passthrough_resolver(asked: list[str | None] | None = None):
+    """Exact versions resolve to themselves; anything else to the newest."""
+
+    async def resolve(spec: str | None, target: Target) -> ResolvedQna:
+        if asked is not None:
+            asked.append(spec)
+        version = spec if spec in RELEASES else "11.0.7.61"
+        return ResolvedQna(version=version, artifact_path=Path("/cache/fake.deb"))
+
+    return resolve
+
+
+async def step_back(version: str) -> str | None:
+    older = [v for v in RELEASES if _key(v) < _key(version)]
+    return max(older, key=_key, default=None)
+
+
+async def test_a_too_new_build_falls_back_to_the_previous_release():
+    transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="debian:11", arch="arm64", platform="debian")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert [r.ok for r in results] == [True]
+    assert results[0].qna_version == "11.0.6.137"
+    assert results[0].qna_fallback_from == "11.0.7.61"
+
+
+async def test_a_fallback_steps_back_more_than_once_when_it_has_to():
+    transport = FakeOldRuntimeTransport("old", newest_ok=(11, 0, 5, 204))
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="old", arch="arm64", platform="debian")],
+        qna_version="11.0",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert results[0].ok
+    assert results[0].qna_version == "11.0.5.204"
+    assert results[0].qna_fallback_from == "11.0.7.61"
+
+
+async def test_every_expression_in_a_batch_runs_on_the_fallback_version():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
+
+    results = await evaluate_many(
+        ["true", "false", "1"],
+        [Target(kind="container", name="debian:11", arch="arm64", platform="debian")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert [r.qna_version for r in results] == ["11.0.6.137"] * 3
+    assert all(r.ok for r in results)
+
+
+async def test_fallback_gives_up_when_no_older_release_starts_either():
+    transport = FakeOldRuntimeTransport("ancient", newest_ok=(1, 0, 0, 0))
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="ancient", arch="arm64", platform="debian")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert results[0].error_kind == ERROR_KIND_BOOTSTRAP
+    assert "too new" in (results[0].error or "")
+    # bounded: never walks the whole release history
+    assert len(transport.calls) <= 4
+
+
+async def test_an_older_release_without_an_artifact_is_skipped():
+    from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError
+
+    async def resolve(spec: str | None, target: Target) -> ResolvedQna:
+        if spec == "11.0.6.137":
+            raise ResolveError("no debian/arm64 qna artifact for 11.0.6.137")
+        version = spec if spec in RELEASES else "11.0.7.61"
+        return ResolvedQna(version=version, artifact_path=Path("/cache/fake.deb"))
+
+    transport = FakeOldRuntimeTransport("old", newest_ok=(11, 0, 6, 137))
+
+    results = await evaluate_client_relevance(
+        "true",
+        # rhel: no known build split, so this walks one release at a time.
+        [Target(kind="container", name="old", arch="arm64", platform="rhel")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=resolve,
+        previous_version=step_back,
+    )
+
+    assert results[0].ok
+    assert results[0].qna_version == "11.0.5.204"
+
+
+async def test_other_bootstrap_failures_never_trigger_a_fallback():
+    asked: list[str | None] = []
+
+    class Broken(FakeTransport):
+        async def evaluate_client_relevance(self, client_relevance, **kwargs):
+            return ClientRelevanceResult(
+                host=self.host,
+                transport="fake",
+                client_relevance=client_relevance,
+                error="missing shared library libdbus-1.so.3",
+                error_kind=ERROR_KIND_BOOTSTRAP,
+            )
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="rocky", arch="x86_64", platform="rhel")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: Broken(t.name),
+        resolver=passthrough_resolver(asked),
+        previous_version=step_back,
+    )
+
+    assert results[0].qna_fallback_from is None
+    assert asked == ["11.0.7.61"]
+
+
+async def test_a_build_that_starts_reports_no_fallback():
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="host0")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert results[0].qna_version == "11.0.7.61"
+    assert results[0].qna_fallback_from is None
+
+
+# --- remembering too-new builds across runs -----------------------------------
+
+
+async def test_a_second_run_skips_the_known_too_new_build(tmp_path):
+    from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
+
+    memory = CompatMemory(tmp_path / "m.json")
+    target = Target(kind="container", name="debian:11", arch="arm64", platform="debian")
+
+    for _ in range(2):
+        transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
+        results = await evaluate_client_relevance(
+            "true",
+            [target],
+            qna_version="11.0.7.61",
+            transport_factory=lambda t, transport=transport: transport,
+            resolver=passthrough_resolver(),
+            previous_version=step_back,
+            compat_memory=memory,
+        )
+
+    assert results[0].ok
+    assert results[0].qna_version == "11.0.6.137"
+    assert results[0].qna_fallback_from == "11.0.7.61"
+    assert [q.version for q in transport.calls] == ["11.0.6.137"]
+
+
+async def test_a_remembered_version_that_stops_working_is_forgotten(tmp_path):
+    from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
+
+    memory = CompatMemory(tmp_path / "m.json")
+    key_target = Target(kind="container", name="old", arch="arm64", platform="rhel")
+    transport = FakeOldRuntimeTransport("old", newest_ok=(11, 0, 6, 137))
+    await evaluate_client_relevance(
+        "true",
+        [key_target],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+        compat_memory=memory,
+    )
+
+    # The image got older underneath us: 11.0.6.137 no longer starts either.
+    transport = FakeOldRuntimeTransport("old", newest_ok=(11, 0, 5, 204))
+    results = await evaluate_client_relevance(
+        "true",
+        [key_target],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+        compat_memory=memory,
+    )
+
+    assert results[0].ok
+    assert results[0].qna_version == "11.0.5.204"
+    assert results[0].qna_fallback_from == "11.0.7.61"
+
+
+async def test_a_compatible_build_records_nothing(tmp_path):
+    from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
+
+    memory = CompatMemory(tmp_path / "m.json")
+    await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="debian:13", arch="arm64", platform="debian")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+        compat_memory=memory,
+    )
+
+    assert not (tmp_path / "m.json").exists()
+
+
+async def test_the_arm64_deb_split_is_crossed_in_one_step():
+    asked: list[str] = []
+
+    async def recording_step_back(version: str) -> str | None:
+        asked.append(version)
+        return await step_back(version)
+
+    transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="container", name="debian:11", arch="arm64", platform="debian")],
+        qna_version="11.0.9.10",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=recording_step_back,
+    )
+
+    assert results[0].qna_version == "11.0.6.137"
+    assert [q.version for q in transport.calls] == ["11.0.9.10", "11.0.6.137"]
+    assert asked == ["11.0.7.0"]

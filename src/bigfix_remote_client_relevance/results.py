@@ -104,6 +104,11 @@ class ClientRelevanceResult:
 
     qna_path: str = ""
     qna_version: str | None = None
+    qna_fallback_from: str | None = None
+    """The version originally resolved, when its build was too new for the
+    target and ``qna_version`` is an older release stepped back to instead.
+    ``None`` when no fallback happened."""
+
     qna_time: str | None = None
     """qna's own ``T:`` timing, distinct from caller-measured ``elapsed_ms``."""
 

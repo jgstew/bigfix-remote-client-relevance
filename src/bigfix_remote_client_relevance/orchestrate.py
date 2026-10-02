@@ -32,7 +32,8 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
-from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError
+from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
+from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError, fallback_floor
 from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
@@ -273,6 +274,52 @@ async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
     return await ensure_artifact(version, ref)
 
 
+MAX_FALLBACK_STEPS = 3
+"""How many older releases a too-new build may step back through.
+
+Enough to cross a release that dropped a platform's build, without walking
+the whole release history for a target nothing will ever start on."""
+
+PreviousVersion = Callable[[str], Coroutine[Any, Any, str | None]]
+
+
+async def default_previous_version(version: str) -> str | None:
+    """The release before ``version``, per the BigFix release index."""
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        previous_version as release_previous_version,
+    )
+
+    return await asyncio.to_thread(release_previous_version, version)
+
+
+def _memory_key(target: Target) -> str:
+    """What a too-new verdict is remembered against: where qna runs, and as what."""
+    return f"{target.kind}:{target.image or target.name}:{target.platform}@{target.arch}"
+
+
+def _split_floor(target: Target, version: str) -> str | None:
+    from bigfix_remote_client_relevance.bootstrap.targets import spec_for
+
+    if target.platform is None or target.arch is None:
+        return None
+    try:
+        release_platform = spec_for(target.platform).release_platform
+    except Exception:  # noqa: BLE001 - an unknown platform just has no known split
+        return None
+    return fallback_floor(version, platform=release_platform, arch=target.arch)
+
+
+def _is_too_new(result: ClientRelevanceResult) -> bool:
+    """Whether a result failed because the qna build needs a newer runtime."""
+    from bigfix_remote_client_relevance.transports.container_libs import (
+        incompatible_symbol_versions,
+    )
+
+    return result.error_kind == ERROR_KIND_BOOTSTRAP and bool(
+        incompatible_symbol_versions(result.error or "")
+    )
+
+
 def _version_specs(target: Target, run_wide: str | Sequence[str] | None) -> list[str | None]:
     """Which version specs apply to this target, per-target override winning."""
     chosen = target.qna_version if target.qna_version is not None else run_wide
@@ -331,6 +378,8 @@ async def _evaluate_stream_indexed(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
+    previous_version: PreviousVersion | None = None,
+    compat_memory: CompatMemory | None = None,
 ) -> AsyncIterator[tuple[int, ClientRelevanceResult]]:
     """Shared core: yield ``(work_index, result)`` as each cell finishes.
 
@@ -360,6 +409,8 @@ async def _evaluate_stream_indexed(
         transport_factory = _default_transport_factory
 
     resolver = resolver or default_resolver
+    previous_version = previous_version or default_previous_version
+    memory = compat_memory or CompatMemory()
     semaphore = asyncio.Semaphore(max_parallel)
     image_semaphore = asyncio.Semaphore(pull_parallel)
 
@@ -558,34 +609,129 @@ async def _evaluate_stream_indexed(
                         emit(index, result)
                     return
 
-            if prepare is not None:
+            async def _prepare(qna: ResolvedQna | None) -> None:
+                if prepare is None:
+                    return
                 # Pulling and building under their own budget. Failures are not
                 # fatal: this is an optimization, and the evaluation below hits the
                 # same code path and reports the failure in its own vocabulary.
                 try:
                     async with image_budget:
-                        await prepare(qna=resolved, timeout_s=timeout_s)
+                        await prepare(qna=qna, timeout_s=timeout_s)
                 except Exception as exc:  # noqa: BLE001 - the evaluation will report it
                     logger.debug("image preparation failed for %s: %s", target.label, exc)
 
-            for index, expression in enumerate(expressions):
-                emit(
-                    index,
-                    await _evaluate_one(
-                        transport,
-                        target,
-                        expression,
-                        resolved=resolved,
-                        spec=spec,
-                        configured_platform=configured_platform,
-                    ),
+            async def _evaluate(expression: str, qna: ResolvedQna | None) -> ClientRelevanceResult:
+                return await _evaluate_one(
+                    transport,
+                    target,
+                    expression,
+                    resolved=qna,
+                    spec=spec,
+                    configured_platform=configured_platform,
                 )
+
+            if not expressions:
+                await _prepare(resolved)
+                return
+
+            # A build already known to be too new here is skipped outright, so
+            # an old-runtime target pays for the failed attempt once, not on
+            # every run.
+            memory_key = _memory_key(target)
+            requested = resolved
+            remembered = memory.lookup(memory_key, resolved.version) if resolved else None
+            if remembered is not None:
+                try:
+                    resolved = await _resolve(target, remembered)
+                except Exception as exc:  # noqa: BLE001 - fall back to the requested build
+                    logger.debug("remembered %s unusable for %s: %s", remembered, target.label, exc)
+                    remembered = None
+                else:
+                    logger.info(
+                        "%s: qna %s is known to be too new here; using %s",
+                        target.label,
+                        requested.version if requested else None,
+                        resolved.version,
+                    )
+
+            await _prepare(resolved)
+            first = await _evaluate(expressions[0], resolved)
+            if resolved is not None and _is_too_new(first):
+                if remembered is not None:
+                    memory.forget(memory_key)
+                older = await _fall_back(target, resolved, _prepare, _evaluate, expressions[0])
+                if older is not None:
+                    resolved, first = older
+
+            fallback_from: str | None = None
+            if (
+                requested is not None
+                and resolved is not None
+                and resolved.version != requested.version
+            ):
+                fallback_from = requested.version
+                if remembered is None or resolved.version != remembered:
+                    memory.record(memory_key, too_new=requested.version, works=resolved.version)
+
+            def _tagged(result: ClientRelevanceResult) -> ClientRelevanceResult:
+                result.qna_fallback_from = fallback_from
+                return result
+
+            emit(0, _tagged(first))
+            for index, expression in enumerate(expressions[1:], start=1):
+                emit(index, _tagged(await _evaluate(expression, resolved)))
         finally:
             # Nothing else in the process holds this transport, so an
             # unreleased one leaks whatever it opened -- an SSH connection,
             # or (worse, because it outlives the process) a kept-alive
             # container.
             await _release(transport)
+
+    async def _fall_back(
+        target: Target,
+        too_new: ResolvedQna,
+        prepare: Callable[[ResolvedQna], Coroutine[Any, Any, None]],
+        evaluate: Callable[[str, ResolvedQna], Coroutine[Any, Any, ClientRelevanceResult]],
+        expression: str,
+    ) -> tuple[ResolvedQna, ClientRelevanceResult] | None:
+        """Step back through older releases until one's build starts on ``target``.
+
+        Bounded by :data:`MAX_FALLBACK_STEPS`; a release with no artifact for
+        this platform/arch counts as a step and is skipped. ``None`` when none
+        starts, so the caller reports the original failure, which names the
+        version actually asked for.
+        """
+        version = too_new.version
+        # Past a known build split, the first step clears it entirely.
+        floor = _split_floor(target, version)
+        if floor is not None:
+            version = floor
+        for _ in range(MAX_FALLBACK_STEPS):
+            try:
+                older = await previous_version(version)
+            except Exception as exc:  # noqa: BLE001 - keep the original failure
+                logger.debug("could not step back from %s: %s", version, exc)
+                return None
+            if older is None:
+                return None
+            version = older
+            try:
+                candidate = await _resolve(target, older)
+            except Exception as exc:  # noqa: BLE001 - a missing artifact is just skipped
+                logger.debug("skipping %s for %s: %s", older, target.label, exc)
+                continue
+            await prepare(candidate)
+            result = await evaluate(expression, candidate)
+            if not _is_too_new(result):
+                logger.warning(
+                    "%s: qna %s is too new for this target; fell back to %s",
+                    target.label,
+                    too_new.version,
+                    candidate.version,
+                )
+                return candidate, result
+        return None
 
     async def _evaluate_one(
         transport: Transport,
@@ -716,6 +862,8 @@ async def evaluate_client_relevance_stream(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
+    previous_version: PreviousVersion | None = None,
+    compat_memory: CompatMemory | None = None,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate ``client_relevance`` on every target, for every version.
 
@@ -735,6 +883,8 @@ async def evaluate_client_relevance_stream(
         timeout_s=timeout_s,
         transport_factory=transport_factory,
         resolver=resolver,
+        previous_version=previous_version,
+        compat_memory=compat_memory,
     ):
         yield result
 
@@ -749,6 +899,8 @@ async def evaluate_client_relevance(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
+    previous_version: PreviousVersion | None = None,
+    compat_memory: CompatMemory | None = None,
 ) -> list[ClientRelevanceResult]:
     """Evaluate ``client_relevance`` on every target, for every version.
 
@@ -767,6 +919,8 @@ async def evaluate_client_relevance(
         timeout_s=timeout_s,
         transport_factory=transport_factory,
         resolver=resolver,
+        previous_version=previous_version,
+        compat_memory=compat_memory,
     ):
         by_index[index] = result
     return [by_index[i] for i in range(len(by_index))]
@@ -782,6 +936,8 @@ async def evaluate_many_stream(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
+    previous_version: PreviousVersion | None = None,
+    compat_memory: CompatMemory | None = None,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate every expression on every target, for every version.
 
@@ -797,6 +953,8 @@ async def evaluate_many_stream(
         timeout_s=timeout_s,
         transport_factory=transport_factory,
         resolver=resolver,
+        previous_version=previous_version,
+        compat_memory=compat_memory,
     ):
         yield result
 
@@ -811,6 +969,8 @@ async def evaluate_many(
     timeout_s: float = 30.0,
     transport_factory: TransportFactory | None = None,
     resolver: Resolver | None = None,
+    previous_version: PreviousVersion | None = None,
+    compat_memory: CompatMemory | None = None,
 ) -> list[ClientRelevanceResult]:
     """Evaluate several expressions across several targets in one pass.
 
@@ -841,6 +1001,8 @@ async def evaluate_many(
         timeout_s=timeout_s,
         transport_factory=transport_factory,
         resolver=resolver,
+        previous_version=previous_version,
+        compat_memory=compat_memory,
     ):
         by_index[index] = result
     return [by_index[i] for i in sorted(by_index)]
@@ -866,10 +1028,12 @@ __all__ = [
     "EXIT_RELEVANCE",
     "EXIT_RESOLVE",
     "EXIT_TRANSPORT",
+    "PreviousVersion",
     "Resolver",
     "Target",
     "TransportFactory",
     "count_work",
+    "default_previous_version",
     "default_resolver",
     "default_transport_factory",
     "evaluate_client_relevance",

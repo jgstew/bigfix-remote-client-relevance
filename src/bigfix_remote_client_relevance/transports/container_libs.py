@@ -34,6 +34,24 @@ def missing_shared_library(stderr: str) -> str | None:
     return match.group("soname") if match else None
 
 
+# The linker's "version `GLIBC_2.38' not found (required by ...)" -- the binary
+# was built against a newer runtime than the host carries. glibc quotes with a
+# backtick and an apostrophe; plain quotes are accepted too in case a shell or
+# log layer normalized them.
+_SYMBOL_VERSION_RE = re.compile(
+    r"version [`'](?P<symbol>[A-Za-z_]+_[\d.]+)' not found \(required by"
+)
+
+
+def incompatible_symbol_versions(stderr: str) -> list[str]:
+    """Symbol versions a binary needs but the host's libraries lack, in order.
+
+    Non-empty means the qna build is too new for this host: no package install
+    fixes it, only an older build does. Each version is named once.
+    """
+    return list(dict.fromkeys(m.group("symbol") for m in _SYMBOL_VERSION_RE.finditer(stderr)))
+
+
 PACKAGE_MANAGER_PROBE_COMMAND = (
     "command -v dnf >/dev/null 2>&1 && echo dnf; "
     "command -v microdnf >/dev/null 2>&1 && echo microdnf; "

@@ -95,7 +95,9 @@ def label(result: ClientRelevanceResult, *, with_expression: bool = False) -> st
         text = display_host(result)
     if result.transport in _ARCH_SUFFIXED_TRANSPORTS and result.arch:
         text = f"{text}@{result.arch}"
-    if result.qna_version:
+    if result.qna_version and result.qna_fallback_from:
+        text = f"{text} (qna {result.qna_version}, fell back from {result.qna_fallback_from})"
+    elif result.qna_version:
         text = f"{text} (qna {result.qna_version})"
     if with_expression:
         # A batch puts several results under one host and version; only the

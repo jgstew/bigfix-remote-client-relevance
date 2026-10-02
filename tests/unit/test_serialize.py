@@ -164,3 +164,13 @@ def test_payload_round_trips_through_json():
     payload = result_to_dict(make_result())
 
     assert json.loads(json.dumps(payload)) == payload
+
+
+def test_fallback_from_is_emitted():
+    payload = result_to_dict(make_result(qna_fallback_from="11.0.7.61"))
+
+    assert payload["qna_fallback_from"] == "11.0.7.61"
+
+
+def test_fallback_from_defaults_to_null():
+    assert result_to_dict(make_result())["qna_fallback_from"] is None

@@ -58,6 +58,7 @@ from bigfix_remote_client_relevance.transports.container_libs import (
     PACKAGE_MANAGER_PROBE_COMMAND,
     enable_foreign_arch_command,
     foreign_arch_package_for_interpreter,
+    incompatible_symbol_versions,
     install_command,
     missing_arm_interpreter,
     missing_shared_library,
@@ -1192,6 +1193,17 @@ class TransportContainer:
                 f"({stderr.strip()})"
             )
 
+        # Already classified as too new by classify_qna_outcome; restated here
+        # only to name the image, which the shared classifier cannot know.
+        elif error_kind is not None and (too_new := incompatible_symbol_versions(stderr)):
+            build = f"qna {qna.version}" if qna else "qna"
+            error_kind = ERROR_KIND_BOOTSTRAP
+            error = (
+                f"{build} is too new for image {self.image}: it needs "
+                f"{', '.join(too_new)}, which the image's libraries do not provide; "
+                f"use an older qna version ({stderr.strip()})"
+            )
+
         # A missing binary is a provisioning problem, not a qna crash.
         elif error_kind is not None and _looks_like_missing_qna(exit_code, stderr):
             error_kind = ERROR_KIND_BOOTSTRAP
@@ -1509,7 +1521,11 @@ def _looks_like_missing_qna(exit_code: int, stderr: str) -> bool:
     # "No such file or directory" — so that case is ruled out first, or every
     # missing shared library would be reported as a missing binary. qemu's
     # missing-interpreter message ends the same way, so it's ruled out too.
-    if missing_shared_library(stderr) is not None or missing_arm_interpreter(stderr) is not None:
+    if (
+        missing_shared_library(stderr) is not None
+        or missing_arm_interpreter(stderr) is not None
+        or incompatible_symbol_versions(stderr)
+    ):
         return False
     lowered = stderr.lower()
     return exit_code in (126, 127) or "not found" in lowered or "no such file" in lowered

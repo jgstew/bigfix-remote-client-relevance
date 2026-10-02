@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from bigfix_remote_client_relevance.transports.container_libs import missing_shared_library
+from bigfix_remote_client_relevance.transports.container_libs import (
+    incompatible_symbol_versions,
+    missing_shared_library,
+)
 
 ROCKY_STDERR = (
     "/opt/bigfix_qna/opt/BESClient/bin/qna: error while loading shared libraries: "
@@ -267,3 +270,48 @@ def test_enabling_a_foreign_arch_also_refreshes_the_index():
 
     assert "dpkg --add-architecture armhf" in command
     assert "apt-get update" in command
+
+
+# --- a binary built against a newer runtime than the host has -----------------
+#
+# Captured from debian:11 arm64 running the 11.0.7.61 debian13 build. No package
+# install fixes this; only an older qna build does.
+
+DEBIAN11_TOO_NEW = (
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: /lib/aarch64-linux-gnu/libm.so.6: "
+    "version `GLIBC_2.38' not found (required by /opt/bigfix_qna/opt/BESClient/bin/qna)\n"
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: /lib/aarch64-linux-gnu/libc.so.6: "
+    "version `GLIBC_2.34' not found (required by /opt/bigfix_qna/opt/BESClient/bin/qna)\n"
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: /usr/lib/aarch64-linux-gnu/libstdc++.so.6: "
+    "version `GLIBCXX_3.4.32' not found (required by /opt/bigfix_qna/opt/BESClient/bin/qna)\n"
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: /usr/lib/aarch64-linux-gnu/libstdc++.so.6: "
+    "version `CXXABI_1.3.15' not found (required by /opt/bigfix_qna/opt/BESClient/bin/qna)\n"
+)
+
+
+def test_names_every_missing_symbol_version_once_in_order():
+    assert incompatible_symbol_versions(DEBIAN11_TOO_NEW) == [
+        "GLIBC_2.38",
+        "GLIBC_2.34",
+        "GLIBCXX_3.4.32",
+        "CXXABI_1.3.15",
+    ]
+
+
+def test_a_repeated_symbol_version_is_named_once():
+    line = "qna: /lib64/libc.so.6: version `GLIBC_2.34' not found (required by qna)\n"
+
+    assert incompatible_symbol_versions(line * 2) == ["GLIBC_2.34"]
+
+
+def test_a_missing_library_is_not_a_symbol_version_mismatch():
+    stderr = (
+        "qna: error while loading shared libraries: libdbus-1.so.3: "
+        "cannot open shared object file: No such file or directory"
+    )
+
+    assert incompatible_symbol_versions(stderr) == []
+
+
+def test_a_missing_binary_is_not_a_symbol_version_mismatch():
+    assert incompatible_symbol_versions("sh: 1: qna: not found") == []

@@ -133,6 +133,7 @@ def test_result_has_every_designed_field():
         "raw_qna_output",
         "qna_path",
         "qna_version",
+        "qna_fallback_from",
         "qna_time",
         "elapsed_ms",
         "exit_code",

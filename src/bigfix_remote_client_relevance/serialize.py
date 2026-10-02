@@ -54,13 +54,14 @@ class ResultPayload(TypedDict):
     error_kind: str | None
     exit_code: int
     qna_version: str | None
+    qna_fallback_from: str | None
     qna_path: str
     qna_time: str | None
     elapsed_ms: int
     raw_qna_output: str
 
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 """Bumped on any additive change to the result payload. See the module docstring."""
 
 SCHEMA_ID = (
@@ -83,6 +84,7 @@ _KEY_ORDER = (
     "error_kind",
     "exit_code",
     "qna_version",
+    "qna_fallback_from",
     "qna_path",
     "qna_time",
     "elapsed_ms",
@@ -135,6 +137,7 @@ def result_to_dict(
         "error_kind": result.error_kind,
         "exit_code": result.exit_code,
         "qna_version": result.qna_version,
+        "qna_fallback_from": result.qna_fallback_from,
         "qna_path": result.qna_path,
         "qna_time": result.qna_time,
         "elapsed_ms": result.elapsed_ms,
@@ -223,6 +226,13 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
         "qna_version": {
             "type": _STRING_OR_NULL,
             "description": "The full four-part version actually evaluated, e.g. 11.0.6.137.",
+        },
+        "qna_fallback_from": {
+            "type": _STRING_OR_NULL,
+            "description": (
+                "The version originally resolved when its build was too new for the target "
+                "and qna_version is the older release fallen back to; null otherwise."
+            ),
         },
         "qna_path": {"type": "string", "description": "Path to the qna binary on the target."},
         "qna_time": {

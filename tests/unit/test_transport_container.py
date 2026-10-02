@@ -700,6 +700,23 @@ async def test_exit_126_still_reads_as_a_missing_qna():
     assert "no qna in image" in (result.error or "")
 
 
+DEBIAN11_TOO_NEW = (
+    "/opt/bigfix_qna/opt/BESClient/bin/qna: /lib/aarch64-linux-gnu/libc.so.6: "
+    "version `GLIBC_2.38' not found (required by /opt/bigfix_qna/opt/BESClient/bin/qna)"
+)
+
+
+async def test_a_too_new_qna_is_not_reported_as_missing():
+    engine = FakeEngine(responses=[(r"-showtypes", ("", DEBIAN11_TOO_NEW, 1))])
+
+    result = await TransportContainer("debian:11", engine=engine).evaluate_client_relevance("true")
+
+    assert result.error_kind == ERROR_KIND_BOOTSTRAP
+    assert "no qna in image" not in (result.error or "")
+    assert "too new" in (result.error or "")
+    assert "GLIBC_2.38" in (result.error or "")
+
+
 # --- prepared-image cache -----------------------------------------------------
 #
 # Issue #1: provisioning per run is the wrong unit of work for a matrix sweep.
