@@ -93,7 +93,7 @@ repos:
   # Enforces a few Python style rules slyp's author found error-prone in
   # practice (e.g. no bare string-literal concatenation across lines).
   - repo: https://github.com/sirosen/slyp
-    rev: 072ea633cef088f143be7c16499d1564485dfc0c # 0.9.0
+    rev: 5eda35ad8f51f572b10523884f466df187335f74 # 0.10.3
     hooks:
       - id: slyp
 
