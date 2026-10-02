@@ -64,23 +64,16 @@ def test_artifact_urls_are_live(platform, arch):
 def test_no_arm64_agent_is_published_for_the_platforms_we_target(platform):
     """Why --arch still defaults to x86_64 rather than the host's architecture.
 
-    As of 11.0.6.137 the release site publishes amd64/x86_64, ppc64le, s390x
-    and armhf (raspbian) builds. Two families have an arm64-capable
-    workaround, both handled by `artifact_for`, neither a true native build:
-
-    - `rhel` ships its arm64 client under an Amazon Linux-named filename
-      (`al2.aarch64.rpm`, officially supported only there, but a plain rpm
-      that runs on any rhel-family arm64 host) -- see the `rhel` entry in
-      `_PLATFORM_PATTERNS`.
-    - `ubuntu`/`debian` have no native arm64 build at all, but the raspbian
-      armhf (32-bit ARM) deb runs under an arm64 kernel's 32-bit userspace
-      compat -- generically on Debian, mostly on Ubuntu with some rough
-      edges -- see `_ARM64_RASPBIAN_FALLBACK`.
+    As of 11.0.7 the release site publishes official native arm64 builds for
+    `ubuntu` (`ubuntu24.arm64.deb`), `debian` (`debian13.arm64.deb`) and
+    `rhel` (`rhe9.aarch64.rpm`). Before 11.0.7, `rhel` arm64 came only as an
+    Amazon Linux-named rpm and `ubuntu`/`debian` fell back to the raspbian
+    armhf deb -- see `_ARM64_RASPBIAN_FALLBACK_PLATFORMS`, which is never
+    used from 11.0.7 on.
 
     `suse` is the one platform left with no arm64 option whatsoever -- so on
     Apple Silicon defaulting to the host architecture would still fail
-    resolution there, and fall back to x86_64 emulation anyway. The tool
-    emulates and says so instead.
+    resolution there. The tool emulates and says so instead.
 
     If this test starts failing, that assumption has changed and defaulting
     --arch to the host architecture becomes worth doing.

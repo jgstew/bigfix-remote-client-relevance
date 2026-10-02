@@ -189,8 +189,8 @@ def missing_arm_interpreter(stderr: str) -> str | None:
 
 
 # Interpreter basename -> (dpkg foreign architecture, package providing it).
-# armhf is the only case this tool exercises today -- the raspbian-on-arm64
-# fallback for Debian/Ubuntu (see bootstrap/release_site.py's
+# armhf is the only case this tool exercises today -- the pre-11.0.7
+# raspbian-on-arm64 fallback for Debian/Ubuntu (see bootstrap/release_site.py's
 # _ARM64_RASPBIAN_FALLBACK_PLATFORMS); add rows as new cross-arch cases arise.
 _ARM_INTERPRETER_PACKAGES: dict[str, tuple[str, str]] = {
     "ld-linux-armhf.so.3": ("armhf", "libc6:armhf"),

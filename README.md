@@ -422,16 +422,20 @@ bigfix-remote-client-relevance \
   --container ubuntu:24.04 --arch amd64 --arch arm64 "name of operating system"
 ```
 
-Ubuntu and Debian have no native arm64 BigFix client, so the `arm64` run above
-uses the raspbian armhf (32-bit ARM) build under the host's arm64 kernel's
-32-bit compat — it works generically on Debian, and mostly on Ubuntu with
-some rough edges, which still beats having no arm64 option at all. RHEL's
-arm64 client ships under an Amazon Linux-named filename (officially
-supported only there, but it's a plain rpm that runs on any rhel-family
-arm64 host), which this tool resolves transparently for `--container
-amazonlinux:2023 --arch arm64` and any other rhel-family image.
+From BigFix 11.0.7, Ubuntu, Debian and RHEL have official native arm64
+clients (`ubuntu24.arm64.deb`, `debian13.arm64.deb`, `rhe9.aarch64.rpm`), and
+the `arm64` run above uses them. The raspbian fallback below is never used
+for 11.0.7 or later.
 
-Running that armhf build at all — even on a native arm64 host, since armhf
+Before 11.0.7, Ubuntu and Debian had no native arm64 BigFix client, so an
+`arm64` run against an older `--qna` version uses the raspbian armhf (32-bit
+ARM) build under the host's arm64 kernel's 32-bit compat. It works on Debian
+in general, and mostly on Ubuntu with some rough edges. Older RHEL arm64
+clients ship under an Amazon Linux-named filename (officially supported only
+there, but it's a plain rpm that runs on any rhel-family arm64 host), which
+this tool resolves transparently for any rhel-family image.
+
+Running that pre-11.0.7 armhf build at all — even on a native arm64 host, since armhf
 (32-bit ARM) is a different architecture from arm64 (64-bit) — needs
 QEMU/binfmt_misc support for it registered with the container engine.
 `--auto-setup` installs the missing 32-bit C library *inside* the image, but

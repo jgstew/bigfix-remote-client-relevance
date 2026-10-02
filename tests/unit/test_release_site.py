@@ -42,6 +42,13 @@ def pages(release_site_fixture):
         "https://support.bigfix.com/bes/release/11.0/patch6/SHA256SUMS": release_site_fixture(
             "SHA256SUMS.txt"
         ),
+        # 11.0 patch7 is the first release with official native arm64 debs.
+        "https://support.bigfix.com/bes/release/11.0/patch7/": release_site_fixture(
+            "patch_page_11.0.7.html"
+        ),
+        "https://support.bigfix.com/bes/release/11.0/patch7/SHA256SUMS": release_site_fixture(
+            "SHA256SUMS_11.0.7.txt"
+        ),
         # 10.0 patch16 is the one captured page that publishes two macOS pkgs.
         "https://support.bigfix.com/bes/release/10.0/patch16/": release_site_fixture(
             "patch_page_10.0.16.html"
@@ -184,7 +191,7 @@ def test_raspbian_resolves_its_one_build_regardless_of_requested_arch(fetch, arc
 
 # --- the raspbian armhf deb as an arm64 stand-in for debian/ubuntu ---------
 #
-# Neither publishes a native arm64 build. The raspbian armhf (32-bit ARM) deb
+# Before 11.0.7 neither published a native arm64 build. The raspbian armhf (32-bit ARM) deb
 # is the only thing that runs on an arm64 host at all, via the kernel's
 # 32-bit ARM userspace compat -- a cross-arch substitution, unlike the rhel
 # case above where the filename genuinely is a 64-bit arm64 build.
@@ -216,6 +223,35 @@ def test_the_raspbian_fallback_never_leaks_into_an_x86_64_request(fetch):
     artifact = artifact_for("11.0.6.137", platform="ubuntu", arch="x86_64", fetch=fetch)
 
     assert "raspbian" not in artifact.filename
+
+
+# --- 11.0.7+: official native arm64 builds, never the raspbian fallback ----
+
+
+@pytest.mark.parametrize(
+    ("platform", "arch", "expected"),
+    [
+        ("debian", "arm64", "BESAgent-11.0.7.61-debian13.arm64.deb"),
+        ("debian", "aarch64", "BESAgent-11.0.7.61-debian13.arm64.deb"),
+        ("ubuntu", "arm64", "BESAgent-11.0.7.61-ubuntu24.arm64.deb"),
+        ("rhel", "arm64", "BESAgent-11.0.7.61-rhe9.aarch64.rpm"),
+    ],
+)
+def test_native_arm64_builds_win_from_11_0_7(fetch, platform, arch, expected):
+    artifact = artifact_for("11.0.7.61", platform=platform, arch=arch, fetch=fetch)
+
+    assert artifact.filename == expected
+    assert artifact.sha256
+
+
+def test_no_raspbian_fallback_from_11_0_7_even_if_the_native_deb_is_missing(pages):
+    """From 11.0.7 a missing native arm64 deb must fail loudly rather than
+    quietly substitute the 32-bit raspbian armhf build."""
+    url = "https://support.bigfix.com/bes/release/11.0/patch7/"
+    pages[url] = "\n".join(line for line in pages[url].splitlines() if "ubuntu24.arm64" not in line)
+
+    with pytest.raises(ResolveError):
+        artifact_for("11.0.7.61", platform="ubuntu", arch="arm64", fetch=RecordingFetcher(pages))
 
 
 def test_artifact_carries_published_sha256(fetch):

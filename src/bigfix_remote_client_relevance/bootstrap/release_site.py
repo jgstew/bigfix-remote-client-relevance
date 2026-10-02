@@ -80,17 +80,22 @@ _PLATFORM_PATTERNS: dict[str, tuple[str, ...]] = {
 _ARCH_DEB = {"x86_64": "amd64", "amd64": "amd64", "arm64": "arm64", "aarch64": "arm64"}
 _ARCH_RPM = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}
 
-# Neither Debian nor Ubuntu publishes a native arm64 build -- the raspbian
-# armhf deb (a 32-bit ARM package) is the only thing that runs on an arm64
-# host at all, via the kernel's 32-bit ARM userspace compat. Unlike the rhel
-# arm64 case above, this is a genuine cross-arch substitution (32-bit
+# Before 11.0.7 neither Debian nor Ubuntu published a native arm64 build --
+# the raspbian armhf deb (a 32-bit ARM package) was the only thing that ran on
+# an arm64 host at all, via the kernel's 32-bit ARM userspace compat. Unlike
+# the rhel arm64 case above, this is a genuine cross-arch substitution (32-bit
 # standing in for a 64-bit request), not just a different distro's naming for
 # the same arch -- so it can't go through the {arch_deb}/{arch_rpm}
 # templating above, which assumes the filename's arch matches the request.
 # It generically works for Debian; on Ubuntu it mostly works but with some
-# rough edges -- still better than refusing outright, since there is no other
-# option today.
+# rough edges.
+#
+# 11.0.7 added official native arm64 builds (debian13.arm64.deb,
+# ubuntu24.arm64.deb, rhe9.aarch64.rpm), which the ordinary patterns above
+# already match. From that release on the fallback is never offered: a
+# missing native build is a resolve error, not a silent swap to 32-bit armhf.
 _ARM64_RASPBIAN_FALLBACK_PLATFORMS = frozenset({"ubuntu", "debian"})
+_FIRST_NATIVE_ARM64_DEB_VERSION = (11, 0, 7)
 
 
 class ResolveError(BigFixRelevanceError):
@@ -352,6 +357,12 @@ def _candidate_links(soup: BeautifulSoup, page_url: str) -> dict[str, str]:
     return links
 
 
+def _predates_native_arm64_debs(full_version: str) -> bool:
+    """Whether ``full_version`` is older than the first official arm64 debs."""
+    major, minor, patch, _build = (int(part) for part in full_version.split("."))
+    return (major, minor, patch) < _FIRST_NATIVE_ARM64_DEB_VERSION
+
+
 def artifact_for(
     full_version: str,
     *,
@@ -383,16 +394,21 @@ def artifact_for(
         for p in patterns
     ]
 
-    if platform in _ARM64_RASPBIAN_FALLBACK_PLATFORMS and _ARCH_DEB.get(arch) == "arm64":
+    if (
+        platform in _ARM64_RASPBIAN_FALLBACK_PLATFORMS
+        and _ARCH_DEB.get(arch) == "arm64"
+        and _predates_native_arm64_debs(full_version)
+    ):
         logger.debug(
-            "no native %s/arm64 build exists -- falling back to the raspbian armhf deb", platform
+            "no native %s/arm64 build before 11.0.7 -- falling back to the raspbian armhf deb",
+            platform,
         )
         compiled.append(re.compile(_RASPBIAN_ARMHF_PATTERN))
 
     # Patterns outer, links inner: the pattern tuples above express a
     # preference order (universal macOS pkg over the Intel-only one, native
-    # rhel rpm over the Amazon Linux-named one, raspbian armhf only as a last
-    # resort) and this is what makes that order authoritative. Iterating links
+    # rhel rpm over the Amazon Linux-named one, raspbian armhf only as a
+    # pre-11.0.7 last resort) and this is what makes that order authoritative. Iterating links
     # first would instead hand the decision to the release page's own layout.
     for pattern in compiled:
         for filename, url in links.items():

@@ -989,9 +989,10 @@ class TransportContainer:
     def _note_emulation(self) -> None:
         """Say when the container's architecture is not this machine's.
 
-        BigFix publishes no arm64 agent for any platform this tool targets, so
-        on Apple Silicon this is every run — emulated, slower, and occasionally
-        behaving differently from native. Worth knowing about; not worth
+        ``--arch`` defaults to x86_64 (SUSE still has no arm64 agent, and
+        native arm64 debs only arrived in 11.0.7), so on Apple Silicon this is
+        most runs — emulated, slower, and occasionally behaving differently
+        from native. Worth knowing about; not worth
         repeating per evaluation.
         """
         if self._warned_about_emulation:
@@ -1001,10 +1002,11 @@ class TransportContainer:
         if target_arch != host_arch():
             logger.info(
                 "running %s as %s while this machine is %s: emulated, so slower than "
-                "native and occasionally different. BigFix publishes no %s agent, so "
-                "this is the only option.",
+                "native and occasionally different. Pass --arch %s to run natively "
+                "where BigFix publishes a %s agent (11.0.7+ for Debian/Ubuntu).",
                 self.image,
                 target_arch,
+                host_arch(),
                 host_arch(),
                 host_arch(),
             )
