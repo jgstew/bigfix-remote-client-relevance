@@ -2004,22 +2004,26 @@ async def test_a_second_run_skips_the_known_too_new_build(tmp_path):
     memory = CompatMemory(tmp_path / "m.json")
     target = Target(kind="container", name="debian:11", arch="arm64", platform="debian")
 
-    for _ in range(2):
+    async def run_once() -> tuple[list[ClientRelevanceResult], FakeOldRuntimeTransport]:
         transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
         results = await evaluate_client_relevance(
             "true",
             [target],
             qna_version="11.0.7.61",
-            transport_factory=lambda t, transport=transport: transport,
+            transport_factory=lambda t: transport,
             resolver=passthrough_resolver(),
             previous_version=step_back,
             compat_memory=memory,
         )
+        return results, transport
+
+    await run_once()
+    results, transport = await run_once()
 
     assert results[0].ok
     assert results[0].qna_version == "11.0.6.137"
     assert results[0].qna_fallback_from == "11.0.7.61"
-    assert [q.version for q in transport.calls] == ["11.0.6.137"]
+    assert [q.version for q in transport.calls if q] == ["11.0.6.137"]
 
 
 async def test_a_remembered_version_that_stops_working_is_forgotten(tmp_path):
@@ -2090,7 +2094,7 @@ async def test_the_arm64_deb_split_is_crossed_in_one_step():
     )
 
     assert results[0].qna_version == "11.0.6.137"
-    assert [q.version for q in transport.calls] == ["11.0.9.10", "11.0.6.137"]
+    assert [q.version for q in transport.calls if q] == ["11.0.9.10", "11.0.6.137"]
     assert asked == ["11.0.7.0"]
 
 
