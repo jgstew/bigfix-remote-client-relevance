@@ -359,35 +359,35 @@ tests/                       # sibling of src/, not inside the package
 ```python
 @dataclass
 class ClientRelevanceResult:
-    host: str                    # "mac-test", "local", or "container:<image>"
-    transport: str               # "local" | "ssh" | "container" | "fastquery"
-    client_relevance: str        # input expression (internal name)
-    answers: list[str]           # parsed A: lines from qna output
-    answer_types: list[str]      # parsed I: result-type lines (per answer)
-    qna_time: str | None         # parsed T: line (qna's own timing)
-    error: str | None            # human-readable: the first E: line for
-                                 # error_kind "relevance", else an
-                                 # exception / stderr summary
-    error_kind: str | None       # None on success; else "relevance"
-                                 # (E: line) | "qna" (nonzero exit /
-                                 # unparsable output) | "bootstrap"
-                                 # (push/extract/prereq failure) |
-                                 # "transport" (connect/auth/timeout) |
-                                 # "resolve" (version spec resolution)
-    raw_qna_output: str          # full qna stdout, for debugging / agents
-    qna_path: str                # binary used on the remote / in container
-    qna_version: str | None      # parsed from `qna -version` when available
-    elapsed_ms: int              # measured caller-side
+    host: str  # "mac-test", "local", or "container:<image>"
+    transport: str  # "local" | "ssh" | "container" | "fastquery"
+    client_relevance: str  # input expression (internal name)
+    answers: list[str]  # parsed A: lines from qna output
+    answer_types: list[str]  # parsed I: result-type lines (per answer)
+    qna_time: str | None  # parsed T: line (qna's own timing)
+    error: str | None  # human-readable: the first E: line for
+    # error_kind "relevance", else an
+    # exception / stderr summary
+    error_kind: str | None  # None on success; else "relevance"
+    # (E: line) | "qna" (nonzero exit /
+    # unparsable output) | "bootstrap"
+    # (push/extract/prereq failure) |
+    # "transport" (connect/auth/timeout) |
+    # "resolve" (version spec resolution)
+    raw_qna_output: str  # full qna stdout, for debugging / agents
+    qna_path: str  # binary used on the remote / in container
+    qna_version: str | None  # parsed from `qna -version` when available
+    elapsed_ms: int  # measured caller-side
     exit_code: int
 ```
 
 ```python
 @dataclass
 class ResolvedQna:
-    version: str                 # full version, e.g. "11.0.6.137" —
-                                 # never a spec like "11.0"
-    artifact_path: Path          # controller-cache artifact matching the
-                                 # target's platform/arch
+    version: str  # full version, e.g. "11.0.6.137" —
+    # never a spec like "11.0"
+    artifact_path: Path  # controller-cache artifact matching the
+    # target's platform/arch
 ```
 
 `ResolvedQna` is produced only by the orchestration layer (via
@@ -403,14 +403,14 @@ class Transport(Protocol):
         self,
         client_relevance: str,
         *,
-        qna_path: str | None = None,     # None => discover on target
+        qna_path: str | None = None,  # None => discover on target
         qna: ResolvedQna | None = None,  # None => use whatever qna is
-                                         # present on the target; else a
-                                         # fully-resolved version + cached
-                                         # artifact, produced upstream by
-                                         # the orchestration layer (specs
-                                         # like "11.0" never reach a
-                                         # transport)
+        # present on the target; else a
+        # fully-resolved version + cached
+        # artifact, produced upstream by
+        # the orchestration layer (specs
+        # like "11.0" never reach a
+        # transport)
         timeout_s: float = 30.0,
     ) -> ClientRelevanceResult: ...
 ```

@@ -83,7 +83,7 @@ jobs:
     name: Test
     needs: version
     if: needs.version.outputs.release_needed == 'true'
-    uses: ./.github/workflows/test.yaml
+    uses: ./.github/workflows/test.yaml # zizmor: ignore[self-repository] -- ./ is the documented local reusable-workflow form
 
   release:
     name: Tag and Release

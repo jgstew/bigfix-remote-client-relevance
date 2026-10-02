@@ -276,7 +276,7 @@ from bigfix_remote_client_relevance import (
 
 targets = [Target(kind="container", name="ubuntu:22.04", image="ubuntu:22.04")]
 
-total = count_work(targets, "11.0")          # the progress denominator
+total = count_work(targets, "11.0")  # the progress denominator
 results = []
 async for result in evaluate_client_relevance_stream(expr, targets, qna_version="11.0"):
     results.append(result)
