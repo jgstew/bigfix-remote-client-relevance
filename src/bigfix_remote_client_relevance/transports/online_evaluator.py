@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -67,6 +68,25 @@ _RETRYABLE_STATUS = 502
 _RETRY_DELAY_S = 0.5
 
 
+class HTTPResponse(Protocol):
+    """The slice of :class:`requests.Response` this transport reads."""
+
+    @property
+    def status_code(self) -> int: ...
+
+    @property
+    def text(self) -> str: ...
+
+    def json(self) -> Any: ...
+
+
+class HTTPSession(Protocol):
+    """The slice of :class:`requests.Session` this transport uses; lets tests
+    inject a fake without subclassing ``requests``."""
+
+    def post(self, url: str, *, json: Any, timeout: float) -> HTTPResponse: ...
+
+
 class TransportOnlineEvaluator:
     """Evaluates client relevance against a hosted qna-style HTTP API.
 
@@ -83,7 +103,7 @@ class TransportOnlineEvaluator:
         base_url: str,
         *,
         host: str | None = None,
-        session: requests.Session | None = None,
+        session: HTTPSession | None = None,
         max_retries: int = 1,
     ) -> None:
         """
@@ -105,7 +125,7 @@ class TransportOnlineEvaluator:
         self._base_url = base_url
         self._url = urljoin(base_url.rstrip("/") + "/", _EVALUATE_PATH.lstrip("/"))
         self._host = host or urlparse(base_url).hostname or base_url
-        self._session = session or requests.Session()
+        self._session: HTTPSession = session or requests.Session()
         self._max_retries = max_retries
 
     async def resolve_arch(self, *, timeout_s: float = 30.0) -> str:
@@ -169,7 +189,7 @@ class TransportOnlineEvaluator:
         payload = {"relevance": client_relevance}
 
         attempts = self._max_retries + 1
-        response: requests.Response | None = None
+        response: HTTPResponse | None = None
         for attempt in range(attempts):
             try:
                 response = await asyncio.to_thread(
