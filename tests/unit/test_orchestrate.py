@@ -2092,3 +2092,38 @@ async def test_the_arm64_deb_split_is_crossed_in_one_step():
     assert results[0].qna_version == "11.0.6.137"
     assert [q.version for q in transport.calls] == ["11.0.9.10", "11.0.6.137"]
     assert asked == ["11.0.7.0"]
+
+
+# --- how loudly a fallback speaks ------------------------------------------------
+#
+# The result label already says "fell back from"; the log must not repeat it on
+# every run. First discovery is worth an INFO line, a remembered one is not.
+
+
+async def test_fallback_logging_stays_quiet_by_default(tmp_path, caplog):
+    import logging
+
+    from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
+
+    memory = CompatMemory(tmp_path / "m.json")
+    target = Target(kind="container", name="debian:11", arch="arm64", platform="debian")
+    levels: list[list[int]] = []
+
+    for _ in range(2):
+        caplog.clear()
+        transport = FakeOldRuntimeTransport("debian11", newest_ok=(11, 0, 6, 137))
+        with caplog.at_level(logging.DEBUG, logger="bigfix_remote_client_relevance.orchestrate"):
+            await evaluate_client_relevance(
+                "true",
+                [target],
+                qna_version="11.0.7.61",
+                transport_factory=lambda t, transport=transport: transport,
+                resolver=passthrough_resolver(),
+                previous_version=step_back,
+                compat_memory=memory,
+            )
+        levels.append([r.levelno for r in caplog.records if "too new" in r.getMessage()])
+
+    first_run, second_run = levels
+    assert first_run == [logging.INFO]
+    assert second_run and all(level == logging.DEBUG for level in second_run)

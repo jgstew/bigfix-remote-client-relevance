@@ -1187,3 +1187,73 @@ def test_json_payload_matches_the_schema_properties(captured):
     result = invoke("--local", "--json", "true")
 
     assert set(json.loads(result.stdout)[0]) == set(RESULT_JSON_SCHEMA["properties"])
+
+
+# --- end-of-run summary: identical answers collapsed --------------------------
+#
+# Plain output streams one section per target as each answers. Across a wide
+# sweep the useful recap is how many distinct answers came back and who gave
+# each, so the run ends with one, majority first.
+
+
+def _summary(stdout: str) -> str:
+    assert "== summary" in stdout, stdout
+    return stdout[stdout.index("== summary") :]
+
+
+def test_a_multi_target_run_ends_with_a_collapsed_summary(captured):
+    captured["results"] = [
+        result_for("h0", ["Win2022"]),
+        result_for("h1", ["Linux Debian 12.15"]),
+        result_for("h2", ["Win2022"]),
+        result_for("h3", ["Win2022"]),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    assert result.exit_code == 0, result.output
+    summary = _summary(result.stdout)
+    assert "4 results, 2 distinct" in summary
+    assert summary.count("Win2022") == 1, "a shared answer is printed once"
+    assert "3× Win2022" in summary
+    assert summary.index("Win2022") < summary.index("Debian"), "majority first"
+    for host in ("h0", "h1", "h2", "h3"):
+        assert host in summary, "every target is still named"
+
+
+def test_the_summary_collapses_identical_errors(captured):
+    captured["results"] = [
+        result_for("h0", ["2134"]),
+        result_for("h1", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT),
+        result_for("h2", [], error="cannot connect", kind=ERROR_KIND_TRANSPORT),
+    ]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    summary = _summary(result.stdout)
+    assert summary.count("cannot connect") == 1
+    assert "2× !! transport: cannot connect" in summary
+
+
+def test_no_summary_when_nothing_collapses(captured):
+    """All-distinct answers would just repeat the sections above it."""
+    captured["results"] = [result_for("h0", ["a"]), result_for("h1", ["b"])]
+
+    result = invoke("--container", "a", "--container", "b", "true")
+
+    assert "== summary" not in result.stdout
+
+
+def test_no_summary_for_a_single_target(captured):
+    captured["results"] = [result_for("h0", ["a"])]
+
+    assert "== summary" not in invoke("--container", "a", "true").stdout
+
+
+@pytest.mark.parametrize("flag", ["--json", "--jsonl", "--diff"])
+def test_no_summary_outside_plain_text(captured, flag):
+    captured["results"] = [result_for(f"h{i}", ["same"]) for i in range(3)]
+
+    result = invoke("--container", "a", "--container", "b", flag, "true")
+
+    assert "== summary" not in result.stdout

@@ -1074,7 +1074,7 @@ async def test_running_a_foreign_architecture_says_so(caplog, monkeypatch):
     monkeypatch.setattr(container_module, "host_arch", lambda: "arm64")
     engine = FakeEngine(responses=[EVAL_OK])
 
-    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
+    with caplog.at_level(logging.DEBUG, logger=CONTAINER_LOGGER):
         await TransportContainer(
             "ubuntu:22.04", engine=engine, arch="x86_64"
         ).evaluate_client_relevance("true")
@@ -1090,7 +1090,7 @@ async def test_a_native_architecture_says_nothing(caplog, monkeypatch):
     monkeypatch.setattr(container_module, "host_arch", lambda: "arm64")
     engine = FakeEngine(responses=[EVAL_OK])
 
-    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
+    with caplog.at_level(logging.DEBUG, logger=CONTAINER_LOGGER):
         await TransportContainer(
             "ubuntu:22.04", engine=engine, arch="arm64"
         ).evaluate_client_relevance("true")
@@ -1105,12 +1105,29 @@ async def test_the_emulation_notice_is_logged_once_per_transport(caplog, monkeyp
     engine = FakeEngine(responses=[EVAL_OK])
     transport = TransportContainer("ubuntu:22.04", engine=engine, arch="x86_64")
 
-    with caplog.at_level(logging.INFO, logger=CONTAINER_LOGGER):
+    with caplog.at_level(logging.DEBUG, logger=CONTAINER_LOGGER):
         await transport.evaluate_client_relevance("true")
         await transport.evaluate_client_relevance("true")
 
     notices = [r for r in caplog.records if "emulat" in r.message.lower()]
     assert len(notices) == 1, "one notice per target, not one per evaluation"
+
+
+async def test_the_emulation_notice_is_debug_detail_not_default_output(caplog, monkeypatch):
+    """Emulation is the norm for x86_64 targets on Apple Silicon; repeating it
+    for every image on every run buries the answers."""
+    import bigfix_remote_client_relevance.transports.container as container_module
+
+    monkeypatch.setattr(container_module, "host_arch", lambda: "arm64")
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    with caplog.at_level(logging.DEBUG, logger=CONTAINER_LOGGER):
+        await TransportContainer(
+            "ubuntu:22.04", engine=engine, arch="x86_64"
+        ).evaluate_client_relevance("true")
+
+    notices = [r for r in caplog.records if "emulat" in r.message.lower()]
+    assert notices and all(r.levelno == logging.DEBUG for r in notices)
 
 
 async def test_aarch64_selects_the_arm64_docker_platform():

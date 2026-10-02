@@ -188,6 +188,46 @@ def _render_diff(results: list[ClientRelevanceResult]) -> str:
     return "\n".join(lines)
 
 
+# Long enough for a typical qna error, short enough that the recap stays a recap;
+# the full text is in that target's own section above it.
+_SUMMARY_ANSWER_CHARS = 120
+
+
+def _summary_answer(result: ClientRelevanceResult) -> str:
+    """One line standing for a group's shared answer."""
+    if result.error:
+        text = f"!! {result.error_kind}: {' '.join(result.error.split())}"
+    else:
+        text = " | ".join(result.answers) or "(no answers)"
+    if len(text) > _SUMMARY_ANSWER_CHARS:
+        text = text[: _SUMMARY_ANSWER_CHARS - 1] + "…"
+    return text
+
+
+def _render_summary(results: list[ClientRelevanceResult]) -> str:
+    """Recap a streamed run with identical answers collapsed, majority first.
+
+    Empty when nothing collapses: every group would be a single target, and
+    the recap would only repeat the sections already printed above it.
+    """
+    groups: dict[tuple[object, ...], list[ClientRelevanceResult]] = {}
+    for result in results:
+        groups.setdefault(_diff_key(result), []).append(result)
+    if len(groups) == len(results):
+        return ""
+
+    order = sorted(
+        groups.values(),
+        key=lambda members: (-len(members), results.index(members[0])),
+    )
+    distinct = "answer" if len(groups) == 1 else "answers"
+    lines = [f"== summary: {_plural(len(results), 'result')}, {len(groups)} distinct {distinct}"]
+    for members in order:
+        lines.append(f"{len(members)}× {_summary_answer(members[0])}")
+        lines.append("    " + ", ".join(_label(member) for member in members))
+    return "\n".join(lines)
+
+
 def _summarize_failures(results: list[ClientRelevanceResult]) -> None:
     for result in results:
         if result.error_kind is not None:
@@ -641,6 +681,12 @@ def evaluate(
         return collected
 
     results = asyncio.run(_run())
+
+    if stream and not as_jsonl and labelled:
+        summary = _render_summary(results)
+        if summary:
+            typer.echo("")
+            typer.echo(summary)
 
     _summarize_failures(results)
 

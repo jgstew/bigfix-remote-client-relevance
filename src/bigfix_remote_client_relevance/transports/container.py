@@ -993,15 +993,16 @@ class TransportContainer:
         ``--arch`` defaults to x86_64 (SUSE still has no arm64 agent, and
         native arm64 debs only arrived in 11.0.7), so on Apple Silicon this is
         most runs — emulated, slower, and occasionally behaving differently
-        from native. Worth knowing about; not worth
-        repeating per evaluation.
+        from native. Worth knowing about, but since it is the norm there it is
+        debug detail (``-v``): at the default level it would print once per
+        image on every run and bury the answers.
         """
         if self._warned_about_emulation:
             return
         self._warned_about_emulation = True
         target_arch = normalize_arch(self.arch)
         if target_arch != host_arch():
-            logger.info(
+            logger.debug(
                 "running %s as %s while this machine is %s: emulated, so slower than "
                 "native and occasionally different. Pass --arch %s to run natively "
                 "where BigFix publishes a %s agent (11.0.7+ for Debian/Ubuntu).",

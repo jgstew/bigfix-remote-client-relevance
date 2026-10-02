@@ -648,7 +648,7 @@ async def _evaluate_stream_indexed(
                     logger.debug("remembered %s unusable for %s: %s", remembered, target.label, exc)
                     remembered = None
                 else:
-                    logger.info(
+                    logger.debug(
                         "%s: qna %s is known to be too new here; using %s",
                         target.label,
                         requested.version if requested else None,
@@ -724,7 +724,9 @@ async def _evaluate_stream_indexed(
             await prepare(candidate)
             result = await evaluate(expression, candidate)
             if not _is_too_new(result):
-                logger.warning(
+                # INFO, not WARNING: the result label already says so, and the
+                # outcome is remembered, so this prints once per target.
+                logger.info(
                     "%s: qna %s is too new for this target; fell back to %s",
                     target.label,
                     too_new.version,
