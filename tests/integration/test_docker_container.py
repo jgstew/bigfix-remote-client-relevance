@@ -26,6 +26,9 @@ from bigfix_remote_client_relevance.transports.container import (
 pytestmark = pytest.mark.docker
 
 IMAGE = "ubuntu:22.04"
+# TransportContainer defaults to x86_64 (linux/amd64); build stubs to match so
+# Apple Silicon hosts do not fall through to a registry pull of a local tag.
+PLATFORM = "linux/amd64"
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +65,9 @@ def stub_qna_image(tmp_path_factory):
         )
     )
     client = docker.from_env()
-    image, _logs = client.images.build(path=str(context), tag="bfrcr-test-qna:latest", rm=True)
+    image, _logs = client.images.build(
+        path=str(context), tag="bfrcr-test-qna:latest", rm=True, platform=PLATFORM
+    )
     yield "bfrcr-test-qna:latest"
     try:
         client.images.remove(image.id, force=True)
@@ -93,7 +98,9 @@ async def test_client_relevance_reaches_container_stdin(tmp_path):
         f"FROM {IMAGE}\nCOPY qna /usr/local/bin/qna\nRUN chmod +x /usr/local/bin/qna\n"
     )
     client = docker.from_env()
-    image, _ = client.images.build(path=str(context), tag="bfrcr-test-echo:latest", rm=True)
+    image, _ = client.images.build(
+        path=str(context), tag="bfrcr-test-echo:latest", rm=True, platform=PLATFORM
+    )
     try:
         transport = TransportContainer("bfrcr-test-echo:latest", engine=DockerEngine())
         result = await transport.evaluate_client_relevance("Q: version of client")
