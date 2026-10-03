@@ -100,6 +100,26 @@ you want one document to parse in full. They are mutually exclusive.
 only exists once every answer is in — so those two still print once at the
 end. Exit codes are always decided after the full fan-out, streaming or not.
 
+Plain text ends with a summary that collapses identical answers, most common
+first, so a wide sweep closes with how many distinct answers came back and
+who gave each:
+
+```
+== summary: 4 results, 3 distinct answers
+2× Linux Amazon 2023
+    container:amazonlinux:2023@arm64 (qna 11.0.7.61), container:amazonlinux:2023@x86_64 (qna 11.0.7.61)
+1× Linux Debian GNU/Linux 11.11
+    container:debian:11@arm64 (qna 11.0.6.137, fell back from 11.0.7.61)
+1× Linux Debian 11.11
+    container:debian:11@x86_64 (qna 11.0.7.61)
+```
+
+Results are grouped the way `--diff` groups them (answers, answer types and
+error; not timing, path or qna version), and identical errors collapse too.
+The summary is printed only when it actually collapses something — with a
+single result, or every answer distinct, it would only repeat the sections
+above it — and never with `--json`, `--jsonl` or `--diff`.
+
 ### Exit codes
 
 Actionable for CI gating; the worst across the fan-out wins.
@@ -247,8 +267,10 @@ await reclaim_stray_containers()  # clear what a killed run left behind
 ```
 
 One `ClientRelevanceResult` comes back per (target × version × expression), carrying
-`answers`, `answer_types`, `error` / `error_kind`, the resolved `qna_version`,
-and the full `raw_qna_output` for debugging. Failures are reported inside
+`answers`, `answer_types`, `error` / `error_kind`, the resolved `qna_version`
+(plus `qna_fallback_from` when that version is an older release stepped back
+to — see § When a build is too new for the target), and the full
+`raw_qna_output` for debugging. Failures are reported inside
 results rather than raised, so one unreachable host never breaks a fan-out.
 
 The library logs through `logging` and never writes to stdout — that channel
@@ -317,7 +339,9 @@ Shell out to the CLI, which is the same code paths:
 bigfix-remote-client-relevance --schema
 ```
 
-prints the JSON Schema for a single result and exits 0 — no target needed. Then
+prints the JSON Schema for a single result and exits 0 — no target needed.
+The schema is versioned (`x-schema-version`, currently `1.2`) and only ever
+grows within a major version; 1.2 added `qna_fallback_from`. Then
 `--jsonl` emits exactly one of those objects per line, flushed as each target
 answers, so a Node or Go server can stream progress off the pipe. `--json`
 emits the whole array once. stdout carries only the payload; logs and error
@@ -347,7 +371,56 @@ immutable per version. On a target, an extracted version is left in place, so
 it crosses the wire once ever rather than once per run.
 
 Only Windows has a standalone QnA download; every other platform extracts qna
-out of the agent package without installing it.
+out of the agent package without installing it. A deb-family target (Ubuntu,
+Debian, Raspbian) is only ever given a `.deb`, and an rpm-family one (RHEL,
+SUSE, Amazon Linux) only an `.rpm` — never the other, fallbacks included.
+
+### When a build is too new for the target
+
+A newer release can need a newer C runtime than an older target has. 11.0.7's
+only arm64 debs are built for `debian13` and `ubuntu24`, so on `debian:11`
+arm64 qna 11.0.7.61 cannot start at all:
+
+```
+qna: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+```
+
+Rather than fail, the run steps back to the newest older release whose build
+does start there, and reports both versions in the label:
+
+```
+== container:debian:11@arm64 (qna 11.0.6.137, fell back from 11.0.7.61)
+Linux Debian GNU/Linux 11.11
+```
+
+and in the result, as `qna_version` (what actually ran) and
+`qna_fallback_from` (what was asked for; `null` when no fallback happened).
+This applies to a stream spec (`11.0`) and an exact pin (`11.0.7.61`) alike,
+over containers, SSH and local. The trigger is that specific linker error —
+missing symbol versions such as `GLIBC_*`, `GLIBCXX_*` or `CXXABI_*` — not a
+list of distros, so any target with too old a runtime is covered; other
+failures, like a missing shared library, never trigger a fallback.
+
+- **Bounded.** At most 3 older releases are tried; a release with no artifact
+  for the target's platform/arch is skipped. If none starts, the original
+  error is reported, naming the version that was asked for.
+- **Known splits are crossed in one step.** For Debian/Ubuntu arm64 the 11.0.7
+  change is known, so a request for 11.0.7 or anything later goes straight to
+  the newest release before 11.0.7 — an 11.0.9 request never tries 11.0.8 or
+  11.0.7 first. On Debian/Ubuntu that pre-11.0.7 build is the raspbian armhf
+  one (see § Containers).
+- **Remembered.** The outcome is recorded per target (kind, image or host,
+  platform, arch), so later runs requesting that version or newer go straight
+  to the one that worked, and only the first run pays for the failed attempt.
+  Entries expire after 30 days, so an upgraded image is eventually re-checked;
+  if the remembered version itself stops starting, the entry is dropped and
+  the fallback runs again. The record lives in the platform state directory
+  (`compat_memory.json`, e.g.
+  `~/Library/Application Support/bigfix_remote_client_relevance/` on macOS),
+  apart from the artifact cache, and is safe to delete at any time.
+
+The first fallback for a target logs one INFO line; a remembered one is only
+shown with `-v`.
 
 ### Comparing across targets
 
@@ -414,7 +487,8 @@ docker rmi $(docker images 'bfrcr/prepared:*' -q)
 `--arch` defaults to `x86_64` — the common case for BigFix clients,
 regardless of this host's own architecture, so a bare
 `--container ubuntu:24.04` targets `x86_64` even on Apple Silicon (emulated
-via Rosetta/QEMU). It is also repeatable, to evaluate more than one
+via Rosetta/QEMU; that is the norm there, so the notice saying so only shows
+with `-v`). It is also repeatable, to evaluate more than one
 architecture in a single run:
 
 ```bash
@@ -425,7 +499,9 @@ bigfix-remote-client-relevance \
 From BigFix 11.0.7, Ubuntu, Debian and RHEL have official native arm64
 clients (`ubuntu24.arm64.deb`, `debian13.arm64.deb`, `rhe9.aarch64.rpm`), and
 the `arm64` run above uses them. The raspbian fallback below is never used
-for 11.0.7 or later.
+for 11.0.7 or later. Those debs need a recent glibc, though, so an older
+Debian/Ubuntu arm64 image (`debian:11`, say) steps back to the newest pre-11.0.7
+release automatically — see § When a build is too new for the target.
 
 Before 11.0.7, Ubuntu and Debian had no native arm64 BigFix client, so an
 `arm64` run against an older `--qna` version uses the raspbian armhf (32-bit
@@ -471,7 +547,8 @@ falls back to podman only if Docker is unreachable), `docker`, or `podman`.
   passwordless sudo or a cached credential; it never prompts.
 
 SSH host keys are verified against `~/.ssh/known_hosts` like the `ssh` CLI,
-so a brand-new endpoint needs its key trusted first. For throwaway lab hosts,
+so a brand-new endpoint needs its key trusted first. As with `ssh`, the lookup
+ignores the case of the hostname. For throwaway lab hosts,
 `--insecure-skip-host-key-check` skips that at the cost of the connection's
 protection against interception.
 

@@ -940,6 +940,12 @@ the `ssh` CLI does. A first connection to a new endpoint therefore fails
 until its key is trusted — `ssh-keyscan -H <host> >> ~/.ssh/known_hosts`, or
 just connect once with `ssh` and accept the key.
 
+The known_hosts lookup is case-insensitive, also like the `ssh` CLI: an
+inventory host spelled `Mac-mini.local` matches an entry stored as
+`mac-mini.local`. asyncssh matches the name verbatim, so the lowercased name is
+passed as `host_key_alias` — it only changes the known_hosts lookup; DNS and
+`~/.ssh/config` still see the host as written.
+
 `verify_host_key=False` (CLI: `--insecure-skip-host-key-check`) turns this
 off for throwaway lab endpoints whose keys are regenerated often. It logs a
 warning every time, because it removes the connection's protection against

@@ -697,6 +697,96 @@ def test_connect_kwargs_include_values_that_were_given():
     assert kwargs["port"] == 2222
 
 
+# --- host key lookup is case-insensitive, like the ssh CLI -----------------
+#
+# OpenSSH lowercases the hostname before matching known_hosts; asyncssh
+# matches it verbatim. An inventory host spelled "jgstews-Mac-mini.local"
+# was rejected as untrusted even though known_hosts held the right keys under
+# "jgstews-mac-mini.local".
+
+MIXED_CASE_HOST = "jgstews-Mac-mini.local"
+
+
+def test_asyncssh_known_hosts_matching_is_case_sensitive():
+    """Root cause: asyncssh does not case-fold the host when matching.
+
+    If this starts failing, asyncssh now case-folds on its own and the
+    host_key_alias workaround in connect_kwargs is no longer needed.
+    """
+    import asyncssh
+
+    public_key = asyncssh.generate_private_key("ssh-ed25519").export_public_key()
+    known_hosts = asyncssh.import_known_hosts(f"{MIXED_CASE_HOST.lower()} {public_key.decode()}")
+
+    assert known_hosts.match(MIXED_CASE_HOST.lower(), "", None)[0]
+    assert not known_hosts.match(MIXED_CASE_HOST, "", None)[0]
+
+
+def test_connect_kwargs_look_up_host_key_by_lowercased_host():
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user=None, key=None, port=22, host=MIXED_CASE_HOST)
+
+    assert kwargs["host_key_alias"] == "jgstews-mac-mini.local"
+    assert "known_hosts" not in kwargs, "host key verification must stay on"
+
+
+def test_connect_kwargs_lowercase_keeps_trailing_dot():
+    from bigfix_remote_client_relevance.transports.ssh import connect_kwargs
+
+    kwargs = connect_kwargs(user=None, key=None, port=22, host="Host.Example.")
+
+    assert kwargs["host_key_alias"] == "host.example."
+
+
+@pytest.fixture
+def captured_connect(monkeypatch):
+    """Replace asyncssh.connect, recording (host, kwargs) for each call."""
+    import asyncssh
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_connect(host, **kwargs):
+        calls.append((host, kwargs))
+        return object()
+
+    monkeypatch.setattr(asyncssh, "connect", fake_connect)
+    return calls
+
+
+async def test_connect_dials_original_host_but_verifies_lowercased(captured_connect):
+    """DNS and ~/.ssh/config Host matching keep the caller's spelling; only
+    the known_hosts lookup name is case-folded."""
+    from bigfix_remote_client_relevance.transports.ssh import _connect
+
+    await _connect(MIXED_CASE_HOST, None, None, 2222)
+
+    [(host, kwargs)] = captured_connect
+    assert host == MIXED_CASE_HOST
+    assert kwargs["host_key_alias"] == "jgstews-mac-mini.local"
+    assert kwargs["port"] == 2222
+    assert "known_hosts" not in kwargs
+
+
+@pytest.mark.parametrize("host", ["jgstews-mac-mini.local", "host.example.", "192.168.5.40", "::1"])
+async def test_connect_leaves_already_lowercase_hosts_alone(captured_connect, host):
+    """No alias when lowercasing changes nothing, so any HostKeyAlias from
+    ~/.ssh/config still applies and the options are what they always were."""
+    from bigfix_remote_client_relevance.transports.ssh import _connect
+
+    await _connect(host, None, None, 22)
+
+    assert captured_connect == [(host, {"port": 22})]
+
+
+async def test_connect_without_verification_adds_no_alias(captured_connect):
+    from bigfix_remote_client_relevance.transports.ssh import _connect
+
+    await _connect(MIXED_CASE_HOST, None, None, 22, verify_host_key=False)
+
+    assert captured_connect == [(MIXED_CASE_HOST, {"port": 22, "known_hosts": None})]
+
+
 async def test_writes_nothing_to_stdout(capsys):
     runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
 

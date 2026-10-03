@@ -157,10 +157,11 @@ def connect_kwargs(
     port: int,
     *,
     verify_host_key: bool = True,
+    host: str | None = None,
 ) -> dict[str, object]:
     """Build asyncssh.connect options, omitting anything not set.
 
-    Two asyncssh quirks shape this:
+    Three asyncssh quirks shape this:
 
     * ``username=None`` is not the same as omitting it — option construction
       raises a bare ``TypeError`` before it ever tries to connect, turning a
@@ -169,6 +170,12 @@ def connect_kwargs(
       entirely. It is only passed when the caller explicitly opts out;
       otherwise it is omitted so asyncssh verifies against ``~/.ssh/known_hosts``
       the way the ssh CLI does.
+    * asyncssh matches ``host`` against known_hosts case-sensitively, while the
+      ssh CLI lowercases it first, so ``Mac-mini.local`` misses an entry stored
+      as ``mac-mini.local``. ``host_key_alias`` swaps in the lowercased name for
+      that lookup only; DNS and ``~/.ssh/config`` still see ``host`` as given.
+      It is only set when lowercasing changes the name, so already-lowercase
+      hosts keep any ``HostKeyAlias`` from ``~/.ssh/config``.
 
     Everything unset is left out so asyncssh applies its own defaults
     (``~/.ssh/config``, the agent, the usual key names).
@@ -180,6 +187,8 @@ def connect_kwargs(
         kwargs["client_keys"] = [key]
     if not verify_host_key:
         kwargs["known_hosts"] = None
+    elif host and host.lower() != host:
+        kwargs["host_key_alias"] = host.lower()
     return kwargs
 
 
@@ -201,7 +210,8 @@ async def _connect(
         )
     try:
         connection = await asyncssh.connect(
-            host, **connect_kwargs(user, key, port, verify_host_key=verify_host_key)
+            host,
+            **connect_kwargs(user, key, port, verify_host_key=verify_host_key, host=host),
         )
     except (OSError, asyncssh.Error) as exc:
         raise SSHConnectionError(f"could not connect to {host}: {exc}") from exc
