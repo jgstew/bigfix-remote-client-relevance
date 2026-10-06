@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -52,11 +53,15 @@ def _euid() -> int | None:
 
 def _home_of(user: str) -> Path | None:
     """``user``'s home directory from the account database, or None."""
-    try:
-        import pwd  # POSIX only
+    # A sys.platform check rather than `except ImportError`: when mypy checks
+    # for Windows, it only treats `pwd` as unreachable behind this guard.
+    if sys.platform == "win32":
+        return None
+    import pwd  # POSIX only
 
+    try:
         return Path(pwd.getpwnam(user).pw_dir)
-    except (ImportError, KeyError):
+    except KeyError:
         return None
 
 

@@ -198,3 +198,19 @@ def test_sudo_invoker_home_is_none_on_windows(monkeypatch):
     monkeypatch.setenv("SUDO_USER", "alice")
 
     assert module.sudo_invoker_home() is None
+
+
+def test_home_of_is_none_on_windows(monkeypatch):
+    """No account database on Windows: the sudo-user lookup is skipped outright.
+
+    Guarded by a ``sys.platform`` check (not just ``except ImportError``) so
+    mypy's Windows type-check also knows ``pwd`` is out of reach there.
+    """
+    import getpass
+    import sys
+
+    from bigfix_remote_client_relevance import inventory_paths as module
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert module._home_of(getpass.getuser()) is None
