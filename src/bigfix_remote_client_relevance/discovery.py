@@ -349,6 +349,37 @@ async def discover(
     return found
 
 
+PLACEHOLDER_MARKER = "# Auto-discovery found no working hosts"
+
+PLACEHOLDER = f"""\
+# Created by bigfix-remote-client-relevance auto-discovery.
+{PLACEHOLDER_MARKER}, so this file has no [hosts.*]
+# entries yet, and runs that give no target will fail until it does.
+#
+# Either add hosts by hand (see remote_clients.example.toml in the project),
+# or fix whatever kept discovery from working -- e.g. install the BigFix
+# client, start docker or podman, or check network access -- and re-run:
+#
+#   bigfix-remote-client-relevance --auto-discovery
+#
+# Re-running replaces this text with what it finds.
+"""
+
+
+def write_placeholder(path: Path) -> None:
+    """Write the comment-only file left behind when discovery finds nothing.
+
+    Its existence is what stops first-run discovery from repeating on every
+    run; loading it raises EmptyInventoryError, whose message suggests
+    ``--auto-discovery``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(PLACEHOLDER, encoding="utf-8", newline="")
+    logger.warning(
+        "auto-discovery found no working hosts; wrote %s with instructions instead", path
+    )
+
+
 def write_discovered(path: Path, hosts: Mapping[str, Mapping[str, Any]]) -> list[str]:
     """Add ``hosts`` not already in ``path``'s ``[hosts]``; return the names added.
 
@@ -356,13 +387,19 @@ def write_discovered(path: Path, hosts: Mapping[str, Mapping[str, Any]]) -> list
     add. An existing file is edited with tomlkit so comments survive, and an
     existing host is never overwritten.
     """
+    fresh = True
+    document = tomlkit.document()
     if path.is_file():
         try:
-            document = tomlkit.parse(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            parsed = tomlkit.parse(text)
         except (OSError, ParseError, UnicodeDecodeError) as exc:
             raise InventoryError(f"could not read inventory {path}: {exc}") from exc
-    else:
-        document = tomlkit.document()
+        # The nothing-found placeholder is replaced, not appended to: its
+        # instructions would be wrong as soon as there are hosts.
+        if not (PLACEHOLDER_MARKER in text and parsed.get("hosts") is None):
+            document = parsed
+            fresh = False
 
     existing = document.get("hosts")
     known = set(existing) if existing is not None else set()
@@ -371,7 +408,7 @@ def write_discovered(path: Path, hosts: Mapping[str, Mapping[str, Any]]) -> list
         return []
 
     if existing is None:
-        if not path.is_file():
+        if fresh:
             document.add(
                 tomlkit.comment("Created by bigfix-remote-client-relevance auto-discovery.")
             )
@@ -392,8 +429,34 @@ def write_discovered(path: Path, hosts: Mapping[str, Mapping[str, Any]]) -> list
     return added
 
 
+def ensure_writable(path: Path) -> None:
+    """Prove ``path`` can be written, creating its directory, before discovery.
+
+    Discovery can take minutes, and first-run discovery repeats on every run
+    until the file exists -- so a location that can never be written would
+    rediscover forever. Fail up front instead. A file that doesn't exist yet
+    is created and removed again rather than left empty: an empty file is a
+    "found" inventory with no hosts, which would stop first-run discovery
+    without giving it anything to use.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            with open(path, "a", encoding="utf-8"):
+                pass
+        else:
+            with open(path, "x", encoding="utf-8"):
+                pass
+            path.unlink()
+    except OSError as exc:
+        raise InventoryError(
+            f"cannot write {path}, so auto-discovery would have nowhere to save its results: {exc}"
+        ) from exc
+
+
 def run_auto_discovery(path: Path, **kwargs: Any) -> list[str]:
     """Discover hosts missing from ``path`` and write the working ones to it."""
+    ensure_writable(path)
     skip: set[str] = set()
     if path.is_file():
         try:
@@ -402,16 +465,22 @@ def run_auto_discovery(path: Path, **kwargs: Any) -> list[str]:
             raise InventoryError(f"could not read inventory {path}: {exc}") from exc
         skip = set(hosts) if hosts is not None else set()
     found = asyncio.run(discover(skip=skip, **kwargs))
-    return write_discovered(path, found)
+    added = write_discovered(path, found)
+    if not added and not path.exists():
+        write_placeholder(path)
+    return added
 
 
 __all__ = [
+    "PLACEHOLDER",
     "PROBE_RELEVANCE",
     "EngineImageSource",
     "ImageSource",
     "default_image_source",
     "discover",
+    "ensure_writable",
     "host_name_for",
     "run_auto_discovery",
     "write_discovered",
+    "write_placeholder",
 ]

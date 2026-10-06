@@ -31,6 +31,7 @@ import typer
 from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
 from bigfix_remote_client_relevance.discovery import run_auto_discovery
 from bigfix_remote_client_relevance.inventory import (
+    EmptyInventoryError,
     InventoryError,
     load_inventory,
     update_inventory_arch,
@@ -602,7 +603,11 @@ def evaluate(
                 # works here rather than refusing outright. Once the file
                 # exists this never repeats unless --auto-discovery asks.
                 logger.info("no remote_clients.toml found; running first-run auto-discovery")
-                if _auto_discover():
+                _auto_discover()
+                # Written either way: hosts that work, or, when none did, the
+                # comment-only placeholder that stops this from repeating on
+                # every run (loading it fails with a pointer back here).
+                if user_inventory_path().is_file():
                     discovered = user_inventory_path()
             if discovered is not None:
                 inventory = discovered
@@ -628,6 +633,19 @@ def evaluate(
     if inventory is not None:
         try:
             inventory_targets = load_inventory(inventory)
+        except EmptyInventoryError as exc:
+            message = str(exc)
+            # Only ~/.bigfix is ever written by --auto-discovery, so only
+            # there is it a fix -- typically the placeholder it leaves when
+            # it finds nothing.
+            if inventory.resolve() == user_inventory_path().resolve():
+                message += (
+                    "; add hosts by hand, or, once whatever kept auto-discovery "
+                    "from finding any is fixed (e.g. the BigFix client installed, "
+                    "docker or podman running, network access), run "
+                    "--auto-discovery again"
+                )
+            _fail(message)
         except InventoryError as exc:
             _fail(str(exc))
         if update_inventory:

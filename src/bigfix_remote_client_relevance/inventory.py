@@ -41,6 +41,14 @@ class InventoryError(BigFixRelevanceError):
     """The inventory file is missing, malformed, or describes an unusable host."""
 
 
+class EmptyInventoryError(InventoryError):
+    """The inventory parsed fine but defines no ``[hosts.*]`` entries.
+
+    Its own type so a caller can suggest a fix -- e.g. re-running
+    auto-discovery, which leaves exactly this behind when it finds nothing.
+    """
+
+
 def load_inventory(path: str | Path) -> list[Target]:
     """Read ``path`` and return one :class:`Target` per host."""
     path = Path(path)
@@ -57,7 +65,7 @@ def load_inventory(path: str | Path) -> list[Target]:
     defaults = document.get("defaults", {})
     hosts = document.get("hosts", {})
     if not hosts:
-        raise InventoryError(f"inventory {path} defines no [hosts.*] entries")
+        raise EmptyInventoryError(f"inventory {path} defines no [hosts.*] entries")
 
     targets: list[Target] = []
     for name, config in hosts.items():
@@ -185,6 +193,7 @@ def update_inventory_arch(path: str | Path, host: str, arch: str) -> None:
 __all__ = [
     "DEFAULT_TRANSPORT",
     "KNOWN_TRANSPORTS",
+    "EmptyInventoryError",
     "InventoryError",
     "load_inventory",
     "update_inventory_arch",

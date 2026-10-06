@@ -176,6 +176,13 @@ Only hosts that actually evaluate cleanly get written. After that it never
 runs again on its own; `--auto-discovery` re-runs it and adds anything new
 without touching existing hosts.
 
+Discovery first checks that `~/.bigfix/remote_clients.toml` can be written,
+and stops with an error if it can't, rather than rediscovering on every run.
+If nothing works, it writes a comment-only file explaining what to do. Runs
+with no target then fail with a message pointing at `--auto-discovery`, so
+you can re-run it once the cause is fixed (BigFix client installed, docker
+or podman running, network access).
+
 ```toml
 # remote_clients.toml
 [defaults]

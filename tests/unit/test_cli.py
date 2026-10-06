@@ -1351,3 +1351,73 @@ def test_auto_discovery_flag_then_evaluates(captured, tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert {t.name for t in captured["targets"]} == {"local"}
+
+
+def test_first_run_with_unwritable_user_inventory_is_a_clear_usage_error(
+    captured, tmp_path, monkeypatch
+):
+    from bigfix_remote_client_relevance.inventory import InventoryError
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+
+    def unwritable(path, **kwargs):
+        raise InventoryError(f"cannot write {path}: Permission denied")
+
+    monkeypatch.setattr(cli_module, "run_auto_discovery", unwritable)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "cannot write" in result.output
+    assert "targets" not in captured
+
+
+def _placeholder(path):
+    from bigfix_remote_client_relevance.discovery import write_placeholder
+
+    write_placeholder(path)
+    return path
+
+
+def test_later_run_with_placeholder_suggests_auto_discovery(captured, tmp_path, monkeypatch):
+    user_inventory = _placeholder(tmp_path / "home" / ".bigfix" / "remote_clients.toml")
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "no [hosts.*] entries" in result.output
+    assert "--auto-discovery" in result.output
+    assert "targets" not in captured
+
+
+def test_first_run_finding_nothing_writes_placeholder_and_suggests_auto_discovery(
+    captured, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(
+        cli_module, "run_auto_discovery", lambda path, **kwargs: (_placeholder(path), [])[1]
+    )
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert user_inventory.is_file()
+    assert "--auto-discovery" in result.output
+
+
+def test_empty_inventory_elsewhere_does_not_suggest_auto_discovery(captured, tmp_path, monkeypatch):
+    """--auto-discovery only ever writes ~/.bigfix, so it can't fix ./remote_clients.toml."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "remote_clients.toml").write_text("# empty\n", encoding="utf-8")
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "no [hosts.*] entries" in result.output
+    assert "--auto-discovery" not in result.output

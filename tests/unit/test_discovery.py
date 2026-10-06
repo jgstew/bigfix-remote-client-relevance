@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import tomllib
 
+import pytest
+
+from bigfix_remote_client_relevance import discovery as discovery_module
 from bigfix_remote_client_relevance.discovery import (
     EngineImageSource,
     default_image_source,
     discover,
     host_name_for,
+    run_auto_discovery,
     write_discovered,
+)
+from bigfix_remote_client_relevance.inventory import (
+    EmptyInventoryError,
+    InventoryError,
+    load_inventory,
 )
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_TRANSPORT,
@@ -428,3 +437,120 @@ def test_no_warning_when_no_engine_installed(caplog):
 
     assert source is None
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+# --- run_auto_discovery: prove the file is writable before discovering --------
+
+
+@pytest.fixture
+def discover_calls(monkeypatch):
+    """Replace discover(); record calls and report one working host."""
+    calls: list = []
+
+    async def fake_discover(**kwargs):
+        calls.append(kwargs)
+        return {"local": {"transport": "local", "qna_version": []}}
+
+    monkeypatch.setattr(discovery_module, "discover", fake_discover)
+    return calls
+
+
+def test_unwritable_location_fails_before_discovering(tmp_path, discover_calls):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8")  # a file where ~/.bigfix should be
+    path = blocker / "remote_clients.toml"
+
+    with pytest.raises(InventoryError, match="cannot write"):
+        run_auto_discovery(path)
+
+    assert discover_calls == []
+
+
+def test_writable_location_probe_leaves_no_empty_file_behind(tmp_path, monkeypatch):
+    path = tmp_path / ".bigfix" / "remote_clients.toml"
+    seen_during_discovery: list[bool] = []
+
+    async def fake_discover(**kwargs):
+        seen_during_discovery.append(path.exists())
+        return {}
+
+    monkeypatch.setattr(discovery_module, "discover", fake_discover)
+
+    assert run_auto_discovery(path) == []
+    assert seen_during_discovery == [False]
+    # Afterwards it's the instructions placeholder, never an empty file.
+    assert "--auto-discovery" in path.read_text(encoding="utf-8")
+
+
+def test_writable_location_discovers_and_writes(tmp_path, discover_calls):
+    path = tmp_path / ".bigfix" / "remote_clients.toml"
+
+    assert run_auto_discovery(path) == ["local"]
+    assert len(discover_calls) == 1
+    assert "[hosts.local]" in path.read_text(encoding="utf-8")
+
+
+def test_existing_read_only_file_fails_before_discovering(tmp_path, discover_calls, monkeypatch):
+    path = tmp_path / "remote_clients.toml"
+    path.write_text('[hosts.b]\ntransport = "ssh"\n', encoding="utf-8")
+    real_open = open
+
+    def deny_append(file, mode="r", *args, **kwargs):
+        if str(file) == str(path) and "a" in mode:
+            raise PermissionError(13, "Permission denied", str(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", deny_append)
+
+    with pytest.raises(InventoryError, match="cannot write"):
+        run_auto_discovery(path)
+
+    assert discover_calls == []
+
+
+# --- nothing found: a comment-only placeholder ends first-run rediscovery ------
+
+
+def _discover_returning(monkeypatch, found):
+    async def fake_discover(**kwargs):
+        return found
+
+    monkeypatch.setattr(discovery_module, "discover", fake_discover)
+
+
+def test_nothing_found_writes_comment_only_placeholder(tmp_path, monkeypatch):
+    path = tmp_path / ".bigfix" / "remote_clients.toml"
+    _discover_returning(monkeypatch, {})
+
+    assert run_auto_discovery(path) == []
+
+    text = path.read_text(encoding="utf-8")
+    assert all(line.startswith("#") or not line.strip() for line in text.splitlines())
+    assert tomllib.loads(text) == {}
+    assert "--auto-discovery" in text
+    with pytest.raises(EmptyInventoryError):
+        load_inventory(path)
+
+
+def test_nothing_found_leaves_existing_file_alone(tmp_path, monkeypatch):
+    path = tmp_path / "remote_clients.toml"
+    original = '# mine\n[hosts.b]\ntransport = "ssh"\n'
+    path.write_text(original, encoding="utf-8")
+    _discover_returning(monkeypatch, {})
+
+    assert run_auto_discovery(path) == []
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_rediscovery_replaces_placeholder_text(tmp_path, monkeypatch):
+    path = tmp_path / ".bigfix" / "remote_clients.toml"
+    _discover_returning(monkeypatch, {})
+    run_auto_discovery(path)
+    _discover_returning(monkeypatch, {"local": {"transport": "local", "qna_version": []}})
+
+    assert run_auto_discovery(path) == ["local"]
+
+    text = path.read_text(encoding="utf-8")
+    assert "found no working hosts" not in text
+    assert "Created by bigfix-remote-client-relevance auto-discovery." in text
+    assert tomllib.loads(text)["hosts"]["local"]["transport"] == "local"
