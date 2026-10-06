@@ -30,6 +30,7 @@ import asyncio
 import logging
 import re
 import shutil
+import tomllib
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -197,6 +198,45 @@ def _newest_first(images: Collection[str]) -> list[str]:
     return sorted(dict.fromkeys(images), key=key, reverse=True)
 
 
+def _image_key(image: str) -> str:
+    """One spelling per image: ``docker.io/library/debian`` == ``debian:latest``."""
+    image = image.strip().lower()
+    for prefix in ("docker.io/library/", "index.docker.io/library/", "docker.io/"):
+        if image.startswith(prefix):
+            image = image[len(prefix) :]
+            break
+    repo, tag = _split(image)
+    return f"{repo}:{tag or 'latest'}"
+
+
+def _qna_key(version: object) -> tuple[str, ...]:
+    """``[]``, ``None`` and ``""`` all mean the installed qna."""
+    if isinstance(version, str):
+        return (version,) if version else ()
+    if isinstance(version, (list, tuple)):
+        return tuple(str(v) for v in version)
+    return ()
+
+
+def _identity(entry: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """What an inventory entry *is*, regardless of its name.
+
+    Two entries with the same identity evaluate the same way, so discovery
+    must not add one when the other is already there under another name.
+    ``entry`` must already have ``[defaults]`` applied.
+    """
+    transport = str(entry.get("transport", "ssh"))
+    if transport == "container" and entry.get("image"):
+        # No arch on a container means x86_64 -- see default_transport_factory.
+        arch = normalize_arch(str(entry.get("arch") or "x86_64"))
+        return ("container", _image_key(str(entry["image"])), arch)
+    if transport == "local":
+        return ("local", *_qna_key(entry.get("qna_version")))
+    if transport == "online_evaluator" and entry.get("base_url"):
+        return ("online_evaluator", str(entry["base_url"]).rstrip("/").lower())
+    return None
+
+
 def _container(image: str, arch: str) -> dict[str, Any]:
     return {"transport": "container", "image": image, "arch": arch, "qna_version": QNA_STREAM}
 
@@ -220,11 +260,27 @@ def _base_candidates() -> list[Candidate]:
 
 
 class _Discovery:
-    """One discovery run: shared evaluator, known names and image metadata."""
+    """One discovery run: shared evaluator, what's already known, image metadata."""
 
-    def __init__(self, run: Evaluator, known: set[str], arch: str) -> None:
+    def __init__(
+        self,
+        run: Evaluator,
+        known: set[str],
+        existing: Mapping[str, Mapping[str, Any]],
+        arch: str,
+    ) -> None:
         self._run = run
         self._known = known
+        self._known_ids = {
+            identity for entry in existing.values() if (identity := _identity(entry))
+        }
+        # (distro, arch) pairs some existing container entry already covers,
+        # whatever its tag or name: ubuntu-2404 covers ubuntu on x86_64.
+        self._known_distros = {
+            (_distro(identity[1]), identity[2])
+            for identity in self._known_ids
+            if identity[0] == "container"
+        }
         self._arch = arch
         self._platforms: dict[str, set[str] | None] = {}
 
@@ -248,8 +304,15 @@ class _Discovery:
                 return name, entry
         return None
 
+    def is_known(self, candidate: Candidate) -> bool:
+        """``candidate`` is already in the inventory, by name or by what it is."""
+        name, entry = candidate
+        return name in self._known or _identity(entry) in self._known_ids
+
     def _represented(self, images: Collection[str], arch: str) -> bool:
-        """Any of ``images`` already in the inventory for ``arch``."""
+        """``images``' distros already in the inventory for ``arch``."""
+        if any((_distro(image), arch) in self._known_distros for image in images):
+            return True
         for image in images:
             name = host_name_for(image, arch)
             # Inventories written before the -ARCH suffix used the host arch.
@@ -313,8 +376,12 @@ async def discover(
     arch: str | None = None,
     evaluate: Evaluator | None = None,
     skip: Collection[str] = (),
+    existing: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Try every candidate not already in ``skip``; return the ones that worked.
+    """Try every candidate not already known; return the ones that worked.
+
+    Known means named in ``skip``, or the same as an ``existing`` entry
+    (``[defaults]`` already applied) under any name -- see ``_identity``.
 
     ``images`` is the container engine to look in; None means there isn't
     one (no container candidates at all). Left out, docker or podman is
@@ -325,11 +392,12 @@ async def discover(
     run = _Discovery(
         evaluate or evaluate_client_relevance,
         set(skip),
+        existing or {},
         host_arch() if arch is None else arch,
     )
 
     tasks: list[Awaitable[list[Candidate]]] = [
-        run.single(candidate) for candidate in _base_candidates() if candidate[0] not in skip
+        run.single(candidate) for candidate in _base_candidates() if not run.is_known(candidate)
     ]
     if images is not None:
         local: dict[str, dict[str, list[str]]] = {family: {} for family in _REMOTE_DEFAULTS}
@@ -457,14 +525,19 @@ def ensure_writable(path: Path) -> None:
 def run_auto_discovery(path: Path, **kwargs: Any) -> list[str]:
     """Discover hosts missing from ``path`` and write the working ones to it."""
     ensure_writable(path)
-    skip: set[str] = set()
+    existing: dict[str, dict[str, Any]] = {}
     if path.is_file():
         try:
-            hosts = tomlkit.parse(path.read_text(encoding="utf-8")).get("hosts")
-        except (OSError, ParseError, UnicodeDecodeError) as exc:
+            document = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
             raise InventoryError(f"could not read inventory {path}: {exc}") from exc
-        skip = set(hosts) if hosts is not None else set()
-    found = asyncio.run(discover(skip=skip, **kwargs))
+        defaults = document.get("defaults", {})
+        # Per-host values win over [defaults], same as load_inventory.
+        existing = {
+            name: {**defaults, **(config or {})}
+            for name, config in document.get("hosts", {}).items()
+        }
+    found = asyncio.run(discover(skip=set(existing), existing=existing, **kwargs))
     added = write_discovered(path, found)
     if not added and not path.exists():
         write_placeholder(path)

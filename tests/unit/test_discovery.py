@@ -554,3 +554,114 @@ def test_rediscovery_replaces_placeholder_text(tmp_path, monkeypatch):
     assert "found no working hosts" not in text
     assert "Created by bigfix-remote-client-relevance auto-discovery." in text
     assert tomllib.loads(text)["hosts"]["local"]["transport"] == "local"
+
+
+# --- duplicates by content, not just by name -----------------------------------
+
+
+async def _discover_existing(images, seen, existing, *, arch="arm64"):
+    return await discover(images=images, arch=arch, evaluate=_evaluator(seen), existing=existing)
+
+
+async def test_existing_local_entry_under_another_name_covers_local():
+    seen: list = []
+    found = await _discover_existing(
+        None, seen, {"this-mac": {"transport": "local", "qna_version": []}}
+    )
+
+    assert "local" not in seen
+    assert "local" not in found
+    assert "local-downloaded" in found  # a different qna version, not a duplicate
+
+
+async def test_existing_pinned_local_matching_stream_covers_local_downloaded():
+    seen: list = []
+    await _discover_existing(None, seen, {"pinned": {"transport": "local", "qna_version": "11.0"}})
+
+    assert "local-downloaded" not in seen
+
+
+async def test_existing_online_evaluator_under_another_name_is_covered():
+    seen: list = []
+    existing = {
+        "dev": {"transport": "online_evaluator", "base_url": "https://developer.bigfix.com/"}
+    }
+    await _discover_existing(None, seen, existing)
+
+    assert "web-eval-rhel" not in seen
+
+
+async def test_existing_container_without_arch_counts_as_x86_64():
+    seen: list = []
+    images = FakeImages(local=["debian:12"], platforms={"debian:12": {"x86_64", "arm64"}})
+    found = await _discover_existing(
+        images, seen, {"debian-12": {"transport": "container", "image": "debian:12"}}
+    )
+
+    assert "debian-12-x86_64" not in seen
+    assert "debian-12-arm64" in found
+
+
+async def test_image_spellings_match_latest_and_docker_hub_prefix():
+    seen: list = []
+    images = FakeImages(
+        local=[UBI9 + ":latest", "docker.io/library/amazonlinux:2023"],
+        platforms={UBI9 + ":latest": {"x86_64"}, "docker.io/library/amazonlinux:2023": {"x86_64"}},
+    )
+    existing = {
+        "ubi9": {"transport": "container", "image": UBI9},
+        "amazonlinux-2023": {"transport": "container", "image": "amazonlinux:2023"},
+    }
+    await _discover_existing(images, seen, existing)
+
+    assert "ubi9-x86_64" not in seen
+    assert "amazonlinux-2023-x86_64" not in seen
+
+
+async def test_existing_same_distro_other_tag_covers_that_distro_and_arch():
+    """ubuntu-2404 (x86_64) already represents ubuntu on x86_64."""
+    seen: list = []
+    images = FakeImages(local=["ubuntu:26.04"], platforms={"ubuntu:26.04": {"x86_64", "arm64"}})
+    found = await _discover_existing(
+        images, seen, {"ubuntu-2404": {"transport": "container", "image": "ubuntu:24.04"}}
+    )
+
+    assert "ubuntu-26-04-x86_64" not in seen
+    assert "ubuntu-26-04-arm64" in found
+
+
+async def test_existing_arm64_entry_uses_its_arch():
+    seen: list = []
+    images = FakeImages(local=["debian:11"], platforms={"debian:11": {"x86_64", "arm64"}})
+    await _discover_existing(
+        images,
+        seen,
+        {"debian-11": {"transport": "container", "image": "debian:11", "arch": "aarch64"}},
+    )
+
+    assert "debian-11-arm64" not in seen
+    assert "debian-11-x86_64" in seen
+
+
+def test_run_auto_discovery_passes_entries_with_defaults_applied(tmp_path, monkeypatch):
+    path = tmp_path / "remote_clients.toml"
+    path.write_text(
+        '[defaults]\nqna_version = "11.0"\n\n'
+        '[hosts.this-mac]\ntransport = "local"\nqna_version = []\n\n'
+        '[hosts.pinned]\ntransport = "local"\n',
+        encoding="utf-8",
+    )
+    calls: list = []
+
+    async def fake_discover(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(discovery_module, "discover", fake_discover)
+
+    run_auto_discovery(path)
+
+    (call,) = calls
+    assert call["existing"]["this-mac"]["qna_version"] == []
+    assert call["existing"]["pinned"]["qna_version"] == "11.0"
+    assert set(call["skip"]) == {"this-mac", "pinned"}

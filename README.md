@@ -174,7 +174,9 @@ the first run **auto-discovers** one, trying:
 
 Only hosts that actually evaluate cleanly get written. After that it never
 runs again on its own; `--auto-discovery` re-runs it and adds anything new
-without touching existing hosts.
+without touching existing hosts. "New" is judged by what an entry is, not
+its name: your hand-written `debian-12` (no `arch`, so x86_64) already covers
+Debian on x86_64, and a `local` host with `qna_version = []` covers `local`.
 
 Discovery first checks that `~/.bigfix/remote_clients.toml` can be written,
 and stops with an error if it can't, rather than rediscovering on every run.
