@@ -55,6 +55,15 @@ def captured(monkeypatch):
     return record
 
 
+@pytest.fixture(autouse=True)
+def _no_real_auto_discovery(monkeypatch, tmp_path):
+    """Never probe real hosts or write the real ~/.bigfix from a unit test."""
+    monkeypatch.setattr(
+        cli_module, "user_inventory_path", lambda: tmp_path / "unused-home" / "remote_clients.toml"
+    )
+    monkeypatch.setattr(cli_module, "run_auto_discovery", lambda path, **kwargs: [])
+
+
 def _patch_orchestrator(monkeypatch, fake_evaluate):
     """Stand in for both orchestrator entry points with one fake.
 
@@ -1257,3 +1266,88 @@ def test_no_summary_outside_plain_text(captured, flag):
     result = invoke("--container", "a", "--container", "b", flag, "true")
 
     assert "== summary" not in result.stdout
+
+
+# --- first-run auto-discovery ------------------------------------------------
+
+
+def _fake_discovery(monkeypatch, found: dict, calls: list):
+    """Stand in for discovery.run_auto_discovery: write `found` to the path given."""
+    from bigfix_remote_client_relevance.discovery import write_discovered
+
+    def fake(path, **kwargs):
+        calls.append(path)
+        return write_discovered(path, found)
+
+    monkeypatch.setattr(cli_module, "run_auto_discovery", fake)
+
+
+def test_first_run_without_any_inventory_auto_discovers(captured, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    calls: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, calls)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [user_inventory]
+    assert user_inventory.is_file()
+    assert {t.name for t in captured["targets"]} == {"local"}
+
+
+def test_first_run_discovering_nothing_is_still_a_usage_error(captured, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    _fake_discovery(monkeypatch, {}, [])
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert not user_inventory.exists()
+
+
+def test_existing_user_inventory_skips_auto_discovery(captured, tmp_path, monkeypatch):
+    user_inventory = tmp_path / "remote_clients.toml"
+    user_inventory.write_text('[hosts.b]\ntransport = "ssh"\n', encoding="utf-8")
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    calls: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local"}}, calls)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_auto_discovery_flag_alone_discovers_and_exits(captured, tmp_path, monkeypatch):
+    user_inventory = tmp_path / "remote_clients.toml"
+    user_inventory.write_text('[hosts.b]\ntransport = "ssh"\n', encoding="utf-8")
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    calls: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local"}}, calls)
+
+    result = invoke("--auto-discovery")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [user_inventory]
+    assert "targets" not in captured
+    assert "[hosts.local]" in user_inventory.read_text(encoding="utf-8")
+
+
+def test_auto_discovery_flag_then_evaluates(captured, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: user_inventory)
+    _fake_discovery(monkeypatch, {"local": {"transport": "local"}}, [])
+
+    result = invoke("--auto-discovery", "name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert {t.name for t in captured["targets"]} == {"local"}

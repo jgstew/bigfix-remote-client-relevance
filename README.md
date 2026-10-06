@@ -147,9 +147,22 @@ places, current directory first, and the first one found wins:
    home directory on every OS (same idea as `~/.ssh`, `~/.aws`, `~/.docker`).
    `.bigfix` is a shared, cross-project folder name, not specific to this
    tool.
+   Run as root through `sudo` on Linux or macOS, the invoking user's
+   (`$SUDO_USER`'s) `~/.bigfix/remote_clients.toml` is also searched, right
+   after root's own.
 3. The platform's all-users config directory — `/etc/xdg/bigfix` on Linux,
    `/Library/Application Support/bigfix` on macOS, `C:\ProgramData\bigfix`
    on Windows.
+
+If none of those exist and `~/.bigfix/remote_clients.toml` doesn't either,
+the first run **auto-discovers** one: it tries `--local`, the
+developer.bigfix.com online evaluator (`web-eval-rhel`) and, if `docker` or
+`podman` is installed, one debian-family and one rhel-family container for
+this machine's own architecture (qna 11.0, which has native arm64 builds
+since 11.0.7): `ubuntu:26.04`, falling back to `ubuntu:24.04` if that
+fails, and UBI 10, falling back to UBI 9. Only hosts that actually evaluate cleanly get written. After that
+it never runs again on its own; `--auto-discovery` re-runs it and adds
+anything new without touching existing hosts.
 
 ```toml
 # remote_clients.toml

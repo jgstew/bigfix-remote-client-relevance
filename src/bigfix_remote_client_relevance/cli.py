@@ -23,19 +23,20 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 from urllib.parse import urlparse
 
 import typer
 
 from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
+from bigfix_remote_client_relevance.discovery import run_auto_discovery
 from bigfix_remote_client_relevance.inventory import (
     InventoryError,
     load_inventory,
     update_inventory_arch,
     update_inventory_platform,
 )
-from bigfix_remote_client_relevance.inventory_paths import find_inventory_path
+from bigfix_remote_client_relevance.inventory_paths import find_inventory_path, user_inventory_path
 from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
     DEFAULT_PULL_PARALLEL,
@@ -118,7 +119,7 @@ def _print_schema(value: bool) -> None:
     raise typer.Exit(0)
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     """Report a usage problem on stderr and exit."""
     typer.echo(f"error: {message}", err=True)
     raise typer.Exit(USAGE_EXIT_CODE)
@@ -282,6 +283,20 @@ def _update_inventory(
                 written_arch.add(host)
 
 
+def _auto_discover() -> list[str]:
+    """Run discovery against ~/.bigfix/remote_clients.toml; return hosts added."""
+    path = user_inventory_path()
+    try:
+        added = run_auto_discovery(path)
+    except InventoryError as exc:
+        _fail(str(exc))
+    if added:
+        logger.warning("auto-discovery added %s to %s", ", ".join(added), path)
+    else:
+        logger.warning("auto-discovery found nothing new to add to %s", path)
+    return added
+
+
 @app.command()
 def evaluate(
     args: Annotated[
@@ -342,6 +357,19 @@ def evaluate(
             ),
         ),
     ] = None,
+    auto_discovery: Annotated[
+        bool,
+        typer.Option(
+            "--auto-discovery",
+            help=(
+                "Try --local, the developer.bigfix.com online evaluator and (if "
+                "docker or podman is installed) Ubuntu 26.04 and UBI 10 "
+                "containers, and add each one that works to "
+                "~/.bigfix/remote_clients.toml. Happens automatically on first "
+                "run when no remote_clients.toml exists anywhere."
+            ),
+        ),
+    ] = False,
     update_inventory: Annotated[
         bool,
         typer.Option(
@@ -511,6 +539,12 @@ def evaluate(
     # inventory host's own `arch`) is how anyone wanting arm64 opts in.
     arch_list = arch or ["x86_64"]
 
+    if auto_discovery:
+        _auto_discover()
+        if not args and client_relevance_file is None:
+            # Discovery on its own is a complete invocation.
+            raise typer.Exit(0)
+
     # --container, --online-evaluator and --inventory compose: a fleet plus an
     # ad-hoc extra target is a normal thing to want. --local is still on its own.
     if local and (container or online_evaluator or inventory):
@@ -562,6 +596,13 @@ def evaluate(
         needed = 1 if client_relevance_file else 2
         if len(args) < needed:
             discovered = find_inventory_path()
+            if discovered is None and not auto_discovery and not user_inventory_path().exists():
+                # First run: nothing configured anywhere, so find out what
+                # works here rather than refusing outright. Once the file
+                # exists this never repeats unless --auto-discovery asks.
+                logger.info("no remote_clients.toml found; running first-run auto-discovery")
+                if _auto_discover():
+                    discovered = user_inventory_path()
             if discovered is not None:
                 inventory = discovered
             else:
