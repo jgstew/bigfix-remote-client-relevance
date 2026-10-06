@@ -362,9 +362,10 @@ def evaluate(
         typer.Option(
             "--auto-discovery",
             help=(
-                "Try --local, the developer.bigfix.com online evaluator and (if "
-                "docker or podman is installed) Ubuntu 26.04 and UBI 10 "
-                "containers, and add each one that works to "
+                "Try --local (installed and downloaded qna), the developer.bigfix.com "
+                "online evaluator and, with docker or podman running, debian- and "
+                "rhel-family containers per architecture (already-pulled images "
+                "first), and add each one that works to "
                 "~/.bigfix/remote_clients.toml. Happens automatically on first "
                 "run when no remote_clients.toml exists anywhere."
             ),

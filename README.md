@@ -155,14 +155,26 @@ places, current directory first, and the first one found wins:
    on Windows.
 
 If none of those exist and `~/.bigfix/remote_clients.toml` doesn't either,
-the first run **auto-discovers** one: it tries `--local`, the
-developer.bigfix.com online evaluator (`web-eval-rhel`) and, if `docker` or
-`podman` is installed, one debian-family and one rhel-family container for
-this machine's own architecture (qna 11.0, which has native arm64 builds
-since 11.0.7): `ubuntu:26.04`, falling back to `ubuntu:24.04` if that
-fails, and UBI 10, falling back to UBI 9. Only hosts that actually evaluate cleanly get written. After that
-it never runs again on its own; `--auto-discovery` re-runs it and adds
-anything new without touching existing hosts.
+the first run **auto-discovers** one, trying:
+
+- `local` (this machine's installed qna, like `--local`) and
+  `local-downloaded` (the same machine with qna 11.0 downloaded), so the two
+  can be compared;
+- the developer.bigfix.com online evaluator (`web-eval-rhel`);
+- if a docker or podman engine is running, at least one debian-family and
+  one rhel-family container **per architecture** the image publishes
+  (x86_64, arm64; qna 11.0.7+ has native arm64 builds). Images you've
+  already pulled are preferred, one host per distro (e.g. both `ubuntu` and
+  `debian`), newest tag first. Only if none of a family's local images works
+  is a default downloaded: `ubuntu:26.04` then `ubuntu:24.04`, or UBI 10
+  then UBI 9. Hosts are named like `ubuntu-26-04-arm64`.
+  A stopped engine is never started just to look; if docker or podman is
+  installed but not running, a warning says so, and `--auto-discovery`
+  adds the containers once it's up.
+
+Only hosts that actually evaluate cleanly get written. After that it never
+runs again on its own; `--auto-discovery` re-runs it and adds anything new
+without touching existing hosts.
 
 ```toml
 # remote_clients.toml

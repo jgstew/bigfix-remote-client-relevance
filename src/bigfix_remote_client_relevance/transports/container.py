@@ -485,6 +485,14 @@ class DockerEngine:
             + ", ".join(tried)
         )
 
+    def client(self) -> object:
+        """The connected docker SDK client, for callers outside a transport.
+
+        Blocking, like every SDK call. Raises :class:`ContainerEngineError`
+        when no engine answers.
+        """
+        return self._get_client()
+
     def _start_engine_and_wait(self, tried: list[str]) -> object | None:
         """Start an installed-but-stopped engine, then wait for it to answer."""
         starter = self._setup.detect()
