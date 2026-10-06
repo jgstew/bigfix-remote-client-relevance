@@ -38,6 +38,11 @@ QNA_BODY = b"#!/bin/sh\necho fixture qna\n"
 def _data_tar(compression: str, members: dict[str, bytes] | None = None) -> bytes:
     """A deb payload tarball holding an executable qna."""
     members = members if members is not None else {QNA_MEMBER: QNA_BODY}
+    if compression == "zst":
+        # stdlib tarfile has no zstd writer before 3.14; compress a plain tar.
+        import zstandard
+
+        return zstandard.ZstdCompressor().compress(_data_tar("", members))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode=f"w:{compression}") as tar:  # type: ignore[call-overload]
         for name, body in members.items():
@@ -61,7 +66,7 @@ def _ar_archive(entries: list[tuple[str, bytes]]) -> bytes:
 
 def write_deb(path: Path, compression: str = "xz", members: dict[str, bytes] | None = None) -> Path:
     payload = _data_tar(compression, members)
-    suffix = {"xz": "xz", "gz": "gz"}[compression]
+    suffix = {"xz": "xz", "gz": "gz", "zst": "zst"}[compression]
     path.write_bytes(
         _ar_archive(
             [
@@ -115,6 +120,15 @@ async def test_extracted_qna_is_executable(deb, cache):
 async def test_deb_gz_payload(tmp_path, cache):
     """Older builds ship data.tar.gz rather than data.tar.xz."""
     artifact = write_deb(tmp_path / "old.deb", compression="gz")
+
+    tree = await ensure_extracted(resolved_for(artifact), cache_dir=cache)
+
+    assert qna_in(tree).read_bytes() == QNA_BODY
+
+
+async def test_deb_zst_payload(tmp_path, cache):
+    """Ubuntu 24.04-era builds (e.g. BESAgent-11.0.7.61-ubuntu24) ship data.tar.zst."""
+    artifact = write_deb(tmp_path / "noble.deb", compression="zst")
 
     tree = await ensure_extracted(resolved_for(artifact), cache_dir=cache)
 

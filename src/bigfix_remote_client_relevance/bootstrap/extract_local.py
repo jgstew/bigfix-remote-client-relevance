@@ -125,7 +125,15 @@ def _safe_destination(destination: Path, member_name: str) -> Path:
 
 
 def _extract_deb(artifact: Path, destination: Path) -> None:
-    payload = _ar_member(artifact, prefix="data.tar")
+    name, payload = _ar_member(artifact, prefix="data.tar")
+    if name.endswith(".zst"):
+        # Ubuntu 21.10+ dpkg defaults to zstd (data.tar.zst), which stdlib
+        # tarfile cannot read before Python 3.14. Decompress up front with
+        # the same `zstandard` dependency rpmfile uses for EL9 payloads.
+        import zstandard
+
+        with zstandard.ZstdDecompressor().stream_reader(payload) as reader:
+            payload = io.BytesIO(reader.read())
     with tarfile.open(fileobj=payload, mode="r:*") as tar:
         _extract_tar(tar, destination)
 
@@ -149,8 +157,11 @@ def _extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
         # and following them is how an archive escapes its destination.
 
 
-def _ar_member(artifact: Path, *, prefix: str) -> io.BytesIO:
+def _ar_member(artifact: Path, *, prefix: str) -> tuple[str, io.BytesIO]:
     """Read the first `ar` member whose name starts with ``prefix``.
+
+    Returns the member's name alongside its body, so callers can pick a
+    decompressor from the suffix.
 
     The .deb outer format is an `ar` archive: an 8-byte magic, then per member
     a 60-byte ASCII header (16-byte name, then mtime/uid/gid/mode/size fields)
@@ -176,7 +187,7 @@ def _ar_member(artifact: Path, *, prefix: str) -> io.BytesIO:
                 ) from exc
             body = handle.read(size)
             if name.startswith(prefix):
-                return io.BytesIO(body)
+                return name, io.BytesIO(body)
             if size % 2:
                 handle.read(1)
 

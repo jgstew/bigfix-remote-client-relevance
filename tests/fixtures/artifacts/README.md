@@ -14,5 +14,5 @@ payloads use), but a distinct `archive_compression` tag that this project's
 `rpmfile` dependency (2.2.1) doesn't recognize on its own. The extractor is
 tested against all three.
 
-The `.deb` fixtures are generated in-test with stdlib `tarfile` plus a
+The `.deb` fixtures (xz, gz, and zstd payloads) are generated in-test with stdlib `tarfile` (plus `zstandard` for zstd) and a
 hand-written `ar` wrapper — no external tooling needed for that format.
