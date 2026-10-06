@@ -247,6 +247,11 @@ def _local_pull_tag(image: str, platform: str | None) -> str | None:
     return f"bfrcr/base:{digest}"
 
 
+def _is_missing_platform_error(exc: BaseException) -> bool:
+    """The daemon has the tag but no content for the requested platform."""
+    return "does not provide the specified platform" in str(exc)
+
+
 def _platform_parts(platform: str | None) -> tuple[str, str] | None:
     """``"linux/amd64"`` -> ``("linux", "amd64")``, else ``None``."""
     if platform is None or "/" not in platform:
@@ -438,6 +443,9 @@ class DockerEngine:
         # Every container this engine creates self-expires unless this is
         # explicitly None -- see DEFAULT_IDLE_TTL_S.
         self._idle_ttl_s = idle_ttl_s
+        # local alias tag -> (upstream image, platform) it was made from, so
+        # start() can re-pull an alias whose content turns out to be stale.
+        self._alias_sources: dict[str, tuple[str, str]] = {}
 
     def _connect(self, urls: list[str], tried: list[str]) -> object | None:
         """The first URL that answers, or ``None``."""
@@ -527,8 +535,9 @@ class DockerEngine:
         exact clobbering race this return value exists to close.
         """
         local_tag = _local_pull_tag(image, platform)
-        if local_tag is None:
+        if local_tag is None or platform is None:
             return await self._guard(lambda: self._ensure_plain(image), retry=True)
+        self._alias_sources[local_tag] = (image, platform)
         return await self._guard(
             lambda: self._ensure_aliased(image, platform, local_tag), retry=True
         )
@@ -606,6 +615,19 @@ class DockerEngine:
         pulled.tag(repository, tag_name)
         return local_tag
 
+    def _repull_alias(self, local_tag: str) -> None:
+        """Force a fresh platform-specific pull of ``local_tag``'s source.
+
+        Inspect metadata can claim the wanted architecture (Docker's
+        containerd store reports a multi-arch index that way) while the
+        daemon holds no content for it -- only container-create notices.
+        """
+        image, platform = self._alias_sources[local_tag]
+        repository, _sep, tag_name = local_tag.partition(":")
+        logger.info("alias %s lacks %s content; re-pulling %s", local_tag, platform, image)
+        pulled = self._get_client().images.pull(image, platform=platform)  # type: ignore[attr-defined]
+        pulled.tag(repository, tag_name)
+
     async def run_one_shot(
         self,
         image: str,
@@ -657,6 +679,14 @@ class DockerEngine:
             )
             return str(container.id)
 
+        try:
+            return await self._guard(_start)
+        except ContainerEngineError as exc:
+            # Safe to create again: this create failed before any container
+            # existed, so nothing is left behind.
+            if image not in self._alias_sources or not _is_missing_platform_error(exc):
+                raise
+        await self._guard(lambda: self._repull_alias(image), retry=True)
         return await self._guard(_start)
 
     async def renew(self, container_id: str, *, ttl_s: float | None = None) -> bool:

@@ -2306,3 +2306,42 @@ async def test_a_reused_container_is_renewed_to_cover_the_next_evaluation():
 
     assert engine.renewed[-1][1] is not None
     assert float(str(engine.renewed[-1][1])) > 600
+
+
+class FakeStaleAliasClient(FakeDockerClient):
+    """Images *and* containers: the local alias inspects as the wanted arch
+    (as Docker's containerd store does for a multi-arch index) but the daemon
+    has no content for it, so the first create 404s until a real re-pull."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            existing={"ubuntu:24.04": FakeImage(attrs={"Os": "linux", "Architecture": "arm64"})},
+            pull_result=FakeImage(attrs={"Os": "linux", "Architecture": "arm64"}),
+        )
+        self.containers = self
+        self.runs: list[dict[str, object]] = []
+
+    def run(self, image: str, **kwargs: object) -> FakeStartedContainer:
+        import docker.errors
+
+        self.runs.append({"image": image, **kwargs})
+        if not self.pulled:
+            raise docker.errors.NotFound(
+                f'404 Client Error: Not Found ("image with reference {image} was found '
+                f'but does not provide the specified platform ({kwargs.get("platform")})")'
+            )
+        return FakeStartedContainer()
+
+
+async def test_start_repulls_a_stale_single_arch_alias_and_retries():
+    """A local alias whose content lacks the requested platform must be
+    re-pulled for that platform, not fail the whole target with a 404."""
+    client = FakeStaleAliasClient()
+    engine = engine_with(client)
+    tag = await engine.ensure_image("ubuntu:24.04", platform="linux/arm64")
+    assert client.pulled == [], "precondition: aliased from the local image"
+
+    await engine.start(tag, platform="linux/arm64")
+
+    assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/arm64"}]
+    assert [run["image"] for run in client.runs] == [tag, tag]
