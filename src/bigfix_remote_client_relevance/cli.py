@@ -60,6 +60,7 @@ from bigfix_remote_client_relevance.serialize import (
     result_to_dict,
     results_to_dicts,
 )
+from bigfix_remote_client_relevance.ssh_discovery import run_ssh_discovery
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,41 @@ def _auto_discover() -> list[str]:
     return added
 
 
+def _interactive() -> bool:
+    """stdin and stderr are both a terminal, so a person can answer a prompt."""
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return str(typer.prompt(prompt, default="", show_default=False, prompt_suffix="", err=True))
+    except typer.Abort as exc:  # Ctrl-D / Ctrl-C at the prompt
+        raise EOFError from exc
+
+
+def _tell(line: str) -> None:
+    typer.echo(line, err=True)
+
+
+def _auto_discover_ssh() -> list[str]:
+    """Interactive SSH discovery into ~/.bigfix/remote_clients.toml; return hosts added."""
+    if not _interactive():
+        _fail(
+            "--auto-discovery-ssh asks which hosts to try, so it needs a terminal "
+            "on stdin and stderr"
+        )
+    path = user_inventory_path()
+    try:
+        added = run_ssh_discovery(path, ask=_ask, tell=_tell)
+    except InventoryError as exc:
+        _fail(str(exc))
+    if added:
+        logger.warning("auto-discovery added %s to %s", ", ".join(added), path)
+    else:
+        logger.warning("SSH auto-discovery added nothing to %s", path)
+    return added
+
+
 @app.command()
 def evaluate(
     args: Annotated[
@@ -369,6 +405,19 @@ def evaluate(
                 "first), and add each one that works to "
                 "~/.bigfix/remote_clients.toml. Happens automatically on first "
                 "run when no remote_clients.toml exists anywhere."
+            ),
+        ),
+    ] = False,
+    auto_discovery_ssh: Annotated[
+        bool,
+        typer.Option(
+            "--auto-discovery-ssh",
+            help=(
+                "List SSH hosts from ~/.ssh/config and ~/.ssh/known_hosts that "
+                "aren't in ~/.bigfix/remote_clients.toml yet, ask which to try, "
+                "and add each picked one that works. Nothing is contacted before "
+                "it's picked; picking a host with no known host key also accepts "
+                "its key into ~/.ssh/known_hosts. Needs a terminal."
             ),
         ),
     ] = False,
@@ -541,11 +590,13 @@ def evaluate(
     # inventory host's own `arch`) is how anyone wanting arm64 opts in.
     arch_list = arch or ["x86_64"]
 
+    if auto_discovery_ssh:
+        _auto_discover_ssh()
     if auto_discovery:
         _auto_discover()
-        if not args and client_relevance_file is None:
-            # Discovery on its own is a complete invocation.
-            raise typer.Exit(0)
+    if (auto_discovery or auto_discovery_ssh) and not args and client_relevance_file is None:
+        # Discovery on its own is a complete invocation.
+        raise typer.Exit(0)
 
     # --container, --online-evaluator and --inventory compose: a fleet plus an
     # ad-hoc extra target is a normal thing to want. --local is still on its own.
@@ -598,7 +649,11 @@ def evaluate(
         needed = 1 if client_relevance_file else 2
         if len(args) < needed:
             discovered = find_inventory_path()
-            if discovered is None and not auto_discovery and not user_inventory_path().exists():
+            if (
+                discovered is None
+                and not (auto_discovery or auto_discovery_ssh)
+                and not user_inventory_path().exists()
+            ):
                 # First run: nothing configured anywhere, so find out what
                 # works here rather than refusing outright. Once the file
                 # exists this never repeats unless --auto-discovery asks.

@@ -522,21 +522,29 @@ def ensure_writable(path: Path) -> None:
         ) from exc
 
 
+def read_existing(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """``path``'s ``[defaults]`` and its hosts with those defaults applied.
+
+    Both empty when the file doesn't exist yet.
+    """
+    if not path.is_file():
+        return {}, {}
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise InventoryError(f"could not read inventory {path}: {exc}") from exc
+    defaults = document.get("defaults", {})
+    # Per-host values win over [defaults], same as load_inventory.
+    hosts = {
+        name: {**defaults, **(config or {})} for name, config in document.get("hosts", {}).items()
+    }
+    return defaults, hosts
+
+
 def run_auto_discovery(path: Path, **kwargs: Any) -> list[str]:
     """Discover hosts missing from ``path`` and write the working ones to it."""
     ensure_writable(path)
-    existing: dict[str, dict[str, Any]] = {}
-    if path.is_file():
-        try:
-            document = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-            raise InventoryError(f"could not read inventory {path}: {exc}") from exc
-        defaults = document.get("defaults", {})
-        # Per-host values win over [defaults], same as load_inventory.
-        existing = {
-            name: {**defaults, **(config or {})}
-            for name, config in document.get("hosts", {}).items()
-        }
+    _, existing = read_existing(path)
     found = asyncio.run(discover(skip=set(existing), existing=existing, **kwargs))
     added = write_discovered(path, found)
     if not added and not path.exists():
@@ -553,6 +561,7 @@ __all__ = [
     "discover",
     "ensure_writable",
     "host_name_for",
+    "read_existing",
     "run_auto_discovery",
     "write_discovered",
     "write_placeholder",

@@ -1,0 +1,667 @@
+"""Interactive SSH host discovery (``--auto-discovery-ssh``).
+
+SSH targets are other people's machines: even a failed login can raise a
+login alert, an MFA prompt or a lockout. So nothing is contacted until the
+user has picked it from a list, and nothing is written that didn't work.
+
+Candidates come only from files -- nothing is connected to while gathering:
+
+* ``~/.ssh/config`` ``Host`` aliases (wildcards and negations skipped,
+  ``Include`` followed).
+* ``~/.ssh/known_hosts`` names (hashed entries are unreadable and skipped;
+  entries on a port other than 22 are left out, since the inventory has no
+  ``port`` and only a config alias can reach them).
+
+Public git hosting (``github.com``, ``gitlab.com``, ... -- see ``GIT_HOSTS``)
+is never offered, under any name or address that shares its key.
+
+Each is resolved with ``ssh -G`` (config only, no network) and duplicates are
+merged by host key: two names whose ``known_hosts`` keys overlap are the same
+machine, whatever address each was reached by. Hosts already in the inventory
+and this machine itself are dropped the same way.
+
+A picked host with no key in ``known_hosts`` would always fail the test --
+the SSH transport (asyncssh) verifies host keys and never prompts -- so the
+list says that picking it also accepts its key. After selection its key is
+fetched with ``ssh-keyscan``, its fingerprint shown, and it is appended to
+``~/.ssh/known_hosts`` before the test.
+
+Each picked host is tested as-is first; when that fails for any reason but
+not connecting (e.g. macOS, where qna needs root), it is tried again with
+``become`` (``sudo -n``, so never a password prompt).
+
+The library never prints: prompts and the list go through the caller's
+``ask``/``tell``, which the CLI sends to stderr.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import glob
+import hashlib
+import hmac
+import ipaddress
+import logging
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from bigfix_remote_client_relevance.discovery import (
+    PROBE_RELEVANCE,
+    Evaluator,
+    ensure_writable,
+    read_existing,
+    write_discovered,
+)
+from bigfix_remote_client_relevance.inventory import _target_from_entry
+from bigfix_remote_client_relevance.orchestrate import evaluate_client_relevance
+from bigfix_remote_client_relevance.results import ERROR_KIND_TRANSPORT
+
+logger = logging.getLogger(__name__)
+
+# ssh -G and ssh-keyscan: the first never touches the network, the second
+# only reaches hosts the user picked.
+RESOLVE_TIMEOUT_S = 5.0
+KEYSCAN_TIMEOUT_S = 5
+
+# Shorter than container discovery's: nothing is pulled, only connected to.
+SSH_PROBE_TIMEOUT_S = 120.0
+
+DEFAULT_SSH_PORT = 22
+
+_ALWAYS_SELF = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Public git hosting: in nearly everyone's known_hosts, never a BigFix client.
+# Exact names only -- a self-hosted `github01.corp` or `gitlab-runner` could
+# be a real machine, so nothing here matches by prefix.
+GIT_HOSTS = frozenset(
+    {
+        "github.com",
+        "ssh.github.com",
+        "gist.github.com",
+        "gitlab.com",
+        "altssh.gitlab.com",
+        "bitbucket.org",
+        "altssh.bitbucket.org",
+        "ssh.dev.azure.com",
+        "vs-ssh.visualstudio.com",
+        "codeberg.org",
+        "git.sr.ht",
+        "source.developers.google.com",
+        "git-codecommit.us-east-1.amazonaws.com",
+    }
+)
+
+Resolver = Callable[[str], "Resolved"]
+KeyScanner = Callable[[str, int], list[tuple[str, str]]]
+
+
+@dataclass(frozen=True)
+class KnownHost:
+    """One host name from one ``known_hosts`` line (lowercased, as ssh compares)."""
+
+    host: str
+    port: int
+    keytype: str
+    key: str
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """What ``ssh -G`` says connecting to a name would actually use."""
+
+    hostname: str
+    port: int = DEFAULT_SSH_PORT
+    user: str | None = None
+    hostkeyalias: str | None = None
+    hashed: bool = False
+
+    @property
+    def key_name(self) -> str:
+        """The name ssh looks the host key up under."""
+        return (self.hostkeyalias or self.hostname).lower()
+
+
+@dataclass
+class SSHCandidate:
+    """One machine offered for selection, possibly under several names."""
+
+    name: str
+    source: str
+    resolved: Resolved
+    also: list[str] = field(default_factory=list)
+    keys: frozenset[str] = frozenset()
+
+    @property
+    def needs_host_key(self) -> bool:
+        return not self.keys
+
+
+# --- reading the files ---------------------------------------------------
+
+
+def _is_pattern(name: str) -> bool:
+    return any(char in name for char in "*?!")
+
+
+def _config_words(line: str) -> list[str]:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return []
+    # `Keyword=value` is as valid as `Keyword value`.
+    line = re.sub(r"^(\w+)\s*=\s*", r"\1 ", line)
+    try:
+        return shlex.split(line, comments=True)
+    except ValueError:
+        return line.split()
+
+
+def read_config_aliases(path: Path, *, _seen: set[Path] | None = None) -> list[str]:
+    """Concrete ``Host`` names in an ssh config, following ``Include``.
+
+    Relative ``Include`` paths are taken from the config's own directory,
+    which is ``~/.ssh`` for the user config, as ssh does.
+    """
+    seen = _seen if _seen is not None else set()
+    try:
+        resolved = path.resolve()
+        if resolved in seen:
+            return []
+        seen.add(resolved)
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    aliases: list[str] = []
+    for line in text.splitlines():
+        words = _config_words(line)
+        if not words:
+            continue
+        keyword, args = words[0].lower(), words[1:]
+        if keyword == "host":
+            aliases.extend(a for a in args if not _is_pattern(a) and not a.startswith("-"))
+        elif keyword == "include":
+            for pattern in args:
+                expanded = os.path.expanduser(pattern)
+                if not os.path.isabs(expanded):
+                    expanded = str(path.parent / expanded)
+                for match in sorted(glob.glob(expanded)):
+                    aliases.extend(read_config_aliases(Path(match), _seen=seen))
+    return list(dict.fromkeys(aliases))
+
+
+def _host_and_port(name: str) -> tuple[str, int]:
+    bracketed = re.fullmatch(r"\[(.+)\]:(\d+)", name)
+    if bracketed:
+        return bracketed.group(1), int(bracketed.group(2))
+    return name, DEFAULT_SSH_PORT
+
+
+def parse_known_hosts(text: str) -> list[KnownHost]:
+    """Readable host names in a ``known_hosts`` file, one per name per line."""
+    entries: list[KnownHost] = []
+    for line in text.splitlines():
+        fields = line.split()
+        # Markers (@cert-authority, @revoked) aren't keys for a host.
+        if len(fields) < 3 or fields[0].startswith(("#", "@", "|")):
+            continue
+        names, keytype, key = fields[0], fields[1], fields[2]
+        for name in names.split(","):
+            if not name or _is_pattern(name):
+                continue
+            host, port = _host_and_port(name.lower())
+            entries.append(KnownHost(host, port, keytype, key))
+    return entries
+
+
+def _read_known_hosts(ssh_dir: Path) -> list[KnownHost]:
+    entries: list[KnownHost] = []
+    for name in ("known_hosts", "known_hosts2"):
+        try:
+            text = (ssh_dir / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        entries.extend(parse_known_hosts(text))
+    return entries
+
+
+def parse_ssh_g(text: str) -> Resolved:
+    """The fields discovery uses from ``ssh -G`` output."""
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, value = line.strip().partition(" ")
+        values.setdefault(key.lower(), value.strip())
+    alias = values.get("hostkeyalias")
+    try:
+        port = int(values.get("port", DEFAULT_SSH_PORT))
+    except ValueError:
+        port = DEFAULT_SSH_PORT
+    return Resolved(
+        hostname=values.get("hostname", ""),
+        port=port,
+        user=values.get("user") or None,
+        hostkeyalias=alias if alias and alias != "none" else None,
+        hashed=values.get("hashknownhosts") == "yes",
+    )
+
+
+def default_resolver(host: str) -> Resolved:
+    """``ssh -G host``: applies config, ``Include`` and ``Match`` as ssh would.
+
+    Falls back to the name itself when ssh isn't there or fails.
+    """
+    try:
+        completed = subprocess.run(
+            ["ssh", "-G", "--", host],
+            capture_output=True,
+            text=True,
+            timeout=RESOLVE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("ssh -G %s failed: %s", host, exc)
+        return Resolved(hostname=host)
+    if completed.returncode != 0:
+        logger.debug("ssh -G %s exited %d: %s", host, completed.returncode, completed.stderr)
+        return Resolved(hostname=host)
+    resolved = parse_ssh_g(completed.stdout)
+    return resolved if resolved.hostname else Resolved(hostname=host)
+
+
+def default_keyscan(hostname: str, port: int) -> list[tuple[str, str]]:
+    """``ssh-keyscan``: the host's public keys, without logging in."""
+    try:
+        completed = subprocess.run(
+            ["ssh-keyscan", "-T", str(KEYSCAN_TIMEOUT_S), "-p", str(port), "--", hostname],
+            capture_output=True,
+            text=True,
+            timeout=KEYSCAN_TIMEOUT_S * 3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.info("ssh-keyscan %s failed: %s", hostname, exc)
+        return []
+    keys = []
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and not fields[0].startswith("#"):
+            keys.append((fields[1], fields[2]))
+    return keys
+
+
+def default_self_keys(directory: Path = Path("/etc/ssh")) -> set[str]:
+    """This machine's own SSH host keys, when it runs an SSH server."""
+    keys = set()
+    for public in directory.glob("ssh_host_*_key.pub"):
+        try:
+            fields = public.read_text(encoding="utf-8").split()
+        except OSError:
+            continue
+        if len(fields) >= 2:
+            keys.add(fields[1])
+    return keys
+
+
+def default_self_names() -> set[str]:
+    """Names this machine goes by, including its Bonjour ``.local`` name."""
+    names = set()
+    hostname = socket.gethostname().lower()
+    if hostname:
+        short = hostname.split(".")[0]
+        names |= {hostname, short, f"{short}.local"}
+    if sys.platform == "darwin":
+        try:
+            local = subprocess.run(
+                ["scutil", "--get", "LocalHostName"],
+                capture_output=True,
+                text=True,
+                timeout=RESOLVE_TIMEOUT_S,
+                check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            local = ""
+        if local:
+            names.add(f"{local.lower()}.local")
+    return names
+
+
+# --- candidates ------------------------------------------------------------
+
+
+def _is_ip(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return True
+
+
+@dataclass
+class _Entry:
+    name: str
+    source: str
+    order: int
+    resolved: Resolved
+    keys: set[str]
+    names: set[tuple[str, int]]
+
+
+def _key_index(known: Iterable[KnownHost]) -> dict[tuple[str, int], set[str]]:
+    index: dict[tuple[str, int], set[str]] = {}
+    for entry in known:
+        index.setdefault((entry.host, entry.port), set()).add(entry.key)
+    return index
+
+
+def _entry(
+    name: str,
+    source: str,
+    order: int,
+    resolve: Resolver,
+    index: Mapping[tuple[str, int], set[str]],
+) -> _Entry:
+    resolved = resolve(name)
+    keys = set(index.get((resolved.key_name, resolved.port), ()))
+    names = {(name.lower(), resolved.port), (resolved.hostname.lower(), resolved.port)}
+    return _Entry(name, source, order, resolved, keys, names)
+
+
+def _groups(entries: list[_Entry]) -> list[list[_Entry]]:
+    """Entries that share a host key or a resolved name, merged transitively."""
+    groups: list[list[_Entry]] = []
+    for entry in entries:
+        touching = [
+            group
+            for group in groups
+            if any(entry.keys & other.keys or entry.names & other.names for other in group)
+        ]
+        merged = [member for group in touching for member in group] + [entry]
+        groups = [group for group in groups if group not in touching] + [merged]
+    return groups
+
+
+def _representative(group: list[_Entry]) -> _Entry:
+    # A config alias is a name the user chose; otherwise a name beats an IP.
+    return min(group, key=lambda e: (e.source != "ssh config", _is_ip(e.name), e.order))
+
+
+def gather_candidates(
+    *,
+    aliases: Sequence[str],
+    known: Sequence[KnownHost],
+    resolve: Resolver,
+    existing: Mapping[str, Mapping[str, Any]] | None = None,
+    self_keys: Collection[str] = (),
+    self_names: Collection[str] = (),
+) -> list[SSHCandidate]:
+    """One candidate per machine not already in ``existing`` and not this one."""
+    index = _key_index(known)
+    entries = [_entry(alias, "ssh config", i, resolve, index) for i, alias in enumerate(aliases)]
+    hosts = dict.fromkeys(
+        entry.host for entry in known if entry.port == DEFAULT_SSH_PORT and entry.host
+    )
+    entries += [
+        _entry(host, "known_hosts", len(aliases) + i, resolve, index)
+        for i, host in enumerate(hosts)
+    ]
+
+    taken_keys = set(self_keys)
+    taken_names = {(name.lower(), DEFAULT_SSH_PORT) for name in (*self_names, *_ALWAYS_SELF)}
+    for name, config in (existing or {}).items():
+        if str(config.get("transport", "ssh")) != "ssh":
+            continue
+        known_entry = _entry(name, "inventory", -1, resolve, index)
+        taken_keys |= known_entry.keys
+        taken_names |= known_entry.names
+
+    candidates = []
+    for group in _groups(entries):
+        keys = set().union(*(e.keys for e in group))
+        names = set().union(*(e.names for e in group))
+        if keys & taken_keys or names & taken_names:
+            logger.debug("ssh discovery: skipping known %s", [e.name for e in group])
+            continue
+        if any(name in GIT_HOSTS for name, _ in names):
+            logger.debug("ssh discovery: skipping git hosting %s", [e.name for e in group])
+            continue
+        chosen = _representative(group)
+        also = [e.name for e in sorted(group, key=lambda e: e.order) if e is not chosen]
+        candidates.append(
+            SSHCandidate(
+                name=chosen.name,
+                source=chosen.source,
+                resolved=chosen.resolved,
+                also=list(dict.fromkeys(also)),
+                keys=frozenset(keys),
+            )
+        )
+    # Config aliases first, then named hosts, then bare IPs; stable within each.
+    return sorted(candidates, key=lambda c: (c.source != "ssh config", _is_ip(c.name)))
+
+
+# --- the interactive bits --------------------------------------------------
+
+
+def parse_selection(text: str, count: int) -> list[int]:
+    """``1,4-6`` / ``all`` / ``none`` (or empty) into sorted 0-based indices."""
+    text = text.strip().lower()
+    if text in ("", "none"):
+        return []
+    if text == "all":
+        return list(range(count))
+    picked: set[int] = set()
+    for token in re.split(r"[\s,]+", text):
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
+        if not match:
+            raise ValueError(f"not a number or range: {token!r}")
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if not 1 <= first <= last <= count:
+            raise ValueError(f"{token} is not within 1-{count}")
+        picked.update(range(first - 1, last))
+    return sorted(picked)
+
+
+def describe(candidates: Sequence[SSHCandidate], ssh_dir: Path) -> list[str]:
+    """The numbered list, grouped by where each host came from."""
+    known_hosts = ssh_dir / "known_hosts"
+    lines = ["SSH hosts found (none of them has been contacted):"]
+    source = None
+    for number, candidate in enumerate(candidates, 1):
+        if candidate.source != source:
+            source = candidate.source
+            lines.append(f"  from {ssh_dir / ('config' if source == 'ssh config' else source)}:")
+        also = f"  (also {', '.join(candidate.also)})" if candidate.also else ""
+        lines.append(f"  {number:>3}. {candidate.name}{also}")
+        if candidate.needs_host_key:
+            lines.append(
+                "       no host key in known_hosts yet: picking it also accepts its key, "
+                f"fetched with ssh-keyscan and added to {known_hosts}"
+            )
+    return lines
+
+
+def _ask_selection(ask: Callable[[str], str], tell: Callable[[str], None], count: int) -> list[int]:
+    while True:
+        try:
+            text = ask("Hosts to test and add (e.g. 1,3-4, all, none) [none]: ")
+        except EOFError:
+            return []
+        try:
+            return parse_selection(text, count)
+        except ValueError as exc:
+            tell(f"{exc}; try again")
+
+
+def fingerprint(key: str) -> str:
+    """OpenSSH's ``SHA256:...`` fingerprint of a base64 public key."""
+    digest = hashlib.sha256(base64.b64decode(key)).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+def known_hosts_line(
+    name: str,
+    port: int,
+    keytype: str,
+    key: str,
+    *,
+    hashed: bool = False,
+    salt: bytes | None = None,
+) -> str:
+    """A ``known_hosts`` line, hashed the way ssh does for ``HashKnownHosts yes``."""
+    host = name if port == DEFAULT_SSH_PORT else f"[{name}]:{port}"
+    if hashed:
+        salt = salt if salt is not None else os.urandom(20)
+        digest = hmac.new(salt, host.encode(), hashlib.sha1).digest()
+        host = f"|1|{base64.b64encode(salt).decode()}|{base64.b64encode(digest).decode()}"
+    return f"{host} {keytype} {key}"
+
+
+def _append_known_hosts(path: Path, lines: Sequence[str]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    prefix = ""
+    if path.is_file():
+        existing = path.read_bytes()
+        if existing and not existing.endswith(b"\n"):
+            prefix = "\n"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(prefix + "".join(f"{line}\n" for line in lines))
+
+
+def _accept_host_key(
+    candidate: SSHCandidate,
+    keyscan: KeyScanner,
+    known_hosts: Path,
+    tell: Callable[[str], None],
+) -> bool:
+    resolved = candidate.resolved
+    keys = keyscan(resolved.hostname, resolved.port)
+    valid = []
+    for keytype, key in keys:
+        try:
+            valid.append((keytype, key, fingerprint(key)))
+        except (binascii.Error, ValueError):
+            logger.debug("ssh-keyscan %s: unreadable key %r", resolved.hostname, key)
+    if not valid:
+        tell(f"{candidate.name}: could not fetch its host key with ssh-keyscan; not tested")
+        return False
+    _append_known_hosts(
+        known_hosts,
+        [
+            known_hosts_line(resolved.key_name, resolved.port, keytype, key, hashed=resolved.hashed)
+            for keytype, key, _ in valid
+        ],
+    )
+    for keytype, _, print_ in valid:
+        tell(f"{candidate.name}: added {keytype} {print_} to {known_hosts}")
+    return True
+
+
+async def _probe(
+    name: str,
+    defaults: Mapping[str, Any],
+    path: Path,
+    evaluate: Evaluator,
+    tell: Callable[[str], None],
+) -> dict[str, Any] | None:
+    """The entry that works for ``name`` -- as-is, else with become -- or None."""
+    reason = "no result"
+    for entry in ({"transport": "ssh"}, {"transport": "ssh", "become": True}):
+        target = _target_from_entry(name, dict(entry), dict(defaults), path)
+        results = await evaluate(PROBE_RELEVANCE, [target], timeout_s=SSH_PROBE_TIMEOUT_S)
+        if results and all(r.error_kind is None for r in results):
+            tell(f"{name}: works{' with become' if entry.get('become') else ''}")
+            return entry
+        failed = next((r for r in results if r.error_kind is not None), None)
+        if failed is None or failed.error_kind == ERROR_KIND_TRANSPORT:
+            reason = failed.error if failed is not None and failed.error else reason
+            break
+        reason = failed.error or failed.error_kind or reason
+    tell(f"{name}: did not work ({reason})")
+    return None
+
+
+def run_ssh_discovery(
+    path: Path,
+    *,
+    ask: Callable[[str], str],
+    tell: Callable[[str], None],
+    ssh_dir: Path | None = None,
+    resolve: Resolver | None = None,
+    keyscan: KeyScanner | None = None,
+    evaluate: Evaluator | None = None,
+    self_keys: Collection[str] | None = None,
+    self_names: Collection[str] | None = None,
+) -> list[str]:
+    """List SSH hosts, test the ones picked, add the working ones to ``path``.
+
+    ``ask`` shows a prompt and returns the reply (raising EOFError for no
+    reply); ``tell`` shows a line. Returns the inventory names added.
+    """
+    ensure_writable(path)
+    defaults, existing = read_existing(path)
+    ssh_dir = ssh_dir if ssh_dir is not None else Path.home() / ".ssh"
+
+    candidates = gather_candidates(
+        aliases=read_config_aliases(ssh_dir / "config"),
+        known=_read_known_hosts(ssh_dir),
+        resolve=resolve or default_resolver,
+        existing=existing,
+        self_keys=default_self_keys() if self_keys is None else self_keys,
+        self_names=default_self_names() if self_names is None else self_names,
+    )
+    if not candidates:
+        tell(f"no SSH hosts found in {ssh_dir} that aren't already in {path}")
+        return []
+
+    for line in describe(candidates, ssh_dir):
+        tell(line)
+    picked = [candidates[i] for i in _ask_selection(ask, tell, len(candidates))]
+    if not picked:
+        return []
+
+    keyscan = keyscan or default_keyscan
+    ready = [
+        candidate
+        for candidate in picked
+        if not candidate.needs_host_key
+        or _accept_host_key(candidate, keyscan, ssh_dir / "known_hosts", tell)
+    ]
+
+    async def probe_all() -> dict[str, dict[str, Any]]:
+        entries = await asyncio.gather(
+            *(
+                _probe(c.name, defaults, path, evaluate or evaluate_client_relevance, tell)
+                for c in ready
+            )
+        )
+        return {c.name: entry for c, entry in zip(ready, entries, strict=True) if entry is not None}
+
+    found = asyncio.run(probe_all()) if ready else {}
+    return write_discovered(path, found)
+
+
+__all__ = [
+    "GIT_HOSTS",
+    "KnownHost",
+    "Resolved",
+    "SSHCandidate",
+    "describe",
+    "fingerprint",
+    "gather_candidates",
+    "known_hosts_line",
+    "parse_known_hosts",
+    "parse_selection",
+    "parse_ssh_g",
+    "read_config_aliases",
+    "run_ssh_discovery",
+]

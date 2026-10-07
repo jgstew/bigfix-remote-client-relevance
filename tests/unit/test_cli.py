@@ -1421,3 +1421,55 @@ def test_empty_inventory_elsewhere_does_not_suggest_auto_discovery(captured, tmp
     assert result.exit_code == USAGE_EXIT_CODE
     assert "no [hosts.*] entries" in result.output
     assert "--auto-discovery" not in result.output
+
+
+# --- --auto-discovery-ssh ----------------------------------------------------
+
+
+def test_auto_discovery_ssh_refuses_without_a_terminal(captured, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", lambda *a, **k: calls.append(a) or [])
+
+    result = invoke("--auto-discovery-ssh")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "terminal" in result.output
+    assert calls == []
+
+
+def test_auto_discovery_ssh_alone_discovers_and_exits(captured, tmp_path, monkeypatch):
+    user_inventory = tmp_path / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "_interactive", lambda: True)
+    calls: list = []
+
+    def fake(path, *, ask, tell):
+        calls.append(path)
+        tell("the list")
+        return ["mini.local"]
+
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", fake)
+
+    result = invoke("--auto-discovery-ssh")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [user_inventory]
+    assert "the list" in result.output
+    assert "targets" not in captured
+
+
+def test_auto_discovery_ssh_list_goes_to_stderr_not_stdout(captured, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: tmp_path / "remote_clients.toml")
+    monkeypatch.setattr(cli_module, "_interactive", lambda: True)
+
+    def fake(path, *, ask, tell):
+        tell("the list")
+        return []
+
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", fake)
+
+    result = runner.invoke(cli_module.app, ["--auto-discovery-ssh"])
+
+    assert result.exit_code == 0, result.output
+    assert "the list" not in result.stdout
+    assert "the list" in result.stderr
