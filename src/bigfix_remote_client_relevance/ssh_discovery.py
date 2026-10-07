@@ -66,7 +66,6 @@ import logging
 import os
 import re
 import selectors
-import shlex
 import shutil
 import socket
 import subprocess
@@ -220,15 +219,47 @@ def _is_pattern(name: str) -> bool:
 
 
 def _config_words(line: str) -> list[str]:
+    """Split a config line the way OpenSSH's ``argv_split`` does.
+
+    Not shlex: OpenSSH only treats ``\\`` as an escape before ``\\``, a quote
+    or (unquoted) a space, and keeps it otherwise -- so ``Include
+    C:\\Users\\me\\extra.conf`` stays a Windows path. ``#`` starts a comment
+    only at the start of a word.
+    """
     line = line.strip()
-    if not line or line.startswith("#"):
-        return []
     # `Keyword=value` is as valid as `Keyword value`.
     line = re.sub(r"^(\w+)\s*=\s*", r"\1 ", line)
-    try:
-        return shlex.split(line, comments=True)
-    except ValueError:
-        return line.split()
+    words: list[str] = []
+    word: list[str] = []
+    in_word = False
+    quote = ""
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if not quote and char in " \t":
+            if in_word:
+                words.append("".join(word))
+                word, in_word = [], False
+        elif not quote and not in_word and char == "#":
+            break
+        elif (
+            char == "\\"
+            and i + 1 < len(line)
+            and (line[i + 1] in "\\'\"" or (not quote and line[i + 1] == " "))
+        ):
+            word.append(line[i + 1])
+            in_word = True
+            i += 1
+        elif char in "'\"" and (not quote or char == quote):
+            quote = "" if quote else char
+            in_word = True
+        else:
+            word.append(char)
+            in_word = True
+        i += 1
+    if in_word:
+        words.append("".join(word))
+    return words
 
 
 def read_config_aliases(path: Path, *, _seen: set[Path] | None = None) -> list[str]:

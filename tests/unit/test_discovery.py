@@ -7,6 +7,7 @@ container engine or registry is ever touched here.
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Collection
 
 import pytest
 
@@ -68,7 +69,7 @@ class FakeImages:
         return self._platforms.get(image)
 
 
-def _evaluator(seen: list, *, failing: set[str] = frozenset(), results=None):
+def _evaluator(seen: list, *, failing: Collection[str] = frozenset(), results=None):
     """One target per call; record names; fail the named ones."""
 
     async def fake_evaluate(client_relevance, targets, **kwargs):
@@ -81,7 +82,9 @@ def _evaluator(seen: list, *, failing: set[str] = frozenset(), results=None):
     return fake_evaluate
 
 
-async def _discover(images, seen, *, arch="arm64", failing=frozenset(), skip=(), results=None):
+async def _discover(
+    images, seen, *, arch="arm64", failing: Collection[str] = frozenset(), skip=(), results=None
+):
     return await discover(
         images=images,
         arch=arch,

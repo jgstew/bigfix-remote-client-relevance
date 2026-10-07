@@ -104,6 +104,33 @@ def test_config_follows_includes_relative_to_ssh_dir_with_globs(tmp_path):
     assert read_config_aliases(config) == ["first", "from-a", "from-b", "from-abs"]
 
 
+def test_config_backslashes_are_kept_like_openssh_except_before_quote_or_space(
+    tmp_path, monkeypatch
+):
+    # OpenSSH only treats `\` as an escape before \, ', " or a space, so a
+    # Windows path keeps its backslashes; shlex's POSIX rules would eat them.
+    nested = tmp_path / "w"
+    nested.mkdir()
+    (nested / "abs.conf").write_text("Host from-windows-path\n", encoding="utf-8")
+    config = tmp_path / "config"
+    config.write_text('Host my\\ box "quoted name" plain\nInclude w\\abs.conf\n', encoding="utf-8")
+    # On POSIX `w\abs.conf` is one odd file name, so stand in for Windows'
+    # path handling: what matters is that the backslash reaches glob intact.
+    real_glob = ssh_discovery_module.glob.glob
+    windows_path = str(tmp_path / "w\\abs.conf")
+    monkeypatch.setattr(
+        ssh_discovery_module.glob,
+        "glob",
+        lambda pattern: (
+            [str(nested / "abs.conf")] if pattern == windows_path else real_glob(pattern)
+        ),
+    )
+
+    aliases = read_config_aliases(config)
+
+    assert aliases == ["my box", "quoted name", "plain", "from-windows-path"]
+
+
 def test_config_include_loop_does_not_recurse_forever(tmp_path):
     config = tmp_path / "config"
     config.write_text(f"Host one\nInclude {config}\n", encoding="utf-8")
