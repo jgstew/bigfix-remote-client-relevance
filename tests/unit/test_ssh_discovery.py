@@ -10,8 +10,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import socket
 import sys
 import threading
+import time
 import tomllib
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from bigfix_remote_client_relevance.ssh_discovery import (
     MdnsService,
     Resolved,
     default_browse,
+    default_lookup,
     describe,
     fingerprint,
     gather_candidates,
@@ -39,6 +42,7 @@ from bigfix_remote_client_relevance.ssh_discovery import (
     parse_selection,
     parse_ssh_g,
     read_config_aliases,
+    resolve_addresses,
     run_ssh_discovery,
 )
 
@@ -516,6 +520,160 @@ def test_run_for_a_missing_program_is_empty():
     assert ssh_discovery_module._run_for(["no-such-program-xyz"], 0.5) == ""
 
 
+# --- probable duplicates by address (no key to decide) ---------------------
+
+
+def _addresses(table: dict[str, set[str]]):
+    return {name: frozenset(found) for name, found in table.items()}
+
+
+def test_keyless_host_sharing_an_address_is_a_probable_duplicate():
+    # The issue's example: a known IP, and the same Mac found again by mDNS.
+    known = parse_known_hosts(f"192.168.4.115 ssh-ed25519 {KEY_A}\n")
+
+    candidates = gather_candidates(
+        aliases=[],
+        known=known,
+        resolve=_resolver(),
+        mdns=[MdnsService("Mini", "Mini.local")],
+        addresses=_addresses({"mini.local": {"192.168.4.115"}}),
+    )
+
+    by_name = {c.name: c for c in candidates}
+    assert set(by_name) == {"192.168.4.115", "Mini.local"}  # not merged
+    assert [p.name for p in by_name["Mini.local"].probable] == ["192.168.4.115"]
+    assert [p.name for p in by_name["192.168.4.115"].probable] == ["Mini.local"]
+
+
+def test_mdns_addresses_count_without_a_lookup():
+    known = parse_known_hosts(f"192.168.4.115 ssh-ed25519 {KEY_A}\n")
+
+    candidates = gather_candidates(
+        aliases=[],
+        known=known,
+        resolve=_resolver(),
+        mdns=[MdnsService("Mini", "Mini.local", 22, ("192.168.4.115",))],
+        addresses={},
+    )
+
+    mini = next(c for c in candidates if c.name == "Mini.local")
+    assert [p.name for p in mini.probable] == ["192.168.4.115"]
+
+
+def test_two_keyed_hosts_on_one_address_with_different_keys_are_not_flagged():
+    # Keys decide: a different key is a different machine (or a stale entry).
+    known = parse_known_hosts(f"192.168.4.115 ssh-ed25519 {KEY_A}\nold-box ssh-ed25519 {KEY_B}\n")
+
+    candidates = gather_candidates(
+        aliases=[],
+        known=known,
+        resolve=_resolver(),
+        addresses=_addresses({"old-box": {"192.168.4.115"}}),
+    )
+
+    assert all(c.probable == [] for c in candidates)
+
+
+def test_address_shared_with_an_inventory_host_is_flagged_not_dropped():
+    known = parse_known_hosts(f"mini.local ssh-ed25519 {KEY_A}\n")
+
+    candidates = gather_candidates(
+        aliases=[],
+        known=known,
+        resolve=_resolver(),
+        existing={"mini.local": {"transport": "ssh"}},
+        mdns=[MdnsService("Other name", "other.local")],
+        addresses=_addresses({"mini.local": {"10.0.0.5"}, "other.local": {"10.0.0.5"}}),
+    )
+
+    (other,) = candidates
+    assert other.name == "other.local"
+    (partner,) = other.probable
+    assert partner.name == "mini.local"
+    assert partner.in_inventory
+    assert partner.keys == frozenset({KEY_A})
+
+
+def test_loopback_addresses_never_make_a_match():
+    candidates = gather_candidates(
+        aliases=["a", "b"],
+        known=[],
+        resolve=_resolver(),
+        addresses=_addresses({"a": {"127.0.1.1", "::1"}, "b": {"127.0.1.1", "::1"}}),
+    )
+
+    assert all(c.probable == [] for c in candidates)
+
+
+def test_an_ip_literal_is_its_own_address():
+    known = parse_known_hosts(f"10.0.0.7 ssh-ed25519 {KEY_A}\n")
+
+    candidates = gather_candidates(
+        aliases=["newbox"],
+        known=known,
+        resolve=_resolver(),
+        addresses=_addresses({"newbox": {"10.0.0.7"}}),
+    )
+
+    newbox = next(c for c in candidates if c.name == "newbox")
+    assert [p.name for p in newbox.probable] == ["10.0.0.7"]
+
+
+def test_listing_labels_probable_duplicates(tmp_path):
+    known = parse_known_hosts(f"192.168.4.115 ssh-ed25519 {KEY_A}\n")
+    candidates = gather_candidates(
+        aliases=[],
+        known=known,
+        resolve=_resolver(),
+        existing={"inv-box": {"transport": "ssh"}},
+        mdns=[MdnsService("Mini", "Mini.local"), MdnsService("Twin", "twin.local")],
+        addresses=_addresses(
+            {"mini.local": {"192.168.4.115"}, "twin.local": {"10.1.1.1"}, "inv-box": {"10.1.1.1"}}
+        ),
+    )
+
+    text = "\n".join(describe(candidates, tmp_path))
+
+    assert "(= 192.168.4.115?)" in text
+    assert "(= inv-box in the inventory?)" in text
+    assert "host keys decide" in text
+
+
+def test_resolve_addresses_runs_in_parallel_and_gives_up_at_the_deadline():
+    def lookup(name):
+        if name == "slow":
+            time.sleep(2)
+        return {"10.0.0.1"} if name == "fast" else set()
+
+    started = time.monotonic()
+    found = resolve_addresses(["fast", "slow", "fast", "10.9.9.9"], lookup, timeout_s=0.5)
+
+    assert time.monotonic() - started < 3
+    assert found == {"fast": frozenset({"10.0.0.1"})}
+
+
+def test_resolve_addresses_survives_a_failing_lookup():
+    def lookup(name):
+        raise OSError("no such host")
+
+    assert resolve_addresses(["x"], lookup, timeout_s=1) == {}
+
+
+def test_default_lookup_strips_ipv6_scope_and_ignores_failures(monkeypatch):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host == "bad":
+            raise socket.gaierror("nope")
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1%en0", 0, 0, 4)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.4.115", 0)),
+        ]
+
+    monkeypatch.setattr(ssh_discovery_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert default_lookup("box") == {"fe80::1", "192.168.4.115"}
+    assert default_lookup("bad") == set()
+
+
 # --- selection ---------------------------------------------------------------
 
 
@@ -606,6 +764,8 @@ class Session:
         self.outcomes: dict[str, dict[bool, list[ClientRelevanceResult]]] = {}
         self.mdns: list[MdnsService] = []
         self.browse_windows: list[float] = []
+        self.addresses: dict[str, set[str]] = {}
+        self.looked_up: list[str] = []
 
     def ask(self, prompt: str) -> str:
         self.prompts.append(prompt)
@@ -622,6 +782,10 @@ class Session:
     def browse(self, window_s: float) -> list[MdnsService]:
         self.browse_windows.append(window_s)
         return list(self.mdns)
+
+    def lookup(self, name: str) -> set[str]:
+        self.looked_up.append(name)
+        return self.addresses.get(name.lower(), set())
 
     def keyscan(self, hostname: str, port: int) -> list[tuple[str, str]]:
         self.scanned.append((hostname, port))
@@ -646,6 +810,7 @@ class Session:
             self_keys=set(),
             self_names=set(),
             browse=self.browse,
+            lookup=self.lookup,
             **kwargs,
         )
 
@@ -864,3 +1029,89 @@ def test_a_failing_browse_is_not_fatal(tmp_path):
 
     assert session.run() == []
     assert "alpha" in session.output
+
+
+# --- after selection: host keys confirm or reject probable duplicates -------
+
+
+def test_picked_probable_duplicate_of_an_inventory_host_is_skipped_when_keys_match(tmp_path):
+    session = Session(tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1"])
+    session.inventory.parent.mkdir()
+    session.inventory.write_text('[hosts."mini.local"]\ntransport = "ssh"\n', encoding="utf-8")
+    session.mdns = [MdnsService("Mini again", "mini2.local")]
+    session.addresses = {"mini.local": {"10.0.0.5"}, "mini2.local": {"10.0.0.5"}}
+    session.scan_keys["mini2.local"] = [("ssh-ed25519", KEY_A)]
+
+    assert session.run() == []
+    assert session.probed == []
+    assert "mini.local" in session.output
+    assert "same machine" in session.output
+    known = (session.ssh_dir / "known_hosts").read_text(encoding="utf-8")
+    assert "mini2.local" not in known
+
+
+def test_picked_probable_duplicate_with_a_different_key_warns_and_carries_on(tmp_path):
+    session = Session(tmp_path, known=f"192.168.4.115 ssh-ed25519 {KEY_A}\n", answers=["2"])
+    session.mdns = [MdnsService("Mini", "mini.local")]
+    session.addresses = {"mini.local": {"192.168.4.115"}}
+    session.scan_keys["mini.local"] = [("ssh-ed25519", KEY_B)]
+
+    assert session.run() == ["mini.local"]
+    assert "different host key" in session.output
+    known = (session.ssh_dir / "known_hosts").read_text(encoding="utf-8")
+    assert f"mini.local ssh-ed25519 {KEY_B}" in known
+
+
+def test_two_picked_probable_duplicates_with_matching_keys_add_only_the_first(tmp_path):
+    session = Session(tmp_path, known=f"192.168.4.115 ssh-ed25519 {KEY_A}\n", answers=["all"])
+    session.mdns = [MdnsService("Mini", "mini.local")]
+    session.addresses = {"mini.local": {"192.168.4.115"}}
+    session.scan_keys["mini.local"] = [("ssh-ed25519", KEY_A)]
+
+    assert session.run() == ["192.168.4.115"]
+    assert [name for name, _ in session.probed] == ["192.168.4.115"]
+    assert "same machine" in session.output
+
+
+def test_two_keyless_probable_duplicates_are_compared_by_their_scanned_keys(tmp_path):
+    session = Session(tmp_path, config="Host one\nHost two\n", answers=["all"])
+    session.addresses = {"one": {"10.0.0.9"}, "two": {"10.0.0.9"}}
+    session.scan_keys["one"] = [("ssh-ed25519", KEY_C)]
+    session.scan_keys["two"] = [("ssh-ed25519", KEY_C)]
+
+    assert session.run() == ["one"]
+    known = (session.ssh_dir / "known_hosts").read_text(encoding="utf-8")
+    assert "two" not in known
+
+
+def test_unpicked_partner_without_a_key_cannot_confirm_and_is_said_so(tmp_path):
+    # Keyed candidate picked; its keyless partner isn't, so nothing to compare.
+    session = Session(tmp_path, known=f"192.168.4.115 ssh-ed25519 {KEY_A}\n", answers=["1"])
+    session.mdns = [MdnsService("Mini", "mini.local")]
+    session.addresses = {"mini.local": {"192.168.4.115"}}
+
+    assert session.run() == ["192.168.4.115"]
+    assert session.scanned == []  # the unpicked partner is never contacted
+    assert "could not confirm" in session.output
+
+
+def test_addresses_of_file_hosts_are_looked_up_while_mdns_browses(tmp_path):
+    session = Session(tmp_path, known=f"alpha ssh-ed25519 {KEY_A}\n")
+    looking = threading.Event()
+    overlapped: list[bool] = []
+    plain_lookup = session.lookup
+
+    def lookup(name):
+        looking.set()
+        return plain_lookup(name)
+
+    def browse(window_s):
+        overlapped.append(looking.wait(timeout=5))
+        return []
+
+    session.lookup = lookup  # type: ignore[method-assign]
+    session.browse = browse  # type: ignore[method-assign]
+
+    session.run()
+
+    assert overlapped == [True]

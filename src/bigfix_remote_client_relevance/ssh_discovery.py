@@ -29,6 +29,15 @@ merged by host key: two names whose ``known_hosts`` keys overlap are the same
 machine, whatever address each was reached by. Hosts already in the inventory
 and this machine itself are dropped the same way.
 
+When keys can't decide -- one side has none, typically a host heard only
+over mDNS -- two candidates (or a candidate and an inventory host) whose
+addresses overlap are listed as *probable* duplicates, never merged
+silently: an IP and a ``.local`` name may be one machine, but a multi-homed
+host or a reused DHCP lease can fool an address match. Once picked, host
+keys decide: the same key as an inventory host or an earlier pick means the
+same machine, so it's skipped; a different key gets a warning and the host
+is kept separate.
+
 A picked host with no key in ``known_hosts`` would always fail the test --
 the SSH transport (asyncssh) verifies host keys and never prompts -- so the
 list says that picking it also accepts its key. After selection its key is
@@ -64,7 +73,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -99,6 +108,10 @@ MDNS_WINDOW_S = 5.0
 MDNS_LOOKUP_S = 3.0
 MDNS_SERVICE_TYPES = ("_ssh._tcp", "_sftp-ssh._tcp")
 
+# getaddrinfo, for spotting one machine under two names. Run in parallel;
+# a name that hasn't answered by then just has no addresses.
+ADDRESS_TIMEOUT_S = 3.0
+
 SOURCE_CONFIG = "ssh config"
 SOURCE_KNOWN_HOSTS = "known_hosts"
 SOURCE_MDNS = "mDNS"
@@ -130,6 +143,7 @@ GIT_HOSTS = frozenset(
 
 Resolver = Callable[[str], "Resolved"]
 KeyScanner = Callable[[str, int], list[tuple[str, str]]]
+AddressLookup = Callable[[str], Collection[str]]
 Browser = Callable[[float], list["MdnsService"]]
 
 
@@ -169,6 +183,15 @@ class Resolved:
         return (self.hostkeyalias or self.hostname).lower()
 
 
+@dataclass(frozen=True)
+class Probable:
+    """Another host sharing an address with a candidate: maybe the same machine."""
+
+    name: str
+    keys: frozenset[str]
+    in_inventory: bool = False
+
+
 @dataclass
 class SSHCandidate:
     """One machine offered for selection, possibly under several names."""
@@ -180,6 +203,9 @@ class SSHCandidate:
     keys: frozenset[str] = frozenset()
     label: str | None = None
     """The mDNS display name, when the machine advertised itself."""
+    addresses: frozenset[str] = frozenset()
+    probable: list[Probable] = field(default_factory=list)
+    """Hosts sharing an address where keys can't settle it; checked once picked."""
 
     @property
     def needs_host_key(self) -> bool:
@@ -571,6 +597,77 @@ def _browse_result(browsing: Future[list[MdnsService]] | None) -> list[MdnsServi
         return []
 
 
+# --- addresses -------------------------------------------------------------
+
+
+def _usable_address(address: str) -> str | None:
+    """``address`` without an IPv6 ``%scope``, or None for loopback and junk.
+
+    Loopback never identifies a machine: Debian maps its own name to
+    127.0.1.1, so every such host would "match" every other.
+    """
+    address = address.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    if ip.is_loopback or ip.is_unspecified:
+        return None
+    return str(ip)
+
+
+def default_lookup(name: str) -> set[str]:
+    """``name``'s addresses via getaddrinfo (``.local`` included where supported)."""
+    try:
+        infos = socket.getaddrinfo(name, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError) as exc:
+        logger.debug("no addresses for %s: %s", name, exc)
+        return set()
+    return {address for *_, sockaddr in infos if (address := _usable_address(str(sockaddr[0])))}
+
+
+class _AddressLookups:
+    """Lookups started early and collected later, under one deadline.
+
+    The pool is never waited on: a lookup stuck in the resolver is left to
+    finish on its own rather than holding discovery up.
+    """
+
+    def __init__(self, lookup: AddressLookup) -> None:
+        self._lookup = lookup
+        self._pool = ThreadPoolExecutor(max_workers=16)
+        self._futures: dict[str, Future[Collection[str]]] = {}
+
+    def start(self, names: Iterable[str]) -> None:
+        for name in names:
+            key = name.lower()
+            if key and key not in self._futures and not _is_ip(key):
+                self._futures[key] = self._pool.submit(self._lookup, name)
+
+    def collect(self, timeout_s: float) -> dict[str, frozenset[str]]:
+        done, _ = wait(self._futures.values(), timeout=timeout_s)
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        found = {}
+        for key, future in self._futures.items():
+            if future not in done or future.exception() is not None:
+                continue
+            addresses = frozenset(
+                usable for address in future.result() if (usable := _usable_address(address))
+            )
+            if addresses:
+                found[key] = addresses
+        return found
+
+
+def resolve_addresses(
+    names: Iterable[str], lookup: AddressLookup, *, timeout_s: float = ADDRESS_TIMEOUT_S
+) -> dict[str, frozenset[str]]:
+    """Each name's addresses (keyed lowercase), looked up in parallel."""
+    lookups = _AddressLookups(lookup)
+    lookups.start(names)
+    return lookups.collect(timeout_s)
+
+
 # --- candidates ------------------------------------------------------------
 
 
@@ -591,6 +688,7 @@ class _Entry:
     keys: set[str]
     names: set[tuple[str, int]]
     label: str | None = None
+    addresses: set[str] = field(default_factory=set)
 
 
 def _key_index(known: Iterable[KnownHost]) -> dict[tuple[str, int], set[str]]:
@@ -611,6 +709,31 @@ def _entry(
     keys = set(index.get((resolved.key_name, resolved.port), ()))
     names = {(name.lower(), resolved.port), (resolved.hostname.lower(), resolved.port)}
     return _Entry(name, source, order, resolved, keys, names)
+
+
+def _addresses_of(entry: _Entry, table: Mapping[str, Collection[str]]) -> set[str]:
+    found = set(entry.addresses)
+    for name, _ in entry.names:
+        if _is_ip(name):
+            if usable := _usable_address(name):
+                found.add(usable)
+        else:
+            found |= {a for a in map(_usable_address, table.get(name, ())) if a}
+    return found
+
+
+def _link_probable(
+    candidates: Sequence[SSHCandidate], inventory: Sequence[tuple[str, _Entry]]
+) -> None:
+    """Note address overlaps that host keys can't settle (one side has none)."""
+    for i, one in enumerate(candidates):
+        for other in candidates[i + 1 :]:
+            if one.addresses & other.addresses and not (one.keys and other.keys):
+                one.probable.append(Probable(other.name, other.keys))
+                other.probable.append(Probable(one.name, one.keys))
+        for name, entry in inventory:
+            if one.addresses & entry.addresses and not (one.keys and entry.keys):
+                one.probable.append(Probable(name, frozenset(entry.keys), in_inventory=True))
 
 
 def _groups(entries: list[_Entry]) -> list[list[_Entry]]:
@@ -641,8 +764,13 @@ def gather_candidates(
     self_keys: Collection[str] = (),
     self_names: Collection[str] = (),
     mdns: Sequence[MdnsService] = (),
+    addresses: Mapping[str, Collection[str]] | None = None,
 ) -> list[SSHCandidate]:
-    """One candidate per machine not already in ``existing`` and not this one."""
+    """One candidate per machine not already in ``existing`` and not this one.
+
+    ``addresses`` (names lowercased, as :func:`resolve_addresses` gives them)
+    turns on the probable-duplicate check; without it there is none.
+    """
     index = _key_index(known)
     entries = [_entry(alias, SOURCE_CONFIG, i, resolve, index) for i, alias in enumerate(aliases)]
     hosts = dict.fromkeys(
@@ -658,16 +786,23 @@ def gather_candidates(
             continue
         entry = _entry(service.host, SOURCE_MDNS, len(entries), resolve, index)
         entry.label = service.label
+        entry.addresses = {a for a in map(_usable_address, service.addresses) if a}
         entries.append(entry)
 
     taken_keys = set(self_keys)
     taken_names = {(name.lower(), DEFAULT_SSH_PORT) for name in (*self_names, *_ALWAYS_SELF)}
+    inventory: list[tuple[str, _Entry]] = []
     for name, config in (existing or {}).items():
         if str(config.get("transport", "ssh")) != "ssh":
             continue
         known_entry = _entry(name, "inventory", -1, resolve, index)
         taken_keys |= known_entry.keys
         taken_names |= known_entry.names
+        inventory.append((name, known_entry))
+
+    table = addresses or {}
+    for entry in [*entries, *(e for _, e in inventory)]:
+        entry.addresses = _addresses_of(entry, table)
 
     candidates = []
     for group in _groups(entries):
@@ -693,10 +828,13 @@ def gather_candidates(
                 also=list(dict.fromkeys(also)),
                 keys=frozenset(keys),
                 label=next((e.label for e in group if e.label), None),
+                addresses=frozenset(set().union(*(e.addresses for e in group))),
             )
         )
     # By source, then named hosts before bare IPs; stable within each.
-    return sorted(candidates, key=lambda c: (_SOURCE_RANK[c.source], _is_ip(c.name)))
+    candidates.sort(key=lambda c: (_SOURCE_RANK[c.source], _is_ip(c.name)))
+    _link_probable(candidates, inventory)
+    return candidates
 
 
 # --- the interactive bits --------------------------------------------------
@@ -738,12 +876,21 @@ def describe(candidates: Sequence[SSHCandidate], ssh_dir: Path) -> list[str]:
             lines.append(f"  {headers[source]}")
         label = f'  "{candidate.label}"' if candidate.label else ""
         also = f"  (also {', '.join(candidate.also)})" if candidate.also else ""
-        lines.append(f"  {number:>3}. {candidate.name}{label}{also}")
+        maybe = "".join(
+            f"  (= {p.name}{' in the inventory' if p.in_inventory else ''}?)"
+            for p in candidate.probable
+        )
+        lines.append(f"  {number:>3}. {candidate.name}{label}{also}{maybe}")
         if candidate.needs_host_key:
             lines.append(
                 "       no host key in known_hosts yet: picking it also accepts its key, "
                 f"fetched with ssh-keyscan and added to {known_hosts}"
             )
+    if any(candidate.probable for candidate in candidates):
+        lines.append(
+            "  (= X?): shares an address with X, so probably the same machine; "
+            "if picked, host keys decide and a duplicate is skipped"
+        )
     return lines
 
 
@@ -794,23 +941,25 @@ def _append_known_hosts(path: Path, lines: Sequence[str]) -> None:
         handle.write(prefix + "".join(f"{line}\n" for line in lines))
 
 
-def _accept_host_key(
-    candidate: SSHCandidate,
-    keyscan: KeyScanner,
-    known_hosts: Path,
-    tell: Callable[[str], None],
-) -> bool:
+def _fetch_host_keys(candidate: SSHCandidate, keyscan: KeyScanner) -> list[tuple[str, str, str]]:
+    """``(keytype, key, fingerprint)`` for each key the host presents."""
     resolved = candidate.resolved
-    keys = keyscan(resolved.hostname, resolved.port)
     valid = []
-    for keytype, key in keys:
+    for keytype, key in keyscan(resolved.hostname, resolved.port):
         try:
             valid.append((keytype, key, fingerprint(key)))
         except (binascii.Error, ValueError):
             logger.debug("ssh-keyscan %s: unreadable key %r", resolved.hostname, key)
-    if not valid:
-        tell(f"{candidate.name}: could not fetch its host key with ssh-keyscan; not tested")
-        return False
+    return valid
+
+
+def _record_host_keys(
+    candidate: SSHCandidate,
+    valid: Sequence[tuple[str, str, str]],
+    known_hosts: Path,
+    tell: Callable[[str], None],
+) -> None:
+    resolved = candidate.resolved
     _append_known_hosts(
         known_hosts,
         [
@@ -820,7 +969,83 @@ def _accept_host_key(
     )
     for keytype, _, print_ in valid:
         tell(f"{candidate.name}: added {keytype} {print_} to {known_hosts}")
-    return True
+
+
+def _is_duplicate(
+    candidate: SSHCandidate,
+    keys: frozenset[str],
+    kept: Mapping[str, frozenset[str]],
+    pending: Collection[str],
+    tell: Callable[[str], None],
+) -> bool:
+    """Settle ``candidate``'s probable duplicates by host key; True to skip it.
+
+    ``kept`` is each pick already accepted, by the keys it presented;
+    ``pending`` the picks still to come, which do their own comparing.
+    """
+    for partner in candidate.probable:
+        theirs = kept.get(partner.name, partner.keys)
+        if not theirs:
+            if partner.name not in pending:
+                tell(
+                    f"{candidate.name}: could not confirm whether it's the same machine as "
+                    f"{partner.name} (no host key to compare); treating it as a different one"
+                )
+            continue
+        if keys & theirs:
+            if partner.in_inventory:
+                tell(
+                    f"{candidate.name}: same machine as {partner.name}, already in the "
+                    "inventory (host keys match); skipped"
+                )
+                return True
+            if partner.name in kept:
+                tell(
+                    f"{candidate.name}: same machine as {partner.name}, picked above "
+                    "(host keys match); skipped"
+                )
+                return True
+            tell(f"{candidate.name}: same machine as {partner.name} (host keys match)")
+            continue
+        tell(
+            f"warning: {candidate.name} presents a different host key than "
+            f"{partner.name}, which shares its address -- a different machine, or "
+            f"{partner.name}'s key has changed; keeping them separate"
+        )
+    return False
+
+
+def _confirm_picks(
+    picked: Sequence[SSHCandidate],
+    keyscan: KeyScanner,
+    known_hosts: Path,
+    tell: Callable[[str], None],
+) -> list[SSHCandidate]:
+    """The picks to test: keys fetched where missing, duplicates dropped.
+
+    Only picked hosts are ever contacted (by ssh-keyscan), and a host's key
+    is written to known_hosts only once it's certain to be tested.
+    """
+    kept: dict[str, frozenset[str]] = {}
+    pending = {candidate.name for candidate in picked}
+    ready = []
+    for candidate in picked:
+        pending.discard(candidate.name)
+        fetched: list[tuple[str, str, str]] = []
+        keys = candidate.keys
+        if candidate.needs_host_key:
+            fetched = _fetch_host_keys(candidate, keyscan)
+            if not fetched:
+                tell(f"{candidate.name}: could not fetch its host key with ssh-keyscan; not tested")
+                continue
+            keys = frozenset(key for _, key, _ in fetched)
+        if _is_duplicate(candidate, keys, kept, pending, tell):
+            continue
+        if fetched:
+            _record_host_keys(candidate, fetched, known_hosts, tell)
+        kept[candidate.name] = keys
+        ready.append(candidate)
+    return ready
 
 
 async def _probe(
@@ -860,6 +1085,8 @@ def run_ssh_discovery(
     self_names: Collection[str] | None = None,
     browse: Browser | None = None,
     mdns_window_s: float = MDNS_WINDOW_S,
+    lookup: AddressLookup | None = None,
+    address_timeout_s: float = ADDRESS_TIMEOUT_S,
 ) -> list[str]:
     """List SSH hosts, test the ones picked, add the working ones to ``path``.
 
@@ -872,6 +1099,10 @@ def run_ssh_discovery(
     ssh_dir = ssh_dir if ssh_dir is not None else Path.home() / ".ssh"
     # Cached: each name is resolved ahead of the mDNS wait, then reused.
     resolve = functools.cache(resolve or default_resolver)
+    lookups = _AddressLookups(lookup or default_lookup)
+    inventory_ssh = [
+        name for name, config in existing.items() if str(config.get("transport", "ssh")) == "ssh"
+    ]
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         browsing = (
@@ -881,9 +1112,16 @@ def run_ssh_discovery(
         known = _read_known_hosts(ssh_dir)
         # The slow part of the files (one ssh -G each) runs while the browse
         # is still collecting, so its window adds little or nothing.
-        for name in dict.fromkeys([*aliases, *(entry.host for entry in known)]):
+        file_names = list(dict.fromkeys([*aliases, *(entry.host for entry in known)]))
+        for name in [*file_names, *inventory_ssh]:
             resolve(name)
+        # Address lookups start now too, for the same reason.
+        lookups.start(
+            [*file_names, *inventory_ssh, *(resolve(n).hostname for n in aliases + inventory_ssh)]
+        )
         mdns = _browse_result(browsing)
+    lookups.start(service.host for service in mdns)
+    addresses = lookups.collect(address_timeout_s)
 
     candidates = gather_candidates(
         aliases=aliases,
@@ -893,6 +1131,7 @@ def run_ssh_discovery(
         self_keys=default_self_keys() if self_keys is None else self_keys,
         self_names=default_self_names() if self_names is None else self_names,
         mdns=mdns,
+        addresses=addresses,
     )
     if not candidates:
         tell(f"no SSH hosts found that aren't already in {path}")
@@ -904,13 +1143,7 @@ def run_ssh_discovery(
     if not picked:
         return []
 
-    keyscan = keyscan or default_keyscan
-    ready = [
-        candidate
-        for candidate in picked
-        if not candidate.needs_host_key
-        or _accept_host_key(candidate, keyscan, ssh_dir / "known_hosts", tell)
-    ]
+    ready = _confirm_picks(picked, keyscan or default_keyscan, ssh_dir / "known_hosts", tell)
 
     async def probe_all() -> dict[str, dict[str, Any]]:
         entries = await asyncio.gather(
@@ -929,9 +1162,11 @@ __all__ = [
     "GIT_HOSTS",
     "KnownHost",
     "MdnsService",
+    "Probable",
     "Resolved",
     "SSHCandidate",
     "default_browse",
+    "default_lookup",
     "describe",
     "fingerprint",
     "gather_candidates",
@@ -943,5 +1178,6 @@ __all__ = [
     "parse_selection",
     "parse_ssh_g",
     "read_config_aliases",
+    "resolve_addresses",
     "run_ssh_discovery",
 ]
