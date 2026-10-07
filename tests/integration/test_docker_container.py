@@ -156,6 +156,46 @@ async def test_provisions_a_real_qna_version_into_ubuntu(tmp_path):
 
 @pytest.mark.skipif(
     os.environ.get("BFRCR_NETWORK_TESTS") != "1",
+    reason="needs a real qna artifact; set BFRCR_NETWORK_TESTS=1 to download one",
+)
+async def test_multiline_relevance_is_one_expression_to_a_real_qna(tmp_path):
+    """Regression for #46: qna's stdin reads one question per line, so a
+    multi-line expression used to come back as answer-from-line-1 plus a parse
+    error from line 2. A newline inside a string must keep its value too."""
+    from functools import partial
+
+    from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        artifact_for,
+        resolve_version_spec,
+    )
+
+    version = resolve_version_spec("11.0")
+    ref = artifact_for(version, platform="ubuntu", arch="x86_64")
+    resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
+    transport = TransportContainer(
+        IMAGE,
+        engine=DockerEngine(),
+        target="ubuntu",
+        extractor=partial(ensure_extracted, cache_dir=tmp_path / "cache"),
+    )
+
+    joined = await transport.evaluate_client_relevance(
+        "true\nAND false", qna=resolved, timeout_s=300.0
+    )
+    in_string = await transport.evaluate_client_relevance(
+        'length of "a\r\nb"', qna=resolved, timeout_s=300.0
+    )
+
+    assert joined.error is None
+    assert joined.answers == ["False"]
+    assert in_string.error is None
+    assert in_string.answers == ["4"]
+
+
+@pytest.mark.skipif(
+    os.environ.get("BFRCR_NETWORK_TESTS") != "1",
     reason="needs a real qna artifact and package downloads; set BFRCR_NETWORK_TESTS=1",
 )
 async def test_a_minimal_rpm_image_gets_its_missing_library_installed(tmp_path):

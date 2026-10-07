@@ -141,6 +141,21 @@ async def test_client_relevance_is_piped_on_stdin():
     assert eval_calls[0].input == "version of client\n", "Q: prefix must be stripped for stdin"
 
 
+async def test_multiline_client_relevance_is_piped_as_one_line():
+    runner = FakeSSHRunner(
+        responses=[
+            (r"-x |command -v", ("/opt/BESClient/bin/qna\n", "", 0)),
+            (r"-showtypes", qna_ok()),
+        ]
+    )
+
+    await make_transport(runner).evaluate_client_relevance("true\nAND false")
+
+    eval_calls = [c for c in runner.calls if "-showtypes" in c.command]
+    assert eval_calls, "no eval command issued"
+    assert eval_calls[0].input == "true AND false\n"
+
+
 async def test_explicit_qna_path_skips_discovery():
     runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
 

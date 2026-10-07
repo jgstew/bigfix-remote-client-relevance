@@ -276,3 +276,17 @@ async def test_base_url_is_required():
         pass
     else:
         raise AssertionError("expected ValueError for empty base_url")
+
+
+async def test_multiline_relevance_is_posted_unchanged():
+    """The hosted evaluator takes JSON, not qna stdin, and was checked live to
+    evaluate ``"true\\nAND false"`` as one expression (False). So no joining
+    is applied there; pin that the payload goes out as given (#46)."""
+    session = FakeSession(queue=[ok_response(answers=["False"], result_type="boolean", time_ms=1)])
+    transport = TransportOnlineEvaluator("https://developer.bigfix.com", session=session)
+
+    result = await transport.evaluate_client_relevance("true\nAND false")
+
+    assert result.answers == ["False"]
+    _url, body, _timeout = session.calls[0]
+    assert body == {"relevance": "true\nAND false"}

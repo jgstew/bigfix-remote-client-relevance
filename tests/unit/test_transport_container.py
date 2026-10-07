@@ -288,6 +288,16 @@ async def test_client_relevance_piped_with_q_prefix_stripped():
     assert engine.one_shots[0]["input"] == "version of client\n"
 
 
+async def test_multiline_client_relevance_piped_as_one_line():
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance(
+        "true\nAND false"
+    )
+
+    assert engine.one_shots[0]["input"] == "true AND false\n"
+
+
 async def test_eval_command_uses_t_and_showtypes():
     engine = FakeEngine(responses=[EVAL_OK])
 

@@ -27,6 +27,7 @@ from bigfix_remote_client_relevance.transports.local import (
     TransportLocal,
     classify_qna_outcome,
     dmi_unavailable,
+    normalize_stdin_payload,
     sudo_privilege_problem,
 )
 
@@ -94,6 +95,65 @@ async def test_existing_trailing_newline_not_doubled(fake_qna):
     await TransportLocal().evaluate_client_relevance("version of client\n", qna_path=stub.path)
 
     assert stub.stdin_text == "version of client\n"
+
+
+# --- multi-line relevance is joined onto one qna stdin line (#46) ------------
+# qna's stdin mode reads one question per line, but BigFix treats newlines in
+# relevance as whitespace, so a multi-line expression must arrive as one line.
+
+
+@pytest.mark.parametrize(
+    ("client_relevance", "expected"),
+    [
+        ("true\nAND false", "true AND false\n"),
+        ("a\r\nb", "a b\n"),
+        ("a\rb", "a b\n"),
+        ("Q: true\nAND false", "true AND false\n"),
+        ("true\n", "true\n"),
+        ("true\r\n", "true\n"),
+        # Comments are /* ... */ only, so joining cannot comment out the rest.
+        ("true /* a\nb */ AND false", "true /* a b */ AND false\n"),
+        # A newline inside a string literal is percent-escaped: qna decodes
+        # %0a/%0d back to the same characters, so the string's value is kept.
+        ('length of "a\nb"', 'length of "a%0ab"\n'),
+        ('length of "a\r\nb"', 'length of "a%0d%0ab"\n'),
+        ('"x"\n= "a\nb"', '"x" = "a%0ab"\n'),
+        # Unterminated string: joined as-is (escaped), qna reports the error.
+        ('"abc\ndef', '"abc%0adef\n'),
+    ],
+)
+def test_normalize_stdin_payload_joins_lines(client_relevance, expected):
+    assert normalize_stdin_payload(client_relevance) == expected
+
+
+def test_normalize_stdin_payload_handles_indented_continuations():
+    payload = normalize_stdin_payload('exists file "x"\n\n    whose (size of it > 0)\n\n')
+
+    assert payload.count("\n") == 1
+    assert payload.endswith("\n")
+    assert payload.startswith('exists file "x"')
+    assert "whose (size of it > 0)" in payload
+
+
+def test_normalize_stdin_payload_is_always_exactly_one_line():
+    import random
+
+    rng = random.Random(46)
+    alphabet = ['"', "\n", "\r", " ", "a", "/", "*", "%", "Q", ":"]
+    for _ in range(2000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 20)))
+        payload = normalize_stdin_payload(text)
+        assert payload.count("\n") == 1, repr(text)
+        assert payload.endswith("\n"), repr(text)
+        assert "\r" not in payload, repr(text)
+
+
+async def test_multiline_relevance_reaches_qna_as_one_line(fake_qna):
+    stub = fake_qna(stdout="A: False\n")
+
+    await TransportLocal().evaluate_client_relevance("true\nAND false", qna_path=stub.path)
+
+    assert stub.stdin_text == "true AND false\n"
 
 
 async def test_stdin_is_utf8_encoded(fake_qna):

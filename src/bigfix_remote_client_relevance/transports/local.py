@@ -51,13 +51,40 @@ def normalize_stdin_payload(client_relevance: str) -> str:
 
     qna's file mode requires a ``Q: `` prefix and its stdin mode rejects one, so
     the prefix is stripped here. A trailing newline terminates the question.
+
+    qna's stdin mode also reads one question per line, while BigFix treats
+    newlines in relevance as whitespace, so a multi-line expression is joined
+    onto one line: each ``\\r\\n``/``\\r``/``\\n`` outside a string literal
+    becomes a space. Inside a string literal a raw newline is part of the
+    string's value, so it is percent-escaped (``%0d``/``%0a``), which qna
+    decodes back to the same characters. Comments are ``/* ... */`` only, so
+    joining cannot comment out the rest of an expression. An unterminated
+    string is left for qna to report.
     """
     # API boundary: qna's CLI vocabulary uses "relevance"; internal name stays
     # `client_relevance`.
-    payload = client_relevance.removeprefix("Q: ")
-    if not payload.endswith("\n"):
-        payload += "\n"
-    return payload
+    text = client_relevance.removeprefix("Q: ").rstrip("\r\n")
+    parts: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            # No backslash escapes in relevance (a quote is written %22), so
+            # the next quote always ends the string.
+            in_string = not in_string
+            parts.append(char)
+        elif char in "\r\n":
+            if in_string:
+                parts.append("%0d" if char == "\r" else "%0a")
+            else:
+                if char == "\r" and text.startswith("\n", i + 1):
+                    i += 1
+                parts.append(" ")
+        else:
+            parts.append(char)
+        i += 1
+    return "".join(parts) + "\n"
 
 
 class LocalRunner:

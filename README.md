@@ -66,6 +66,11 @@ bigfix-remote-client-relevance --inventory remote_clients.toml -f probe.rel --js
 `--json` writes one document per (target × version) to stdout; logs go to
 stderr, so piping into `jq` always works.
 
+Client relevance may span several lines (as `<Relevance>` bodies in real
+content often do); it is evaluated as one expression, with line breaks
+treated as whitespace. A line break inside a string literal is kept as part
+of the string (sent to qna as `%0a`/`%0d`, which qna decodes back).
+
 If no target is given at all — no `--local`, `--container`, `--inventory`,
 or `HOST` — a `remote_clients.toml` is searched for automatically, current
 directory first, then `~/.bigfix/`, then the platform's all-users config
