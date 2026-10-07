@@ -1,0 +1,13 @@
+Browsing for _ssh._tcp.local.
+DATE: ---Wed 07 Oct 2026---
+14:27:36.398  ...STARTING...
+Timestamp     A/R    Flags  if Domain               Service Type         Instance Name
+14:27:36.399  Add        3  16 local.               _ssh._tcp.           THIS-MAC (796)
+14:27:36.399  Add        3  16 local.               _ssh._tcp.           build-box
+14:27:36.399  Add        3  16 local.               _ssh._tcp.           Alex’s Mac mini
+14:27:36.399  Add        2  16 local.               _ssh._tcp.           Alex’s iMac
+14:27:36.571  Add        3   1 local.               _ssh._tcp.           THIS-MAC (796)
+14:27:36.571  Add        3  20 local.               _ssh._tcp.           THIS-MAC (796)
+14:27:36.571  Add        2  15 local.               _ssh._tcp.           THIS-MAC (796)
+14:27:37.002  Add        2  16 local.               _ssh._tcp.           gone-box
+14:27:38.104  Rmv        0  16 local.               _ssh._tcp.           gone-box

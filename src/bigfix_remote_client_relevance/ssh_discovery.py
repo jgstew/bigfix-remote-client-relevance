@@ -4,13 +4,22 @@ SSH targets are other people's machines: even a failed login can raise a
 login alert, an MFA prompt or a lockout. So nothing is contacted until the
 user has picked it from a list, and nothing is written that didn't work.
 
-Candidates come only from files -- nothing is connected to while gathering:
+Nothing is connected to while gathering candidates:
 
 * ``~/.ssh/config`` ``Host`` aliases (wildcards and negations skipped,
   ``Include`` followed).
 * ``~/.ssh/known_hosts`` names (hashed entries are unreadable and skipped;
   entries on a port other than 22 are left out, since the inventory has no
   ``port`` and only a config alias can reach them).
+* mDNS / DNS-SD: hosts that advertise ``_ssh._tcp`` or ``_sftp-ssh._tcp``
+  (macOS Remote Login does) on the local network -- ``dns-sd`` on macOS,
+  ``avahi-browse`` on Linux, skipped on Windows or when the tool is missing.
+  A single standard query that only hears hosts which chose to advertise;
+  no scanning. The browse starts first and collects for a few seconds while
+  the files are read and resolved, so its wait overlaps that work. Its
+  display names (``Alex's Mac mini``) are looked up to real host names
+  (``Alexs-Mac-mini.local``), and this machine, which may advertise itself,
+  is dropped like any other.
 
 Public git hosting (``github.com``, ``gitlab.com``, ... -- see ``GIT_HOSTS``)
 is never offered, under any name or address that shares its key.
@@ -39,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 import glob
 import hashlib
 import hmac
@@ -46,11 +56,15 @@ import ipaddress
 import logging
 import os
 import re
+import selectors
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -78,6 +92,19 @@ SSH_PROBE_TIMEOUT_S = 120.0
 
 DEFAULT_SSH_PORT = 22
 
+# How long the mDNS browse collects. Adverts nearly all arrive within half a
+# second; the odd _sftp-ssh record takes a few.
+MDNS_WINDOW_S = 5.0
+# Per-name lookup of a display name to its host; answers are near-instant.
+MDNS_LOOKUP_S = 3.0
+MDNS_SERVICE_TYPES = ("_ssh._tcp", "_sftp-ssh._tcp")
+
+SOURCE_CONFIG = "ssh config"
+SOURCE_KNOWN_HOSTS = "known_hosts"
+SOURCE_MDNS = "mDNS"
+# Listing order, and which source's name wins when one machine has several.
+_SOURCE_RANK = {SOURCE_CONFIG: 0, SOURCE_KNOWN_HOSTS: 1, SOURCE_MDNS: 2}
+
 _ALWAYS_SELF = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # Public git hosting: in nearly everyone's known_hosts, never a BigFix client.
@@ -103,6 +130,7 @@ GIT_HOSTS = frozenset(
 
 Resolver = Callable[[str], "Resolved"]
 KeyScanner = Callable[[str, int], list[tuple[str, str]]]
+Browser = Callable[[float], list["MdnsService"]]
 
 
 @dataclass(frozen=True)
@@ -113,6 +141,16 @@ class KnownHost:
     port: int
     keytype: str
     key: str
+
+
+@dataclass(frozen=True)
+class MdnsService:
+    """One SSH service heard over mDNS: its display label and real host."""
+
+    label: str
+    host: str
+    port: int = DEFAULT_SSH_PORT
+    addresses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +178,8 @@ class SSHCandidate:
     resolved: Resolved
     also: list[str] = field(default_factory=list)
     keys: frozenset[str] = frozenset()
+    label: str | None = None
+    """The mDNS display name, when the machine advertised itself."""
 
     @property
     def needs_host_key(self) -> bool:
@@ -334,6 +374,203 @@ def default_self_names() -> set[str]:
     return names
 
 
+# --- mDNS ------------------------------------------------------------------
+
+
+def _run_for(
+    args: Sequence[str], seconds: float, until: Callable[[str], bool] | None = None
+) -> str:
+    """Run ``args`` for at most ``seconds`` and return its stdout.
+
+    For commands that never exit on their own (``dns-sd``): stopped at the
+    deadline, or as soon as ``until`` is satisfied by what has been read.
+    A missing program is just no output. POSIX only (pipes in a selector).
+    """
+    try:
+        process = subprocess.Popen(
+            list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError as exc:
+        logger.debug("could not run %s: %s", args[0], exc)
+        return ""
+    assert process.stdout is not None
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + seconds
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while (remaining := deadline - time.monotonic()) > 0:
+                if not selector.select(remaining):
+                    break
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if until is not None and until(b"".join(chunks).decode("utf-8", "replace")):
+                    break
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        # Whatever a buffered writer flushed on its way out.
+        chunks.append(process.stdout.read())
+        process.stdout.close()
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+_DNS_SD_EVENT = re.compile(r"^\S+\s+(Add|Rmv)\s+\d+\s+(\d+)\s+\S+\s+\S+\s+(.*\S)\s*$")
+_DNS_SD_REACHED = re.compile(r"can be reached at (\S+):(\d+)")
+
+
+def parse_dns_sd_browse(text: str) -> list[str]:
+    """Display names still advertised at the end of ``dns-sd -B`` output.
+
+    Each name is listed once per network interface; it counts as present
+    while any interface still has it.
+    """
+    interfaces: dict[str, set[str]] = {}
+    for line in text.splitlines():
+        match = _DNS_SD_EVENT.match(line)
+        if not match:
+            continue
+        event, interface, name = match.groups()
+        if event == "Add":
+            interfaces.setdefault(name, set()).add(interface)
+        elif name in interfaces:
+            interfaces[name].discard(interface)
+    return [name for name, present in interfaces.items() if present]
+
+
+def parse_dns_sd_lookup(text: str) -> tuple[str, int] | None:
+    """The host and port from ``dns-sd -L`` output, or None before it answers."""
+    match = _DNS_SD_REACHED.search(text)
+    if not match:
+        return None
+    return match.group(1).rstrip("."), int(match.group(2))
+
+
+def _avahi_unescape(text: str) -> str:
+    """Undo avahi-browse's ``\\DDD`` (decimal byte) and ``\\x`` escapes."""
+    out = bytearray()
+    i = 0
+    while i < len(text):
+        digits = text[i + 1 : i + 4]
+        if text[i] == "\\" and len(digits) == 3 and digits.isdigit() and int(digits) < 256:
+            out.append(int(digits))
+            i += 4
+        elif text[i] == "\\" and i + 1 < len(text):
+            out += text[i + 1].encode()
+            i += 2
+        else:
+            out += text[i].encode()
+            i += 1
+    return out.decode("utf-8", "replace")
+
+
+def parse_avahi_browse(text: str) -> list[MdnsService]:
+    """Resolved (``=``) services from ``avahi-browse -rpt``, one per host and port."""
+    services: dict[tuple[str, str, int], list[str]] = {}
+    for line in text.splitlines():
+        fields = line.split(";")
+        if len(fields) < 9 or fields[0] != "=":
+            continue
+        try:
+            port = int(fields[8])
+        except ValueError:
+            continue
+        key = (_avahi_unescape(fields[3]), fields[6].rstrip("."), port)
+        addresses = services.setdefault(key, [])
+        if fields[7] and fields[7] not in addresses:
+            addresses.append(fields[7])
+    return [
+        MdnsService(label, host, port, tuple(addresses))
+        for (label, host, port), addresses in services.items()
+    ]
+
+
+def _unique(services: Iterable[MdnsService]) -> list[MdnsService]:
+    return list(dict.fromkeys(services))
+
+
+def _browse_dns_sd(window_s: float) -> list[MdnsService]:
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        browses = list(
+            pool.map(
+                lambda kind: _run_for(["dns-sd", "-B", kind, "local."], window_s),
+                MDNS_SERVICE_TYPES,
+            )
+        )
+        names = list(
+            dict.fromkeys(
+                (name, kind)
+                for kind, text in zip(MDNS_SERVICE_TYPES, browses, strict=True)
+                for name in parse_dns_sd_browse(text)
+            )
+        )
+
+        def lookup(item: tuple[str, str]) -> tuple[str, int] | None:
+            name, kind = item
+            return parse_dns_sd_lookup(
+                _run_for(
+                    ["dns-sd", "-L", name, kind, "local."],
+                    MDNS_LOOKUP_S,
+                    until=lambda out: parse_dns_sd_lookup(out) is not None,
+                )
+            )
+
+        answers = list(pool.map(lookup, names))
+    services = []
+    for (name, _), answer in zip(names, answers, strict=True):
+        if answer is None:
+            logger.debug("mDNS: no host for %r", name)
+            continue
+        services.append(MdnsService(name, *answer))
+    return _unique(services)
+
+
+def _browse_avahi(window_s: float) -> list[MdnsService]:
+    # -t ends the browse by itself once the cache is dumped; the window is
+    # only a backstop.
+    with ThreadPoolExecutor(max_workers=len(MDNS_SERVICE_TYPES)) as pool:
+        texts = list(
+            pool.map(
+                lambda kind: _run_for(["avahi-browse", "-rpt", kind], window_s),
+                MDNS_SERVICE_TYPES,
+            )
+        )
+    return _unique(service for text in texts for service in parse_avahi_browse(text))
+
+
+def default_browse(window_s: float) -> list[MdnsService]:
+    """SSH services advertised on the local network, or none where unsupported."""
+    if sys.platform == "darwin":
+        if shutil.which("dns-sd"):
+            return _browse_dns_sd(window_s)
+        logger.debug("mDNS: dns-sd not found; skipping")
+    elif sys.platform.startswith("linux"):
+        if shutil.which("avahi-browse"):
+            return _browse_avahi(window_s)
+        logger.debug("mDNS: avahi-browse not found (install avahi-utils); skipping")
+    else:
+        # Windows' OpenSSH server doesn't advertise itself anyway.
+        logger.debug("mDNS: not supported on %s; skipping", sys.platform)
+    return []
+
+
+def _browse_result(browsing: Future[list[MdnsService]] | None) -> list[MdnsService]:
+    if browsing is None:
+        return []
+    try:
+        return browsing.result()
+    except Exception as exc:  # noqa: BLE001 -- an optional source must never end discovery
+        logger.info("mDNS browse failed, continuing without it: %s", exc)
+        return []
+
+
 # --- candidates ------------------------------------------------------------
 
 
@@ -353,6 +590,7 @@ class _Entry:
     resolved: Resolved
     keys: set[str]
     names: set[tuple[str, int]]
+    label: str | None = None
 
 
 def _key_index(known: Iterable[KnownHost]) -> dict[tuple[str, int], set[str]]:
@@ -391,7 +629,7 @@ def _groups(entries: list[_Entry]) -> list[list[_Entry]]:
 
 def _representative(group: list[_Entry]) -> _Entry:
     # A config alias is a name the user chose; otherwise a name beats an IP.
-    return min(group, key=lambda e: (e.source != "ssh config", _is_ip(e.name), e.order))
+    return min(group, key=lambda e: (e.source != SOURCE_CONFIG, _is_ip(e.name), e.order))
 
 
 def gather_candidates(
@@ -402,17 +640,25 @@ def gather_candidates(
     existing: Mapping[str, Mapping[str, Any]] | None = None,
     self_keys: Collection[str] = (),
     self_names: Collection[str] = (),
+    mdns: Sequence[MdnsService] = (),
 ) -> list[SSHCandidate]:
     """One candidate per machine not already in ``existing`` and not this one."""
     index = _key_index(known)
-    entries = [_entry(alias, "ssh config", i, resolve, index) for i, alias in enumerate(aliases)]
+    entries = [_entry(alias, SOURCE_CONFIG, i, resolve, index) for i, alias in enumerate(aliases)]
     hosts = dict.fromkeys(
         entry.host for entry in known if entry.port == DEFAULT_SSH_PORT and entry.host
     )
     entries += [
-        _entry(host, "known_hosts", len(aliases) + i, resolve, index)
+        _entry(host, SOURCE_KNOWN_HOSTS, len(entries) + i, resolve, index)
         for i, host in enumerate(hosts)
     ]
+    for service in mdns:
+        if service.port != DEFAULT_SSH_PORT:
+            logger.debug("mDNS: skipping %s on port %d", service.host, service.port)
+            continue
+        entry = _entry(service.host, SOURCE_MDNS, len(entries), resolve, index)
+        entry.label = service.label
+        entries.append(entry)
 
     taken_keys = set(self_keys)
     taken_names = {(name.lower(), DEFAULT_SSH_PORT) for name in (*self_names, *_ALWAYS_SELF)}
@@ -434,7 +680,11 @@ def gather_candidates(
             logger.debug("ssh discovery: skipping git hosting %s", [e.name for e in group])
             continue
         chosen = _representative(group)
-        also = [e.name for e in sorted(group, key=lambda e: e.order) if e is not chosen]
+        also = [
+            e.name
+            for e in sorted(group, key=lambda e: e.order)
+            if e.name.lower() != chosen.name.lower()
+        ]
         candidates.append(
             SSHCandidate(
                 name=chosen.name,
@@ -442,10 +692,11 @@ def gather_candidates(
                 resolved=chosen.resolved,
                 also=list(dict.fromkeys(also)),
                 keys=frozenset(keys),
+                label=next((e.label for e in group if e.label), None),
             )
         )
-    # Config aliases first, then named hosts, then bare IPs; stable within each.
-    return sorted(candidates, key=lambda c: (c.source != "ssh config", _is_ip(c.name)))
+    # By source, then named hosts before bare IPs; stable within each.
+    return sorted(candidates, key=lambda c: (_SOURCE_RANK[c.source], _is_ip(c.name)))
 
 
 # --- the interactive bits --------------------------------------------------
@@ -475,13 +726,19 @@ def describe(candidates: Sequence[SSHCandidate], ssh_dir: Path) -> list[str]:
     """The numbered list, grouped by where each host came from."""
     known_hosts = ssh_dir / "known_hosts"
     lines = ["SSH hosts found (none of them has been contacted):"]
+    headers = {
+        SOURCE_CONFIG: f"from {ssh_dir / 'config'}:",
+        SOURCE_KNOWN_HOSTS: f"from {known_hosts}:",
+        SOURCE_MDNS: "advertised on the local network (mDNS):",
+    }
     source = None
     for number, candidate in enumerate(candidates, 1):
         if candidate.source != source:
             source = candidate.source
-            lines.append(f"  from {ssh_dir / ('config' if source == 'ssh config' else source)}:")
+            lines.append(f"  {headers[source]}")
+        label = f'  "{candidate.label}"' if candidate.label else ""
         also = f"  (also {', '.join(candidate.also)})" if candidate.also else ""
-        lines.append(f"  {number:>3}. {candidate.name}{also}")
+        lines.append(f"  {number:>3}. {candidate.name}{label}{also}")
         if candidate.needs_host_key:
             lines.append(
                 "       no host key in known_hosts yet: picking it also accepts its key, "
@@ -601,26 +858,44 @@ def run_ssh_discovery(
     evaluate: Evaluator | None = None,
     self_keys: Collection[str] | None = None,
     self_names: Collection[str] | None = None,
+    browse: Browser | None = None,
+    mdns_window_s: float = MDNS_WINDOW_S,
 ) -> list[str]:
     """List SSH hosts, test the ones picked, add the working ones to ``path``.
 
     ``ask`` shows a prompt and returns the reply (raising EOFError for no
-    reply); ``tell`` shows a line. Returns the inventory names added.
+    reply); ``tell`` shows a line. ``mdns_window_s`` of 0 skips mDNS.
+    Returns the inventory names added.
     """
     ensure_writable(path)
     defaults, existing = read_existing(path)
     ssh_dir = ssh_dir if ssh_dir is not None else Path.home() / ".ssh"
+    # Cached: each name is resolved ahead of the mDNS wait, then reused.
+    resolve = functools.cache(resolve or default_resolver)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        browsing = (
+            pool.submit(browse or default_browse, mdns_window_s) if mdns_window_s > 0 else None
+        )
+        aliases = read_config_aliases(ssh_dir / "config")
+        known = _read_known_hosts(ssh_dir)
+        # The slow part of the files (one ssh -G each) runs while the browse
+        # is still collecting, so its window adds little or nothing.
+        for name in dict.fromkeys([*aliases, *(entry.host for entry in known)]):
+            resolve(name)
+        mdns = _browse_result(browsing)
 
     candidates = gather_candidates(
-        aliases=read_config_aliases(ssh_dir / "config"),
-        known=_read_known_hosts(ssh_dir),
-        resolve=resolve or default_resolver,
+        aliases=aliases,
+        known=known,
+        resolve=resolve,
         existing=existing,
         self_keys=default_self_keys() if self_keys is None else self_keys,
         self_names=default_self_names() if self_names is None else self_names,
+        mdns=mdns,
     )
     if not candidates:
-        tell(f"no SSH hosts found in {ssh_dir} that aren't already in {path}")
+        tell(f"no SSH hosts found that aren't already in {path}")
         return []
 
     for line in describe(candidates, ssh_dir):
@@ -653,12 +928,17 @@ def run_ssh_discovery(
 __all__ = [
     "GIT_HOSTS",
     "KnownHost",
+    "MdnsService",
     "Resolved",
     "SSHCandidate",
+    "default_browse",
     "describe",
     "fingerprint",
     "gather_candidates",
     "known_hosts_line",
+    "parse_avahi_browse",
+    "parse_dns_sd_browse",
+    "parse_dns_sd_lookup",
     "parse_known_hosts",
     "parse_selection",
     "parse_ssh_g",

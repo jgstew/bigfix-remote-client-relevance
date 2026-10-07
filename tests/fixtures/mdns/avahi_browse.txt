@@ -1,0 +1,8 @@
++;eth0;IPv6;build-box;SSH Remote Terminal;local
++;eth0;IPv4;build-box;SSH Remote Terminal;local
++;eth0;IPv4;Alex\226\128\153s\032Mac\032mini;SSH Remote Terminal;local
++;eth0;IPv4;odd\059\032name\.v2;SSH Remote Terminal;local
+=;eth0;IPv6;build-box;SSH Remote Terminal;local;build-box.local;fe80::1234:5678:9abc:def0;22;
+=;eth0;IPv4;build-box;SSH Remote Terminal;local;build-box.local;192.168.4.20;22;
+=;eth0;IPv4;Alex\226\128\153s\032Mac\032mini;SSH Remote Terminal;local;Alexs-Mac-mini.local;192.168.4.115;22;
+=;eth0;IPv4;odd\059\032name\.v2;SSH Remote Terminal;local;odd-port.local;192.168.4.30;2222;

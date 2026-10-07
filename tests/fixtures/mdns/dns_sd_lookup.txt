@@ -1,0 +1,5 @@
+Lookup Alex’s Mac mini._ssh._tcp.local.
+DATE: ---Wed 07 Oct 2026---
+14:27:42.136  ...STARTING...
+14:27:42.137  Alex’s\032Mac\032mini._ssh._tcp.local. can be reached at Alexs-Mac-mini.local.:22 (interface 16) Flags: 1
+14:27:42.137  Alex’s\032Mac\032mini._ssh._tcp.local. can be reached at Alexs-Mac-mini.local.:22 (interface 15)
