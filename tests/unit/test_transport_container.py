@@ -1383,8 +1383,10 @@ class FakeDockerClient:
         existing: dict[str, FakeImage] | None = None,
         *,
         pull_result: FakeImage | None = None,
+        host_platform: tuple[str, str] = ("linux", "amd64"),
     ) -> None:
         self.images = self
+        self._host_platform = host_platform
         self._existing = dict(existing or {})
         self.pulled: list[dict[str, object]] = []
         self._pull_result = pull_result or FakeImage(attrs={"Os": "linux", "Architecture": "amd64"})
@@ -1429,6 +1431,10 @@ class FakeDockerClient:
 
     def ping(self) -> bool:
         return True
+
+    def version(self) -> dict[str, object]:
+        os_name, arch = self._host_platform
+        return {"Os": os_name, "Arch": arch}
 
 
 def engine_with(client: object):
@@ -1554,6 +1560,31 @@ async def test_ensure_image_does_not_trust_a_wrong_architecture_alias():
     assert _image_attrs(client.get(resolved)) == {"Os": "linux", "Architecture": "amd64"}, (
         "a wrong-architecture alias must be re-resolved, never returned as-is"
     )
+
+
+async def test_ensure_image_trusts_an_alias_reporting_the_daemons_native_arch():
+    """Docker Desktop's containerd image store tags the whole multi-arch
+    index, so an amd64 alias on an arm64 host inspects as arm64 -- the
+    host's default -- even though the amd64 content is right there. That
+    must not trigger a re-pull on every run."""
+    client = FakeDockerClient(
+        pull_result=FakeImage(attrs={"Os": "linux", "Architecture": "amd64"}),
+        host_platform=("linux", "arm64"),
+    )
+    engine = engine_with(client)
+    amd64_tag = await engine.ensure_image("ubuntu:26.04", platform="linux/amd64")
+    # What the containerd store reports on the next run, for the alias and
+    # the upstream tag alike: both name the same index, inspected as arm64.
+    index_view = FakeImage(attrs={"Os": "linux", "Architecture": "arm64"})
+    client._existing[amd64_tag] = index_view
+    client._existing["ubuntu:26.04"] = index_view
+    client.pulled.clear()
+
+    # A fresh engine, as on the next CLI invocation.
+    resolved = await engine_with(client).ensure_image("ubuntu:26.04", platform="linux/amd64")
+
+    assert resolved == amd64_tag
+    assert client.pulled == [], "an alias reporting the daemon's native arch must not be re-pulled"
 
 
 # --- transient daemon faults are retried, not fatal --------------------------

@@ -446,6 +446,9 @@ class DockerEngine:
         # local alias tag -> (upstream image, platform) it was made from, so
         # start() can re-pull an alias whose content turns out to be stale.
         self._alias_sources: dict[str, tuple[str, str]] = {}
+        # The daemon's own (os, arch), looked up once; see _daemon_platform.
+        self._daemon_platform_cache: tuple[str, str] | None = None
+        self._daemon_platform_known = False
 
     def _connect(self, urls: list[str], tried: list[str]) -> object | None:
         """The first URL that answers, or ``None``."""
@@ -566,6 +569,19 @@ class DockerEngine:
             logger.info("pulled image %s", image)
         return image
 
+    def _daemon_platform(self) -> tuple[str, str] | None:
+        """The daemon's native ``(os, arch)``, or ``None`` if it won't say."""
+        if not self._daemon_platform_known:
+            try:
+                info = self._get_client().version()  # type: ignore[attr-defined]
+                os_name, arch = info.get("Os"), info.get("Arch")
+                if os_name and arch:
+                    self._daemon_platform_cache = (str(os_name), str(arch))
+            except Exception as exc:  # noqa: BLE001 - only loosens a check
+                logger.debug("could not read the daemon's platform: %s", exc)
+            self._daemon_platform_known = True
+        return self._daemon_platform_cache
+
     def _ensure_aliased(self, image: str, platform: str | None, local_tag: str) -> str:
         import docker.errors
 
@@ -584,9 +600,15 @@ class DockerEngine:
                 # to _guard's retry rather than triggering a needless pull.
                 return None
 
-        # The alias this run (or an earlier one) already created.
+        # The alias this run (or an earlier one) already created. Reporting
+        # the daemon's own platform is also fine: Docker Desktop's containerd
+        # image store tags the whole multi-arch index, which inspects as the
+        # host's arch even when it was pulled (and is used) for another --
+        # and start() re-pulls via _repull_alias if that content is missing.
         found = _lookup(local_tag)
-        if found is not None and _usable(found):
+        if found is not None and (
+            _usable(found) or _image_platform(found) == self._daemon_platform()
+        ):
             return local_tag
         if found is not None:
             # Keyed deterministically by (image, platform), so this should
