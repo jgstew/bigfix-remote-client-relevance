@@ -417,7 +417,8 @@ def evaluate(
                 "aren't in ~/.bigfix/remote_clients.toml yet, ask which to try, "
                 "and add each picked one that works. Nothing is contacted before "
                 "it's picked; picking a host with no known host key also accepts "
-                "its key into ~/.ssh/known_hosts. Needs a terminal."
+                "its key into ~/.ssh/known_hosts. A refused login asks which "
+                "username to use. Needs a terminal."
             ),
         ),
     ] = False,

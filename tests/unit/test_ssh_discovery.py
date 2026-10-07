@@ -793,6 +793,9 @@ class Session:
         self.browse_windows: list[float] = []
         self.addresses: dict[str, set[str]] = {}
         self.looked_up: list[str] = []
+        # host -> the only username it accepts; any other login is refused
+        self.accounts: dict[str, str] = {}
+        self.logins: list[tuple[str, str | None]] = []
 
     def ask(self, prompt: str) -> str:
         self.prompts.append(prompt)
@@ -822,6 +825,22 @@ class Session:
         (target,) = targets
         become = bool(target.become)
         self.probed.append((target.name, become))
+        self.logins.append((target.name, target.user))
+        account = self.accounts.get(target.name)
+        if account is not None and target.user != account:
+            user = target.user or "jamesstewart"
+            return [
+                ClientRelevanceResult(
+                    host=target.name,
+                    transport="ssh",
+                    client_relevance=client_relevance,
+                    error=(
+                        f"{target.name}: could not connect to {target.name}: "
+                        f"Permission denied for user {user} on host {target.name}"
+                    ),
+                    error_kind=ERROR_KIND_TRANSPORT,
+                )
+            ]
         default = [_ok(target.name)]
         return self.outcomes.get(target.name, {}).get(become, default)
 
@@ -1142,3 +1161,136 @@ def test_addresses_of_file_hosts_are_looked_up_while_mdns_browses(tmp_path):
     session.run()
 
     assert overlapped == [True]
+
+
+# --- a refused login asks which username to use ------------------------------
+
+
+def test_refused_login_asks_for_a_username_and_writes_it(tmp_path):
+    session = Session(tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1", "jgstew"])
+    session.accounts["mini.local"] = "jgstew"
+
+    assert session.run() == ["mini.local"]
+    assert session.logins == [("mini.local", None), ("mini.local", "jgstew")]
+    assert "mini.local" in session.prompts[1]
+    assert "Permission denied" in session.output
+    assert session.hosts() == {"mini.local": {"transport": "ssh", "user": "jgstew"}}
+
+
+def test_username_given_still_falls_back_to_become(tmp_path):
+    # The Mac mini case: wrong user, then right user but qna needs root.
+    session = Session(tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1", "jgstew"])
+    session.accounts["mini.local"] = "jgstew"
+    plain_evaluate = session.evaluate
+
+    async def evaluate(client_relevance, targets, **kwargs):
+        (target,) = targets
+        if target.user == "jgstew" and not target.become:
+            session.probed.append((target.name, False))
+            return [_failed(target.name, ERROR_KIND_QNA)]
+        return await plain_evaluate(client_relevance, targets, **kwargs)
+
+    session.evaluate = evaluate  # type: ignore[method-assign]
+
+    assert session.run() == ["mini.local"]
+    assert session.hosts() == {"mini.local": {"transport": "ssh", "user": "jgstew", "become": True}}
+
+
+def test_blank_username_skips_the_host(tmp_path):
+    session = Session(tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1", ""])
+    session.accounts["mini.local"] = "jgstew"
+
+    assert session.run() == []
+    assert session.logins == [("mini.local", None)]
+    assert "skipped" in session.output
+
+
+def test_eof_at_the_username_prompt_skips_the_host(tmp_path):
+    session = Session(tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1"])
+    session.accounts["mini.local"] = "jgstew"
+
+    assert session.run() == []
+    assert session.logins == [("mini.local", None)]
+
+
+def test_a_wrong_username_asks_again(tmp_path):
+    session = Session(
+        tmp_path, known=f"mini.local ssh-ed25519 {KEY_A}\n", answers=["1", "jgstw", "jgstew"]
+    )
+    session.accounts["mini.local"] = "jgstew"
+
+    assert session.run() == ["mini.local"]
+    assert session.logins == [
+        ("mini.local", None),
+        ("mini.local", "jgstw"),
+        ("mini.local", "jgstew"),
+    ]
+    assert len(session.prompts) == 3
+
+
+def test_each_refused_host_is_asked_about_in_turn(tmp_path):
+    session = Session(
+        tmp_path,
+        known=f"alpha ssh-ed25519 {KEY_A}\nbeta ssh-ed25519 {KEY_B}\n",
+        answers=["all", "ann", "bob"],
+    )
+    session.accounts.update(alpha="ann", beta="bob")
+
+    assert session.run() == ["alpha", "beta"]
+    assert session.hosts() == {
+        "alpha": {"transport": "ssh", "user": "ann"},
+        "beta": {"transport": "ssh", "user": "bob"},
+    }
+
+
+def test_a_failure_other_than_a_refused_login_does_not_ask(tmp_path):
+    session = Session(tmp_path, known=f"gone ssh-ed25519 {KEY_A}\n", answers=["1", "never-used"])
+    session.outcomes["gone"] = {False: [_failed("gone", ERROR_KIND_TRANSPORT)]}
+
+    assert session.run() == []
+    assert len(session.prompts) == 1
+
+
+def test_previous_username_is_the_default_for_the_next_refused_host(tmp_path):
+    session = Session(
+        tmp_path,
+        known=f"alpha ssh-ed25519 {KEY_A}\nbeta ssh-ed25519 {KEY_B}\n",
+        answers=["all", "jgstew", ""],  # Enter at beta's prompt takes the default
+    )
+    session.accounts.update(alpha="jgstew", beta="jgstew")
+
+    assert session.run() == ["alpha", "beta"]
+    assert "[jgstew]" in session.prompts[2]
+    assert ("beta", "jgstew") in session.logins
+    assert session.hosts()["beta"] == {"transport": "ssh", "user": "jgstew"}
+
+
+def test_default_refused_on_a_host_drops_it_so_blank_skips(tmp_path):
+    session = Session(
+        tmp_path,
+        known=f"alpha ssh-ed25519 {KEY_A}\nbeta ssh-ed25519 {KEY_B}\n",
+        answers=["all", "ann", "", ""],  # beta: Enter tries ann (refused), then blank skips
+    )
+    session.accounts.update(alpha="ann", beta="bob")
+
+    assert session.run() == ["alpha"]
+    assert [login for login in session.logins if login[0] == "beta"] == [
+        ("beta", None),
+        ("beta", "ann"),
+    ]
+    assert "[ann]" in session.prompts[2]
+    assert "[ann]" not in session.prompts[3]
+    assert "blank to skip" in session.prompts[3]
+
+
+def test_a_new_name_that_works_becomes_the_next_default(tmp_path):
+    session = Session(
+        tmp_path,
+        known=f"alpha ssh-ed25519 {KEY_A}\nbeta ssh-ed25519 {KEY_B}\ngamma ssh-ed25519 {KEY_C}\n",
+        answers=["all", "ann", "bob", ""],
+    )
+    session.accounts.update(alpha="ann", beta="bob", gamma="bob")
+
+    assert session.run() == ["alpha", "beta", "gamma"]
+    assert "[bob]" in session.prompts[3]
+    assert session.hosts()["gamma"] == {"transport": "ssh", "user": "bob"}

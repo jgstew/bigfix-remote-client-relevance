@@ -48,6 +48,11 @@ Each picked host is tested as-is first; when that fails for any reason but
 not connecting (e.g. macOS, where qna needs root), it is tried again with
 ``become`` (``sudo -n``, so never a password prompt).
 
+A refused login (``Permission denied``) asks which username to use and
+tests again; the last name typed is offered as the default for the next
+refused host, and a blank answer skips once that default has been refused
+there too. No username is ever guessed.
+
 The library never prints: prompts and the list go through the caller's
 ``ask``/``tell``, which the CLI sends to stderr.
 """
@@ -1079,28 +1084,89 @@ def _confirm_picks(
     return ready
 
 
+def _login_refused(error: str | None) -> bool:
+    # asyncssh's PermissionDenied ("Permission denied for user X on host Y"),
+    # which the SSH transport passes through in its connection error.
+    return bool(error) and "Permission denied" in str(error)
+
+
 async def _probe(
     name: str,
     defaults: Mapping[str, Any],
     path: Path,
     evaluate: Evaluator,
     tell: Callable[[str], None],
-) -> dict[str, Any] | None:
-    """The entry that works for ``name`` -- as-is, else with become -- or None."""
+    user: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """``(entry, None)`` when ``name`` works -- as-is, else with become.
+
+    ``(None, error)`` when the login was refused, so the caller can ask for a
+    username instead of giving up; ``(None, None)`` for any other failure.
+    """
+    base: dict[str, Any] = {"transport": "ssh"}
+    if user:
+        base["user"] = user
     reason = "no result"
-    for entry in ({"transport": "ssh"}, {"transport": "ssh", "become": True}):
+    for entry in (base, {**base, "become": True}):
         target = _target_from_entry(name, dict(entry), dict(defaults), path)
         results = await evaluate(PROBE_RELEVANCE, [target], timeout_s=SSH_PROBE_TIMEOUT_S)
         if results and all(r.error_kind is None for r in results):
-            tell(f"{name}: works{' with become' if entry.get('become') else ''}")
-            return entry
+            as_user = f" as {user}" if user else ""
+            tell(f"{name}: works{as_user}{' with become' if entry.get('become') else ''}")
+            return entry, None
         failed = next((r for r in results if r.error_kind is not None), None)
         if failed is None or failed.error_kind == ERROR_KIND_TRANSPORT:
             reason = failed.error if failed is not None and failed.error else reason
+            if _login_refused(reason):
+                return None, reason
             break
         reason = failed.error or failed.error_kind or reason
     tell(f"{name}: did not work ({reason})")
-    return None
+    return None, None
+
+
+def _retry_as_user(
+    name: str,
+    refusal: str,
+    remembered: str | None,
+    probe: Callable[[str], tuple[dict[str, Any] | None, str | None]],
+    ask: Callable[[str], str],
+    tell: Callable[[str], None],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Ask which username to log in to ``name`` as, until one works or the user skips.
+
+    The last name typed (``remembered``) is offered as the default, so Enter
+    reuses it. Once a name is refused on this host it is never offered again
+    here, and with no default left a blank answer skips the host. Returns the
+    working entry (or None) and the name to remember for the next host.
+    Nothing is guessed: every login attempt is one the user asked for.
+    """
+    tell(f"{name}: login refused ({refusal})")
+    offered = remembered
+    refused: set[str] = set()
+    while True:
+        prompt = (
+            f"Username for {name} [{offered}]: "
+            if offered
+            else f"Username for {name} (blank to skip): "
+        )
+        try:
+            answer = ask(prompt).strip()
+        except EOFError:
+            answer = ""
+            offered = None
+        if answer:
+            remembered = answer
+        user = answer or offered
+        if not user:
+            tell(f"{name}: skipped")
+            return None, remembered
+        entry, refusal_again = probe(user)
+        if entry is not None or refusal_again is None:
+            return entry, remembered
+        tell(f"{name}: login as {user} refused")
+        refused.add(user)
+        offered = offered if offered not in refused else None
 
 
 def run_ssh_discovery(
@@ -1176,16 +1242,29 @@ def run_ssh_discovery(
 
     ready = _confirm_picks(picked, keyscan or default_keyscan, ssh_dir / "known_hosts", tell)
 
-    async def probe_all() -> dict[str, dict[str, Any]]:
-        entries = await asyncio.gather(
-            *(
-                _probe(c.name, defaults, path, evaluate or evaluate_client_relevance, tell)
-                for c in ready
-            )
-        )
-        return {c.name: entry for c, entry in zip(ready, entries, strict=True) if entry is not None}
+    run_probe = evaluate or evaluate_client_relevance
 
-    found = asyncio.run(probe_all()) if ready else {}
+    async def probe_all() -> list[tuple[dict[str, Any] | None, str | None]]:
+        return await asyncio.gather(
+            *(_probe(c.name, defaults, path, run_probe, tell) for c in ready)
+        )
+
+    # Every pick is tried at once; only refused logins then come back, one
+    # at a time, for a username -- prompts can't interleave with each other.
+    found: dict[str, dict[str, Any]] = {}
+    remembered: str | None = None
+    for candidate, (entry, refusal) in zip(
+        ready, asyncio.run(probe_all()) if ready else [], strict=True
+    ):
+        if entry is None and refusal is not None:
+            name = candidate.name
+
+            def probe_as(user: str, name: str = name) -> tuple[dict[str, Any] | None, str | None]:
+                return asyncio.run(_probe(name, defaults, path, run_probe, tell, user=user))
+
+            entry, remembered = _retry_as_user(name, refusal, remembered, probe_as, ask, tell)
+        if entry is not None:
+            found[candidate.name] = entry
     return write_discovered(path, found)
 
 
