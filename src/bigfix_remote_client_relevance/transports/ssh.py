@@ -52,6 +52,7 @@ from bigfix_remote_client_relevance.transports.local import (
     classify_qna_outcome,
     normalize_stdin_payload,
     sudo_privilege_problem,
+    sudoers_advice,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,9 @@ class TransportSSH:
                 protection against interception.
         """
         self.host = host
+        # Only for advice text (the sudoers rule); None when ssh config or the
+        # local username will decide the login, which this class never sees.
+        self._user = user
         self._become = become
         # `target` and `platform` both name a bootstrap spec; `target` wins.
         self._target = target or platform
@@ -351,9 +355,21 @@ class TransportSSH:
         # overridden, and `self._become` means qna's own stderr can never be
         # mistaken for sudo's.
         if self._become and error_kind == ERROR_KIND_QNA:
-            privilege = sudo_privilege_problem(stderr)
+            privilege = sudo_privilege_problem(stderr, qna_path=qna_path, user=self._user)
             if privilege is not None:
                 error, error_kind = privilege, ERROR_KIND_BOOTSTRAP
+
+        # A non-root qna on macOS aborts instead of answering (see
+        # TransportLocal._macos_root_problem). Local refuses before spawning;
+        # here the login's euid is unknown without another round trip, so the
+        # crash keeps its kind and its text and only gains the likely fix.
+        # ERROR_KIND_QNA excludes an E: line, which proves qna ran fine.
+        if not self._become and spec.name == "macos" and error_kind == ERROR_KIND_QNA:
+            error = (
+                f"{error}; qna requires root on macOS and aborts without it, so unless "
+                "this login is root, rerun with --become (needs passwordless sudo on "
+                f"{self.host}; {sudoers_advice(qna_path, self._user)})"
+            )
 
         return _result(
             answers=parsed.answers,

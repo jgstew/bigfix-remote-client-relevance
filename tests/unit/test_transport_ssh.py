@@ -419,6 +419,28 @@ async def test_sudo_password_refusal_is_a_bootstrap_error_not_a_qna_error():
     assert "nopasswd" in (result.error or "").lower()
 
 
+async def test_sudo_refusal_names_the_remote_qna_path_in_a_sudoers_rule():
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", ("", "sudo: a password is required\n", 1))])
+
+    result = await make_transport(runner, become=True, user="admin").evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert "admin ALL=(root) NOPASSWD: /opt/qna" in (result.error or "")
+
+
+async def test_sudo_rule_uses_a_placeholder_when_the_login_is_unknown():
+    """With no --user the login comes from ssh config or the local name, which
+    this transport never sees -- a guessed name would paste in wrong."""
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", ("", "sudo: a password is required\n", 1))])
+
+    result = await make_transport(runner, become=True).evaluate_client_relevance(
+        "true", qna_path="/opt/qna"
+    )
+
+    assert "<user> ALL=(root) NOPASSWD: /opt/qna" in (result.error or "")
+
+
 async def test_sudo_refusal_keeps_the_original_sudo_line():
     runner = FakeSSHRunner(
         responses=[(r"^sudo -n", ("", "sudo: user is not in the sudoers file.\n", 1))]
@@ -458,6 +480,71 @@ async def test_sudo_stderr_is_ignored_without_become():
     result = await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
 
     assert result.error_kind == ERROR_KIND_QNA
+
+
+# Verbatim shape of a non-root qna on macOS: no A:/E: lines, just libc++'s
+# abort. See TransportLocal._macos_root_problem for the local pre-flight.
+MACOS_NON_ROOT_CRASH = (
+    "",
+    "libc++abi: terminating due to uncaught exception of type FileIOError\n",
+    134,
+)
+
+
+async def test_macos_qna_crash_without_become_suggests_become():
+    """Over SSH the login's euid is unknown without a round trip, so instead of
+    a pre-flight refusal the crash itself gets the hint appended."""
+    runner = FakeSSHRunner(responses=[(r"-showtypes", MACOS_NON_ROOT_CRASH)])
+
+    result = await make_transport(runner, platform="macos", user="admin").evaluate_client_relevance(
+        "true", qna_path="/opt/QnA"
+    )
+
+    error = result.error or ""
+    assert result.error_kind == ERROR_KIND_QNA
+    assert "FileIOError" in error, "the original crash must survive"
+    assert "--become" in error
+    assert "admin ALL=(root) NOPASSWD: /opt/QnA" in error
+
+
+async def test_macos_hint_warns_when_the_rule_targets_tmp():
+    runner = FakeSSHRunner(responses=[(r"-showtypes", MACOS_NON_ROOT_CRASH)])
+
+    result = await make_transport(runner, platform="macos").evaluate_client_relevance(
+        "true", qna_path="/tmp/bigfix_qna/11.0.7.61/BESAgent.app/Contents/MacOS/QnA"
+    )
+
+    assert "under /tmp" in (result.error or "")
+
+
+async def test_macos_hint_is_not_added_under_become():
+    runner = FakeSSHRunner(responses=[(r"^sudo -n", MACOS_NON_ROOT_CRASH)])
+
+    result = await make_transport(runner, platform="macos", become=True).evaluate_client_relevance(
+        "true", qna_path="/opt/QnA"
+    )
+
+    assert "--become" not in (result.error or "")
+
+
+async def test_macos_hint_is_not_added_off_macos():
+    runner = FakeSSHRunner(responses=[(r"-showtypes", MACOS_NON_ROOT_CRASH)])
+
+    result = await make_transport(runner).evaluate_client_relevance("true", qna_path="/opt/qna")
+
+    assert "--become" not in (result.error or "")
+
+
+async def test_macos_hint_is_not_added_to_a_relevance_error(qna_output):
+    """An E: line means qna ran fine, so root is not the problem."""
+    runner = FakeSSHRunner(responses=[(r"-showtypes", (qna_output("relevance_error"), "", 0))])
+
+    result = await make_transport(runner, platform="macos").evaluate_client_relevance(
+        "namez of it", qna_path="/opt/QnA"
+    )
+
+    assert result.error_kind == ERROR_KIND_RELEVANCE
+    assert "--become" not in (result.error or "")
 
 
 # --- provisioning a pinned version ----------------------------------------

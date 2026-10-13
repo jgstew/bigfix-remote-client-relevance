@@ -8,6 +8,7 @@ mapping) only appear when a process is actually run.
 from __future__ import annotations
 
 import dataclasses
+import getpass
 import logging
 import os
 import shutil
@@ -583,6 +584,24 @@ async def test_macos_root_refusal_survives_without_become(fake_qna, monkeypatch)
     assert not stub.was_invoked
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="geteuid is POSIX-only")
+async def test_macos_root_refusal_points_at_become_and_passwordless_sudo(fake_qna, monkeypatch):
+    """The refusal reaches CLI users, so it names CLI-actionable fixes: the
+    library-only `require_root_on_macos` waiver is no use to them."""
+    stub = fake_qna(stdout="A: unreachable\n")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+
+    result = await TransportLocal(become=False).evaluate_client_relevance(
+        "true", qna_path=stub.path
+    )
+
+    error = result.error or ""
+    assert "--become" in error
+    assert "NOPASSWD" in error
+    assert "require_root_on_macos" not in error
+
+
 @posix_only
 async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, monkeypatch):
     """A privilege problem is not the relevance engine failing."""
@@ -596,6 +615,21 @@ async def test_sudo_password_refusal_is_a_bootstrap_error(fake_qna, fake_sudo, m
     assert "sudo" in (result.error or "").lower()
     assert "nopasswd" in (result.error or "").lower()
     assert not stub.was_invoked
+
+
+@posix_only
+async def test_sudo_refusal_names_the_qna_path_in_a_ready_sudoers_rule(
+    fake_qna, fake_sudo, monkeypatch
+):
+    """The provisioned qna lives under a versioned cache directory the user
+    cannot guess, so the hint carries the exact path and a line to paste."""
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout="A: unreachable\n")
+    fake_sudo(deny="sudo: a password is required\n")
+
+    result = await TransportLocal(become=True).evaluate_client_relevance("true", qna_path=stub.path)
+
+    assert f"{getpass.getuser()} ALL=(root) NOPASSWD: {stub.path}" in (result.error or "")
 
 
 @posix_only
@@ -720,6 +754,64 @@ def test_sudo_privilege_problem_detects_a_sudo_line():
 
     assert problem is not None
     assert "a password is required" in problem
+
+
+def test_sudo_privilege_problem_escapes_sudoers_specials_in_the_path():
+    """sudoers splits a command on whitespace and treats `,:=` as syntax."""
+    problem = sudo_privilege_problem(
+        "sudo: a password is required\n", qna_path="/opt/My Q/a,b:c=d/qna", user="alice"
+    )
+
+    assert problem is not None
+    assert r"alice ALL=(root) NOPASSWD: /opt/My\ Q/a\,b\:c\=d/qna" in problem
+
+
+@pytest.mark.parametrize(
+    "qna_path",
+    [
+        "/tmp/bigfix_qna/11.0.7.61/BESAgent.app/Contents/MacOS/QnA",
+        # macOS's /tmp is a symlink to /private/tmp; same directory, same risk.
+        "/private/tmp/bigfix_qna/11.0.7.61/BESAgent.app/Contents/MacOS/QnA",
+    ],
+)
+def test_sudo_privilege_problem_warns_when_the_rule_targets_tmp(qna_path):
+    """A NOPASSWD rule on a binary anyone can replace is a root shell."""
+    problem = sudo_privilege_problem(
+        "sudo: a password is required\n", qna_path=qna_path, user="alice"
+    )
+
+    assert problem is not None
+    assert "under /tmp" in problem
+    assert "root" in problem.split("under /tmp", 1)[1]
+
+
+def test_sudo_privilege_problem_does_not_warn_for_an_installed_client():
+    problem = sudo_privilege_problem(
+        "sudo: a password is required\n",
+        qna_path="/Library/BESAgent/BESAgent.app/Contents/MacOS/QnA",
+        user="alice",
+    )
+
+    assert problem is not None
+    assert "/tmp" not in problem
+
+
+def test_tmp_lookalike_paths_get_no_warning():
+    """Only the directory itself, not every path that starts with the letters."""
+    problem = sudo_privilege_problem(
+        "sudo: a password is required\n", qna_path="/tmpfoo/qna", user="alice"
+    )
+
+    assert problem is not None
+    assert "under /tmp" not in problem
+
+
+def test_sudo_privilege_problem_without_a_path_stays_generic():
+    problem = sudo_privilege_problem("sudo: a password is required\n")
+
+    assert problem is not None
+    assert "NOPASSWD" in problem
+    assert "ALL=(root)" not in problem
 
 
 def test_sudo_privilege_problem_ignores_plain_qna_stderr():

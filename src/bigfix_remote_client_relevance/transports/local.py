@@ -8,6 +8,7 @@ results rather than raised.
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
 import os
 import re
@@ -299,7 +300,9 @@ class TransportLocal:
         # run is never touched; `self._become` means qna's own stderr can never
         # be mistaken for sudo's.
         if self._become and error_kind == ERROR_KIND_QNA:
-            privilege = sudo_privilege_problem(stderr)
+            privilege = sudo_privilege_problem(
+                stderr, qna_path=resolved_path, user=getpass.getuser()
+            )
             if privilege is not None:
                 error, error_kind = privilege, ERROR_KIND_BOOTSTRAP
                 self._sudo_broken = privilege
@@ -372,9 +375,14 @@ class TransportLocal:
             )
             return None
 
+        # Worded for the CLI, which is where this surfaces: --become is how a
+        # CLI user gets here without it, and the library-only waiver above is
+        # documented in this docstring rather than offered to them.
         return (
-            "qna requires root on macOS and aborts without it; rerun with sudo, "
-            "or pass require_root_on_macos=False to attempt it anyway"
+            "qna requires root on macOS and aborts without it; run with --become "
+            "(qna then runs via `sudo -n`, which needs a NOPASSWD sudoers rule for "
+            "the qna binary; a refused sudo reports the exact rule), or rerun the "
+            "whole command under sudo"
         )
 
 
@@ -477,7 +485,47 @@ def dmi_unavailable(error: str) -> str | None:
     return f"{remedy} ({error})"
 
 
-def sudo_privilege_problem(stderr: str) -> str | None:
+# sudoers splits a command on whitespace and reads these as its own syntax, so
+# a literal one in a path needs a backslash.
+_SUDOERS_SPECIALS_RE = re.compile(r"([\\\s,:=])")
+
+
+def sudoers_rule(qna_path: str, user: str | None) -> str:
+    """A sudoers line letting ``user`` run ``qna_path`` as root without a password.
+
+    No arguments after the path, so it matches qna run with any flags --
+    ``-showtypes`` or the plain ``-t`` fallback alike. ``user`` is ``None``
+    when the caller cannot know the login, and becomes a ``<user>``
+    placeholder rather than a guess that would paste in wrong.
+    """
+    escaped = _SUDOERS_SPECIALS_RE.sub(r"\\\1", qna_path)
+    return f"{user or '<user>'} ALL=(root) NOPASSWD: {escaped}"
+
+
+# macOS's /tmp is a symlink to /private/tmp, so a path may arrive as either.
+_TMP_DIRS = ("/tmp/", "/private/tmp/")
+
+
+def sudoers_advice(qna_path: str, user: str | None) -> str:
+    """``sudoers rule: ...`` for an error message, cautioning when it targets /tmp.
+
+    The provisioning cache lives under /tmp, owned by whoever provisioned it, and
+    any local user can recreate it after a reboot clears /tmp. Whoever can
+    replace a binary a NOPASSWD rule names gets root through that rule, so the
+    rule is offered as asked but not without saying so.
+    """
+    advice = f"sudoers rule: {sudoers_rule(qna_path, user)}"
+    if qna_path.startswith(_TMP_DIRS):
+        advice += (
+            "; caution: this path is under /tmp, so anyone who can replace that "
+            "file gets root through this rule"
+        )
+    return advice
+
+
+def sudo_privilege_problem(
+    stderr: str, *, qna_path: str | None = None, user: str | None = None
+) -> str | None:
     """Recognize sudo's own refusal so it is not blamed on qna.
 
     ``sudo -n`` exits 1 without running anything when it has no usable
@@ -488,6 +536,9 @@ def sudo_privilege_problem(stderr: str) -> str | None:
     Detection keys off the ``sudo: `` prefix sudo puts on its own diagnostics
     in every locale — qna never emits one — rather than the English wording of
     any particular message.
+
+    ``qna_path`` turns the generic advice into a rule to paste: a provisioned
+    qna sits under a versioned cache directory nobody would guess.
     """
     line = next(
         (stripped for raw in stderr.splitlines() if (stripped := raw.strip()).startswith("sudo:")),
@@ -495,9 +546,13 @@ def sudo_privilege_problem(stderr: str) -> str | None:
     )
     if line is None:
         return None
+    grant = (
+        f"grant passwordless sudo for {qna_path} ({sudoers_advice(qna_path, user)})"
+        if qna_path
+        else "grant passwordless sudo for the qna binary (a NOPASSWD sudoers rule)"
+    )
     return (
-        f"sudo could not elevate qna: {line}; grant passwordless sudo for the qna "
-        "binary (a NOPASSWD sudoers rule), rerun the whole command under sudo, "
+        f"sudo could not elevate qna: {line}; {grant}, rerun the whole command under sudo, "
         "or drop --become"
     )
 
@@ -508,4 +563,6 @@ __all__ = [
     "dmi_unavailable",
     "normalize_stdin_payload",
     "sudo_privilege_problem",
+    "sudoers_advice",
+    "sudoers_rule",
 ]
