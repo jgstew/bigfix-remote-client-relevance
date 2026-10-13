@@ -25,8 +25,10 @@ import io
 import logging
 import shutil
 import stat
+import sys
 import tarfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from bigfix_remote_client_relevance.bootstrap.cache import default_cache_dir
 from bigfix_remote_client_relevance.bootstrap.targets import MARKER_FILENAME
@@ -128,14 +130,29 @@ def _extract_deb(artifact: Path, destination: Path) -> None:
     name, payload = _ar_member(artifact, prefix="data.tar")
     if name.endswith(".zst"):
         # Ubuntu 21.10+ dpkg defaults to zstd (data.tar.zst), which stdlib
-        # tarfile cannot read before Python 3.14. Decompress up front with
-        # the same `zstandard` dependency rpmfile uses for EL9 payloads.
-        import zstandard
-
-        with zstandard.ZstdDecompressor().stream_reader(payload) as reader:
-            payload = io.BytesIO(reader.read())
+        # tarfile cannot read before Python 3.14. Decompress up front.
+        payload = _zstd_decompressed(payload)
     with tarfile.open(fileobj=payload, mode="r:*") as tar:
         _extract_tar(tar, destination)
+
+
+def _zstd_decompressed(fileobj: BinaryIO) -> io.BytesIO:
+    """Fully decompress a zstd stream (deb data.tar.zst, EL9-era rpm payloads).
+
+    3.14+ has zstd in the stdlib, and there `zstandard` is not a dependency
+    at all: it ships no wheels for a Python newer than its last release, so
+    `uvx` -- which picks the newest Python -- fell back to building it from
+    source, which fails on Windows without a C toolchain.
+    """
+    if sys.version_info >= (3, 14):
+        from compression import zstd
+
+        with zstd.ZstdFile(fileobj) as reader:
+            return io.BytesIO(reader.read())
+    import zstandard
+
+    with zstandard.ZstdDecompressor().stream_reader(fileobj) as reader:
+        return io.BytesIO(reader.read())
 
 
 def _extract_tar(tar: tarfile.TarFile, destination: Path) -> None:
@@ -209,7 +226,16 @@ def _extract_rpm(artifact: Path, destination: Path) -> None:
     import rpmfile
 
     with rpmfile.open(str(artifact)) as archive:
-        if archive.headers.get("archive_compression") == b"lzma":
+        compression = archive.headers.get("archive_compression")
+        if compression == b"zstd":
+            # rpmfile only knows `zstandard`, which is absent on 3.14+ (see
+            # _zstd_decompressed); pre-seed the same cache the same way.
+            archive._data_file = _zstd_decompressed(
+                rpmfile._SubFile(  # pyright: ignore[reportArgumentType]
+                    archive._fileobj, archive.data_offset
+                )
+            )
+        elif compression == b"lzma":
             # Not a leaked handle: this becomes rpmfile's own cached
             # `data_file`, managed exactly like its gzip/zstd/bzip2
             # equivalents -- none of which rpmfile explicitly closes either;

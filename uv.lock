@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -111,7 +111,7 @@ wheels = [
 
 [[package]]
 name = "bigfix-remote-client-relevance"
-version = "1.5.2"
+version = "1.5.3"
 source = { editable = "." }
 dependencies = [
     { name = "asyncssh" },
@@ -123,7 +123,7 @@ dependencies = [
     { name = "rpmfile" },
     { name = "tomlkit" },
     { name = "typer" },
-    { name = "zstandard" },
+    { name = "zstandard", marker = "python_full_version < '3.14'" },
 ]
 
 [package.dev-dependencies]
@@ -148,7 +148,7 @@ requires-dist = [
     { name = "rpmfile", specifier = ">=2.2.1" },
     { name = "tomlkit", specifier = ">=0.15.1" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "zstandard", specifier = ">=0.25.0" },
+    { name = "zstandard", marker = "python_full_version < '3.14'", specifier = ">=0.25.0" },
 ]
 
 [package.metadata.requires-dev]

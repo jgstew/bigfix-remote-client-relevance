@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-remote-client-relevance"
-version = "1.5.2"
+version = "1.5.3"
 description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -37,7 +37,8 @@ dependencies = [
   "rpmfile>=2.2.1",
   "tomlkit>=0.15.1",
   "typer>=0.12",
-  "zstandard>=0.25.0",
+  # 3.14+ uses stdlib compression.zstd; see bootstrap/extract_local.py.
+  "zstandard>=0.25.0; python_version < '3.14'",
 ]
 
 # Dev tooling lives in a PEP 735 dependency group, which `uv sync` installs by

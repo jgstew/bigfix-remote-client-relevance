@@ -39,7 +39,12 @@ def _data_tar(compression: str, members: dict[str, bytes] | None = None) -> byte
     """A deb payload tarball holding an executable qna."""
     members = members if members is not None else {QNA_MEMBER: QNA_BODY}
     if compression == "zst":
-        # stdlib tarfile has no zstd writer before 3.14; compress a plain tar.
+        # Compress a plain tar rather than use tarfile's "w:zst", which only
+        # exists from 3.14 -- the same split the code under test makes.
+        if sys.version_info >= (3, 14):
+            from compression import zstd
+
+            return zstd.compress(_data_tar("", members))
         import zstandard
 
         return zstandard.ZstdCompressor().compress(_data_tar("", members))
@@ -169,6 +174,40 @@ async def test_rpm_preserves_the_executable_bit(cache):
     tree = await ensure_extracted(resolved_for(FIXTURES / "tiny-qna-zstd.rpm"), cache_dir=cache)
 
     assert os.access(qna_in(tree), os.X_OK)
+
+
+# --- zstd without the zstandard package ---------------------------------------
+
+
+@pytest.fixture
+def without_zstandard(monkeypatch):
+    """Hide `zstandard`, as on 3.14+ where it is not a dependency.
+
+    It has no wheels for a Python newer than its last release (none for 3.15
+    as of 0.25.0), so `uvx` -- which picks the newest Python -- fell back to
+    building it from source, which fails on Windows without a C toolchain.
+    rpmfile binds it at import time, so its module attribute goes too.
+    """
+    import rpmfile
+
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+    monkeypatch.delattr(rpmfile, "zstandard", raising=False)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="stdlib compression.zstd is 3.14+")
+async def test_deb_zst_payload_without_zstandard(tmp_path, cache, without_zstandard):
+    artifact = write_deb(tmp_path / "noble.deb", compression="zst")
+
+    tree = await ensure_extracted(resolved_for(artifact), cache_dir=cache)
+
+    assert qna_in(tree).read_bytes() == QNA_BODY
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="stdlib compression.zstd is 3.14+")
+async def test_rpm_zstd_payload_without_zstandard(cache, without_zstandard):
+    tree = await ensure_extracted(resolved_for(FIXTURES / "tiny-qna-zstd.rpm"), cache_dir=cache)
+
+    assert b"fixture qna" in qna_in(tree).read_bytes()
 
 
 # --- caching, atomicity, concurrency ------------------------------------------
