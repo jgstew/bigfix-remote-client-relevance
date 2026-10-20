@@ -1,5 +1,5 @@
 """Tests for the relevance-based arch probe shared by transports with no
-other side channel to ask (online_evaluator, fastquery) -- unlike local's
+other side channel to ask (online_evaluator) -- unlike local's
 ``sys.platform`` or ssh's ``uname -m``.
 """
 

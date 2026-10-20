@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-remote-client-relevance"
-version = "1.5.4"
+version = "1.6.0"
 description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,6 +30,7 @@ classifiers = [
 dependencies = [
   "asyncssh>=2.14",
   "beautifulsoup4>=4.12",
+  "bigfix-remote-session-relevance>=1.1.0,<2",
   "docker>=7.0",
   "filelock>=3.32.3",
   "platformdirs>=4",
@@ -83,6 +84,12 @@ python-preference = "managed"
 # package (`--exclude-newer-package`) when a fresh release must be taken
 # early; see DESIGN.md § Packaging & Python versions.
 exclude-newer = "-P7D"
+# Fast Query needs bigfix-remote-session-relevance 1.1.0 (uploaded
+# 2026-10-20), a sibling package by the same maintainer, inside the window.
+# The fixed date lifts the quarantine for that one release only; remove this
+# once the rolling window has passed it (after 2026-10-27), or it would hold
+# the package back from then on.
+exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-21T00:00:00Z" }
 
 # --- Tooling ---------------------------------------------------------------
 
@@ -100,6 +107,7 @@ markers = [
   "docker: needs a reachable Docker daemon",
   "ssh_localhost: needs sshd on localhost with key auth for the current user",
   "ssh_windows: needs a real Windows endpoint (set BFRCR_WINDOWS_SSH_HOST=user@host)",
+  "fastquery_live: needs a real BigFix server (set BFRCR_FASTQUERY_CONNECTION and BFRCR_FASTQUERY_COMPUTER_ID)",
   "network: reaches support.bigfix.com / software.bigfix.com (opt in with BFRCR_NETWORK_TESTS=1)",
 ]
 

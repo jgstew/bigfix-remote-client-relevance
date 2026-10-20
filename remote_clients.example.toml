@@ -67,3 +67,13 @@ transport = "container"
 image = "ubuntu:24.04"
 keep_alive = true
 idle_ttl_s = 300
+
+# BigFix Fast Query: real managed endpoints, each answering with its own
+# installed agent; one result per computer. Needs a REST connection in
+# bigfix-remote-session-relevance's config (`--setup-fastquery` adds one), so
+# it is commented out here: without that connection every run would refuse.
+# [hosts.lab-web]
+# transport = "fastquery"
+# connection = "lab"
+# computer_ids = [1234567]
+# computer_query = 'bes computers whose (name of it starts with "web")'

@@ -18,7 +18,9 @@ without a full BES client install. Entry point: `bigfix_remote_client_relevance.
   `provision.py`, `extract_local.py`, `compat_memory.py` (which builds are too
   new for which target, remembered across runs)
 - `transports/` -- one module per target kind: `ssh.py`, `container.py`
-  (+ `container_libs.py`, `container_setup.py`), `local.py`, `online_evaluator.py`
+  (+ `container_libs.py`, `container_setup.py`), `local.py`, `online_evaluator.py`,
+  `fastquery.py` (BigFix Fast Query; one target, one result per computer,
+  via the optional `FanOutTransport` protocol in `transports/__init__.py`)
 - `tests/unit/` -- offline; `tests/integration/` -- needs real prerequisites
 
 ## Commands
@@ -35,8 +37,10 @@ Pre-commit runs on commit (ruff, ruff format, mypy, bandit, typos, codespell,
 uv-lock, and more); keep it green rather than skipping hooks.
 
 Unmarked tests run offline on a bare machine. Tests marked `live_qna`,
-`docker`, `ssh_localhost`, `ssh_windows` need a real prerequisite and
-auto-skip without it (see `tests/conftest.py`).
+`docker`, `ssh_localhost`, `ssh_windows`, `fastquery_live` need a real
+prerequisite and auto-skip without it (see `tests/conftest.py`).
+`fastquery_live` needs `BFRCR_FASTQUERY_CONNECTION` and
+`BFRCR_FASTQUERY_COMPUTER_ID`.
 
 ## How to work here
 
@@ -62,7 +66,18 @@ auto-skip without it (see `tests/conftest.py`).
   belongs at DEBUG (`-v`), or it buries the answers.
 - **Tests never touch real user state.** Anything persisted under
   `platformdirs` must be redirected in `tests/conftest.py`, as
-  `_isolated_compat_memory` does.
+  `_isolated_compat_memory` does. `_isolated_bigfix_connections` does the
+  same for bigfix-remote-session-relevance's `~/.bigfix` config and pin
+  store; don't redirect HOME wholesale, or the container tests lose the
+  Docker socket and try to start Docker Desktop.
+- **Fast Query sits on bigfix-remote-session-relevance**, a hard dependency
+  (`>=1.1.0,<2`) that owns config, auth, pinning and the ClientQuery wire
+  calls. This repo owns targeting, polling and mapping rows to results;
+  don't reimplement REST calls here. Its fake in
+  `tests/unit/test_transport_fastquery.py` implements only `evaluate`,
+  `submit_client_query` and `client_query_results`. The repo's
+  `exclude-newer` quarantine needs a per-package override in
+  `pyproject.toml` to take a fresh session-relevance release.
 - **The release-site fixtures lag the real site.**
   `tests/fixtures/release_site/release_index.html` predates 11.0.7, so code
   walking the index must cope with a version it does not list.

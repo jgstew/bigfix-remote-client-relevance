@@ -42,10 +42,12 @@ from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
     DEFAULT_PULL_PARALLEL,
     EXIT_QNA,
+    NO_FASTQUERY_CONNECTION,
     Target,
     count_work,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
+    fastquery_connection,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.render import (
@@ -253,6 +255,9 @@ def _update_inventory(
     became read-only mid-run) is logged, not raised -- one host's config
     problem must not turn a successful evaluation into a failed command.
     """
+    # Fast Query results are named after the computers that answered, not
+    # after any inventory host, and carry no probed platform or arch anyway.
+    results = [result for result in results if result.transport != "fastquery"]
     configured_platform = {target.name: target.platform for target in inventory_targets}
     configured_arch = {target.name: target.arch for target in inventory_targets}
     written_platform: set[str] = set()
@@ -297,6 +302,17 @@ def _auto_discover() -> list[str]:
     else:
         logger.warning("auto-discovery found nothing new to add to %s", path)
     return added
+
+
+def _setup_fastquery() -> int:
+    """bigfix-remote-session-relevance's setup wizard, limited to REST.
+
+    Here because `uvx bigfix-remote-client-relevance` puts only this
+    package's own commands on PATH, so its `--setup` is out of reach.
+    """
+    import bigfix_remote_session_relevance
+
+    return bigfix_remote_session_relevance.run_setup(backends=("rest",))
 
 
 def _interactive() -> bool:
@@ -382,6 +398,51 @@ def evaluate(
             ),
         ),
     ] = None,
+    fastquery: Annotated[
+        str | None,
+        typer.Option(
+            "--fastquery",
+            metavar="CONNECTION",
+            help=(
+                "Evaluate on managed endpoints with BigFix Fast Query, through the "
+                "named REST connection in bigfix-remote-session-relevance's config "
+                "($BFRSR_CONFIG or ~/.bigfix/.remote_session_connections.toml). "
+                "Needs --computer-id and/or --computer-query; one result per "
+                "computer. Uses each endpoint's installed agent, so it cannot pin "
+                "a qna version. Composes with --inventory."
+            ),
+        ),
+    ] = None,
+    computer_id: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--computer-id",
+            metavar="ID",
+            help="BigFix computer ID for --fastquery. Repeatable.",
+        ),
+    ] = None,
+    computer_query: Annotated[
+        str | None,
+        typer.Option(
+            "--computer-query",
+            metavar="SESSION_RELEVANCE",
+            help=(
+                "Session relevance selecting computers for --fastquery, e.g. "
+                "'bes computers whose (name of it starts with \"web\")'; the server "
+                "resolves it with `ids of (...)`."
+            ),
+        ),
+    ] = None,
+    setup_fastquery: Annotated[
+        bool,
+        typer.Option(
+            "--setup-fastquery",
+            help=(
+                "Add a REST connection for --fastquery to bigfix-remote-session-"
+                "relevance's config, interactively."
+            ),
+        ),
+    ] = False,
     inventory: Annotated[
         Path | None,
         typer.Option(
@@ -591,6 +652,11 @@ def evaluate(
     # inventory host's own `arch`) is how anyone wanting arm64 opts in.
     arch_list = arch or ["x86_64"]
 
+    if setup_fastquery:
+        code = _setup_fastquery()
+        if code or (not args and client_relevance_file is None):
+            raise typer.Exit(code)
+
     if auto_discovery_ssh:
         _auto_discover_ssh()
     if auto_discovery:
@@ -603,7 +669,19 @@ def evaluate(
     # ad-hoc extra target is a normal thing to want. --local is still on its own.
     if local and (container or online_evaluator or inventory):
         _fail("--local cannot be combined with --container, --online-evaluator or --inventory")
-    modes = [bool(local), bool(container), bool(online_evaluator), bool(inventory)]
+    if fastquery and (local or container or online_evaluator or qna_version):
+        # Fast Query endpoints evaluate with their installed agent, so a
+        # version can never be pinned; the other modes are kept apart so a
+        # per-computer result set is never mixed into a version comparison.
+        _fail(
+            "--fastquery cannot be combined with --local, --container, "
+            "--online-evaluator or --qna-version"
+        )
+    if (computer_id or computer_query) and not fastquery:
+        _fail("--computer-id and --computer-query only apply to --fastquery")
+    if fastquery and not (computer_id or computer_query):
+        _fail("--fastquery needs --computer-id and/or --computer-query")
+    modes = [bool(local), bool(container), bool(online_evaluator), bool(inventory), bool(fastquery)]
 
     if platform is not None and platform not in KNOWN_TARGETS:
         _fail(f"unknown platform {platform!r}; known: {', '.join(sorted(KNOWN_TARGETS))}")
@@ -705,8 +783,8 @@ def evaluate(
         except InventoryError as exc:
             _fail(str(exc))
         if update_inventory:
-            # Only an updatable inventory host is worth online_evaluator's or
-            # fastquery's arch probe -- a real network round trip whose only
+            # Only an updatable inventory host is worth online_evaluator's
+            # arch probe -- a real network round trip whose only
             # payoff is a value to persist (see orchestrate.py's arch-probe
             # block). --no-update-inventory means a probed value would just
             # be thrown away, so it stays False there, same as any ad hoc
@@ -736,6 +814,29 @@ def evaluate(
                 base_url=online_evaluator,
             )
         )
+    if fastquery:
+        targets.append(
+            Target(
+                kind="fastquery",
+                name=fastquery,
+                connection=fastquery,
+                computer_ids=tuple(computer_id or ()),
+                computer_query=computer_query,
+            )
+        )
+    # One message whichever is wrong -- unknown, disabled, or not REST --
+    # because the fix is the same: set one up. An unparsable config file
+    # raises instead, with its cause appended.
+    try:
+        unusable = any(
+            fastquery_connection(target.connection) is None
+            for target in targets
+            if target.kind == "fastquery"
+        )
+    except ValueError as exc:
+        _fail(str(exc))
+    if unusable:
+        _fail(NO_FASTQUERY_CONNECTION)
     if local:
         # `become` stays whatever the caller passed (True/False/unspecified);
         # default_transport_factory is where an unspecified value resolves,
@@ -761,8 +862,12 @@ def evaluate(
     # up the containers that already finished.
     stream = not as_json and not diff
     # Decided before the run rather than from len(results), so the streaming
-    # path labels its first section the same way the batch path would.
-    labelled = count_work(targets, qna_version or None) > 1
+    # path labels its first section the same way the batch path would. A
+    # Fast Query target is one unit of work but answers per computer, so it
+    # always labels: there is no telling in advance how many will answer.
+    labelled = count_work(targets, qna_version or None) > 1 or any(
+        target.kind == "fastquery" for target in targets
+    )
 
     def _render_streamed(result: ClientRelevanceResult) -> str:
         if as_jsonl:

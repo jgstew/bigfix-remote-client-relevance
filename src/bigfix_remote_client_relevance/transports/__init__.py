@@ -47,6 +47,28 @@ class Transport(Protocol):
         ...
 
 
+@runtime_checkable
+class FanOutTransport(Protocol):
+    """Optional: one evaluation answers for many endpoints.
+
+    Every other transport is one target, one result. Fast Query is one
+    target -- a BigFix server plus which computers to ask -- and one result
+    per computer that answers, so the orchestrator emits each of these in
+    place of the single ``evaluate_client_relevance`` result. Version pinning
+    never applies, so there is no ``qna`` argument.
+
+    So for a fan-out target the number of results is not known up front:
+    :func:`~..orchestrate.count_work` counts one per cell, a floor rather
+    than the exact total it is for every other transport.
+    """
+
+    async def evaluate_client_relevance_fanout(
+        self, client_relevance: str, *, timeout_s: float = 30.0
+    ) -> list[ClientRelevanceResult]:
+        """One result per endpoint, never raising; at least one result."""
+        ...
+
+
 ARCH_PROBE_RELEVANCE = "architecture of the operating system"
 """Client relevance used by :func:`probe_arch_via_relevance`."""
 
@@ -59,9 +81,8 @@ async def probe_arch_via_relevance(
     For transports with no other side channel to ask -- unlike
     :class:`~.local.TransportLocal` (``sys.platform``) or
     :class:`~.ssh.TransportSSH` (``uname -m``),
-    :class:`~.online_evaluator.TransportOnlineEvaluator` and
-    :class:`~.fastquery.TransportFastQuery` have nothing but relevance itself
-    to ask, so the probe *is* an ordinary evaluation. ``evaluate`` is the
+    :class:`~.online_evaluator.TransportOnlineEvaluator` has nothing but
+    relevance itself to ask, so the probe *is* an ordinary evaluation. ``evaluate`` is the
     transport's own bound ``evaluate_client_relevance``.
 
     Raises on any failure -- a relevance error, a transport error, or an
@@ -77,4 +98,4 @@ async def probe_arch_via_relevance(
     return result.answers[0]
 
 
-__all__ = ["ARCH_PROBE_RELEVANCE", "Transport", "probe_arch_via_relevance"]
+__all__ = ["ARCH_PROBE_RELEVANCE", "FanOutTransport", "Transport", "probe_arch_via_relevance"]

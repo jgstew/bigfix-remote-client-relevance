@@ -26,8 +26,8 @@ Corrections implementation forced, all applied below:
    rule.
 
 Remaining: rpm-family and SUSE bootstraps are specified but only the
-Debian/Ubuntu and macOS extract paths are exercised; Fast Query is a stub;
-the MCP server is a separate task.
+Debian/Ubuntu and macOS extract paths are exercised; Fast Query is REST
+only (SaaS is a follow-up); the MCP server is a separate task.
 
 ## Testing
 `uv run pytest` runs the offline unit suite on a bare machine. Tests
@@ -39,6 +39,15 @@ needing a real prerequisite carry a marker and auto-skip without it:
 | `docker` | a reachable Docker daemon | `uv run pytest -m docker` |
 | `ssh_localhost` | sshd on localhost with key auth | `uv run pytest -m ssh_localhost` |
 | `network` | support.bigfix.com | `BFRCR_NETWORK_TESTS=1 uv run pytest -m network` |
+| `fastquery_live` | a BigFix server, a REST connection in the session-relevance config, and an online endpoint | `BFRCR_FASTQUERY_CONNECTION=<NAME> BFRCR_FASTQUERY_COMPUTER_ID=<COMPUTER_ID> uv run pytest -m fastquery_live` |
+
+Every test runs against throwaway bigfix-remote-session-relevance state:
+`tests/conftest.py` points `BFRSR_CONFIG` at an empty temp file, redirects
+the pinned-certificate store, and turns off the `BES_*`, `~/.besapi.conf`
+and local root server fallbacks, so no test reads the real
+`~/.bigfix/.remote_session_connections.toml`. HOME itself is left alone,
+because the container transport finds the Docker socket under it.
+`fastquery_live` alone keeps the real config.
 
 Release-site fixtures under `tests/fixtures/release_site/` are captured
 from the live site and trimmed to `#main-content`, so the scraper is
@@ -293,7 +302,7 @@ Not implemented yet — added when the project is closer to a first release.
   captured fixtures without a live endpoint.
 - A future MCP tool is a thin wrapper around a typed Python function.
 
-### Why SSH + Docker as the two primary transports (Fast Query later)
+### Why SSH + Docker as the two primary transports (Fast Query third)
 - **SSH** is built into macOS (Remote Login) and Windows 10/11 + Server
   2019+ (OpenSSH Server capability). No third-party agent, no BigFix action
   round-trip. Sub-second edit → evaluate loop against real Mac / Windows /
@@ -307,8 +316,10 @@ Not implemented yet — added when the project is closer to a first release.
   pushes a client-relevance query out to endpoints via relays) worth
   designing for, but it needs a live BigFix deployment, only runs against
   the *installed* client's qna version, and gates on operator permissions.
-  SSH and Docker don't. The `Transport` interface is designed so Fast
-  Query slots in later without changing callers.
+  SSH and Docker don't. It is implemented as `TransportFastQuery` (below)
+  on top of bigfix-remote-session-relevance's REST ClientQuery calls, and
+  slots in beside the other transports through the optional
+  `FanOutTransport` protocol.
 - Alternatives rejected: action deploy (too slow), WinRM (Windows-only),
   Ansible (declarative, wrong shape), REST `/api/query` (session relevance,
   wrong dialect), Fixlet Debugger (GUI-only), custom sidecar agent
@@ -333,7 +344,8 @@ src/bigfix_remote_client_relevance/
     local.py                 # TransportLocal    (subprocess)
     ssh.py                   # TransportSSH      (asyncssh) — primary remote
     container.py             # TransportContainer(Docker) — primary on-demand
-    fastquery.py             # TransportFastQuery(BigFix Fast Query) — stub
+    fastquery.py             # TransportFastQuery(BigFix Fast Query via REST
+                             # ClientQuery) — one result per computer
   bootstrap/
     __init__.py              # "provision qna without installing BigFix"
     release_site.py          # resolve version specs ("11.0" -> "11.0.6.137")
@@ -448,18 +460,63 @@ Five concrete transports, all class-named `Transport<Kind>`:
   container's stdin. Primary transport for "answer this on
   Ubuntu/Debian/RHEL/Amazon-Linux/etc. right now, no reservation required."
   Design notes below.
-- `TransportFastQuery(besapi_client, computer_query=...)` — stub only. Nails
-  down the constructor signature so future work does not break callers.
-  Documents that the BigFix REST payload uses the key `Relevance` as an
-  API-vocabulary exception to the naming rule. **Version pinning does not
-  apply here:** Fast Query evaluates with whatever BES agent is installed
-  on each endpoint — there is no way to choose a qna version, so passing
-  a `ResolvedQna` to this transport is an error (`error_kind:
-  "bootstrap"`), version specs targeting it fail at resolution time in
-  `orchestrate.py` with a clear message, and the result's `qna_version`
-  reports the endpoint's installed agent version instead. This
-  inflexibility is inherent to the transport, not a first-cut
-  limitation.
+- `TransportFastQuery(backend, *, computer_ids=(), computer_query=None,
+  host="fastquery")` — BigFix Fast Query: the server sends client relevance
+  to managed endpoints, which answer with their installed agent. `backend`
+  is a bigfix-remote-session-relevance `RestBackend` (typed as its
+  `ClientQueryExtras` protocol plus `evaluate`); that package owns config,
+  credentials, certificate pinning and the two wire calls (`POST
+  /api/clientquery`, whose XML body carries the expression as `QueryText` —
+  an API-vocabulary exception to the naming rule — and `GET
+  /api/clientqueryresults/{id}?output=json`). This transport owns the rest:
+  1. `computer_query` (session relevance) is resolved on the server with
+     `ids of (<expr>)`, under the operator's own scope, and merged with
+     `computer_ids`. No IDs → one `transport` result.
+  2. Submit. A submit error → one `transport` result carrying
+     session-relevance's message (e.g. the 403 "Can Submit Queries" hint).
+  3. Poll: waits of 2 s, then ×1.5, capped at 15 s, with the last check
+     landing on `timeout_s`; stop once every targeted ID has a row. Rows
+     accumulate server-side, so each poll returns all of them. There is
+     always at least one results call, even when resolving and submitting
+     used the whole timeout. A poll error ends polling (the observed ones,
+     such as another operator's query id, do not clear up on retry). Every
+     server call is bounded with `asyncio.wait_for` by the time left (with a
+     5 s floor), so a server that goes quiet cannot hold the run for
+     session-relevance's own read timeout per call.
+  4. One result per computer, answered ones ordered by name: `host` is the
+     computer name, `answers` its non-failure rows in order (a plural answer
+     is one row per value), `answer_types` empty (the JSON carries none),
+     any failure row → `error_kind: "relevance"`, `raw_qna_output` that
+     computer's rows as JSON. A targeted ID with no row by the deadline →
+     a `transport` result with `host` set to the ID and "no answer within N
+     s (offline, UDP notifications blocked, or client/relay older than 9.5
+     Patch 2)". The server accepts IDs outside the operator's scope
+     silently, and those never answer, so the deadline is what bounds them.
+  5. No exception escapes. `aclose` closes the backend.
+
+  `evaluate_client_relevance_fanout(client_relevance, *, timeout_s)` is the
+  native call (the orchestrator's `FanOutTransport`);
+  `evaluate_client_relevance` returns the first result so plain-`Transport`
+  callers keep working. There is no `resolve_arch`: one target is many
+  endpoints. **Version pinning does not apply here:** Fast Query evaluates
+  with whatever BES agent is installed on each endpoint — there is no way to
+  choose a qna version, so passing a `ResolvedQna` (or `qna_path`) to this
+  transport is an error (`error_kind: "bootstrap"`), and version specs
+  targeting it fail at resolution time in `orchestrate.py` with a clear
+  message. `qna_version` is left `None`; reporting each endpoint's agent
+  version there is a follow-up. This inflexibility is inherent to the
+  transport, not a first-cut limitation.
+
+  **One target, many results.** The orchestrator otherwise assumes one
+  result per (target, version, expression). A transport that also
+  satisfies the optional `FanOutTransport` protocol has each result it
+  returns emitted, keyed `(cell index, sub)`, so batch output is ordered by
+  expression and then by host and nothing is overwritten; a cell that
+  returns nothing or raises still yields one `transport` failure, so
+  `count_work` stays a lower bound. The arch probe and the CLI's inventory
+  write-back skip fastquery, and a target's `platform`/`arch` are never
+  stamped onto fan-out results (an inventory fastquery host may not set
+  them). `ClientRelevanceResult` is unchanged.
 - `TransportOnlineEvaluator(base_url, host=None, session=None,
   max_retries=1)` — speaks the small JSON contract behind BigFix's own
   "Online Evaluator" (<https://developer.bigfix.com/relevance/evaluate/>),
@@ -694,9 +751,11 @@ group. A group builds its transport, probes it and prepares its image **once**,
 then runs its expressions through that one transport in sequence. That is the
 whole saving: measured on `ubuntu:22.04` at qna 11.0, ten expressions cost 74s
 run separately and 18s batched (4.1x). A group that dies before evaluating
-anything still emits one result per expression, so the count always matches
+anything still emits one result per expression, so the count matches
 `count_work(targets, qna_version, expressions)` — the denominator a streaming
-progress indicator commits to before the first result arrives. Container
+progress indicator commits to before the first result arrives. (For a Fast
+Query target it is a floor: that cell yields one result per computer that
+answers.) Container
 targets carrying more than one expression are kept alive for the batch, since
 otherwise the second expression starts a second container and the batching
 saves nothing; the container is stopped when the batch is. `evaluate_client_relevance` is the same machinery with a
@@ -745,6 +804,9 @@ bigfix-remote-client-relevance --local "..."
 bigfix-remote-client-relevance --container ubuntu:22.04 "..."
 bigfix-remote-client-relevance --container bigfix_centos --qna-version 11.0.4.60 -f probe.rel
 bigfix-remote-client-relevance --online-evaluator https://developer.bigfix.com "..."
+bigfix-remote-client-relevance --fastquery CONNECTION --computer-id 1234567 "..."
+bigfix-remote-client-relevance --fastquery CONNECTION --computer-query 'bes computers' "..."
+bigfix-remote-client-relevance --setup-fastquery
 ```
 
 - Short alias `-f` is fine for `--client-relevance-file`.
@@ -755,6 +817,23 @@ bigfix-remote-client-relevance --online-evaluator https://developer.bigfix.com "
   `--inventory remote_clients.toml` for a mixed grid); `--container` and
   `--online-evaluator` both compose with `--inventory` the same way, adding
   one ad hoc target to the fleet.
+- `--fastquery CONNECTION` picks `TransportFastQuery` through the named
+  connection in bigfix-remote-session-relevance's config (`$BFRSR_CONFIG`
+  or `~/.bigfix/.remote_session_connections.toml`), with targets from
+  `--computer-id ID` (repeatable) and/or `--computer-query
+  SESSION_RELEVANCE`. It composes with `--inventory`. Usage errors (exit
+  64): no usable connection (unknown, disabled, or not REST) — always
+  "no REST or SaaS connection found, which Fast Query requires; run
+  --setup-fastquery", naming no other backend; `--fastquery` with
+  `--local`, `--container`, `--online-evaluator` or `--qna-version`;
+  `--computer-*` without `--fastquery`; `--fastquery` with no target. As
+  with `--container`, every positional is client relevance, so a `HOST`
+  cannot be given. Output is always labelled when a Fast Query target is
+  present, since how many computers answer is unknown up front.
+  `--setup-fastquery` runs session-relevance's `run_setup(backends=("rest",))`,
+  because `uvx` only puts this package's own commands on PATH.
+  bigfix-remote-session-relevance is a hard dependency, not an extra, so a
+  process importing both shares one config, one pin store and one login.
 - `--qna-version` accepts a version spec (`11.0` or `11.0.6.137`) and is
   repeatable for multi-version fan-out; `--refresh-versions` and
   `--fetch-on-target` are described in § qna binary cache & distribution.
@@ -822,7 +901,18 @@ image = "ubuntu:22.04"
 [hosts.web-eval]
 transport = "online_evaluator"
 base_url = "https://developer.bigfix.com"
+
+[hosts.lab-web]
+transport = "fastquery"
+connection = "lab"            # required: a session-relevance REST connection
+computer_ids = [1234567]      # computer_ids and/or computer_query required
+computer_query = 'bes computers whose (name of it starts with "web")'
 ```
+
+A fastquery host is validated at load time next to the online_evaluator
+`base_url` check: it needs `connection`, and `computer_ids` (a list of
+integers) and/or `computer_query`. They land in explicit `Target.connection`,
+`Target.computer_ids` and `Target.computer_query` fields.
 
 ### MCP-ready contract (server itself out of scope)
 The server is still out of scope; the affordances a server needs are not. The
@@ -1025,7 +1115,9 @@ answers cross an untrusted network.
 
 ## Out of scope (for this task)
 - The MCP server itself (design keeps the surface compatible).
-- Full `TransportFastQuery` implementation (stub only).
+- Fast Query over BigFix SaaS (REST only for now), targeting by computer
+  name, group or custom relevance, streaming per-computer results as they
+  arrive, and reporting each endpoint's agent version in `qna_version`.
 - Windows containers, and publishing our own qna-preloaded images to a
   registry (noted for `TransportContainer` follow-ups). podman is supported
   via `PodmanEngine`/`--engine podman`; niche rootless-podman configurations
@@ -1055,7 +1147,7 @@ order.
    `inventory.py`, `cli.py`, `--json` output.
 
 Follow-ups after M5: rpm-family + SUSE bootstraps, remaining arches,
-Fast Query, MCP server (separate task). Fine-grained work items live in
+SaaS Fast Query, MCP server (separate task). Fine-grained work items live in
 GitHub issues, not in this doc.
 
 ---
@@ -1169,7 +1261,12 @@ for macOS) — the URLs the bootstrap scripts already use.
 to `client_relevance` on the caller side.
 
 ### BigFix REST API (external tool, API-vocabulary exception)
-Referenced only for `TransportFastQuery` (stub) and to disambiguate from
-`/api/query`. REST payload key is `Relevance`. **Usefulness: low for this
-task; kept in the interface so it doesn't reshape callers when Fast Query
-lands.**
+Used by `TransportFastQuery` through bigfix-remote-session-relevance's
+ClientQuery layer: `POST /api/clientquery` (the expression goes in the XML
+`QueryText` element) and `GET /api/clientqueryresults/{id}?output=json`, plus
+`/api/query` for resolving `--computer-query` to IDs. This package never
+calls the REST API directly. Observed on 11.x: rows accumulate as agents
+answer (a poll straight after submit has none), a plural answer is one row
+per value, an empty plural answer and `""` look the same, out-of-scope
+computer IDs are accepted but never answer, and only the submitting
+operator can read the results. **Usefulness: essential for Fast Query.**

@@ -1473,3 +1473,207 @@ def test_auto_discovery_ssh_list_goes_to_stderr_not_stdout(captured, tmp_path, m
     assert result.exit_code == 0, result.output
     assert "the list" not in result.stdout
     assert "the list" in result.stderr
+
+
+# --- Fast Query --------------------------------------------------------------
+
+NO_CONNECTION = (
+    "error: no REST or SaaS connection found, which Fast Query requires; run --setup-fastquery"
+)
+
+
+def _connections(*entries: tuple[str, str]) -> None:
+    """Write session-relevance connections into the isolated $BFRSR_CONFIG."""
+    import os
+    from pathlib import Path
+
+    text = "".join(
+        f'[[connections]]\nname = "{name}"\nbackend = "{backend}"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+        for name, backend in entries
+    )
+    Path(os.environ["BFRSR_CONFIG"]).write_text(text, encoding="utf-8")
+
+
+@pytest.fixture
+def lab_connection():
+    _connections(("lab", "rest"))
+
+
+def test_fastquery_builds_target(captured, lab_connection):
+    result = invoke(
+        "--fastquery", "lab", "--computer-id", "11", "--computer-id", "12", "name of it"
+    )
+
+    assert result.exit_code == 0, result.output
+    [target] = captured["targets"]
+    assert target.kind == "fastquery"
+    assert target.name == "lab"
+    assert target.connection == "lab"
+    assert target.computer_ids == (11, 12)
+    assert target.computer_query is None
+    assert captured["client_relevance"] == "name of it"
+
+
+def test_fastquery_computer_query_reaches_the_target(captured, lab_connection):
+    result = invoke("--fastquery", "lab", "--computer-query", "bes computers", "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].computer_query == "bes computers"
+    assert captured["targets"][0].computer_ids == ()
+
+
+def test_fastquery_composes_with_inventory(captured, lab_connection, tmp_path):
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text('[hosts.a]\ntransport = "ssh"\n', encoding="utf-8")
+
+    result = invoke(
+        "--inventory", str(inventory), "--fastquery", "lab", "--computer-id", "1", "true"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert {t.kind for t in captured["targets"]} == {"ssh", "fastquery"}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--local"],
+        ["--container", "debian:12"],
+        ["--online-evaluator", "https://developer.bigfix.com"],
+        ["--qna-version", "11.0"],
+    ],
+)
+def test_fastquery_conflicts(captured, lab_connection, extra):
+    result = invoke("--fastquery", "lab", "--computer-id", "1", *extra, "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--fastquery" in result.stderr
+    assert "targets" not in captured
+
+
+@pytest.mark.parametrize("flag", [["--computer-id", "1"], ["--computer-query", "bes computers"]])
+def test_computer_flags_require_fastquery(captured, flag):
+    result = invoke("--local", *flag, "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--fastquery" in result.stderr
+
+
+def test_fastquery_requires_a_target(captured, lab_connection):
+    result = invoke("--fastquery", "lab", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--computer-id" in result.stderr and "--computer-query" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        [],  # nothing configured at all
+        [("other", "rest")],  # the name is unknown
+        [("lab", "webreports")],  # the name is not a REST (or SaaS) connection
+    ],
+)
+def test_no_usable_connection_suggests_setup_fastquery(captured, configured):
+    _connections(*configured)
+
+    result = invoke("--fastquery", "lab", "--computer-id", "1", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert result.stderr.strip() == NO_CONNECTION
+    assert "targets" not in captured
+
+
+def test_inventory_fastquery_host_without_a_usable_connection_is_refused(captured, tmp_path):
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text(
+        '[hosts.fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n',
+        encoding="utf-8",
+    )
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert result.stderr.strip() == NO_CONNECTION
+
+
+def test_setup_fastquery_calls_run_setup_rest_only(captured, monkeypatch):
+    import bigfix_remote_session_relevance
+
+    calls: list[dict] = []
+
+    def fake_run_setup(path=None, **kwargs):
+        calls.append({"path": path, **kwargs})
+        return 0
+
+    monkeypatch.setattr(bigfix_remote_session_relevance, "run_setup", fake_run_setup)
+
+    result = invoke("--setup-fastquery")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [{"path": None, "backends": ("rest",)}]
+    assert "targets" not in captured
+
+
+def test_setup_fastquery_failure_is_its_exit_code(captured, monkeypatch):
+    import bigfix_remote_session_relevance
+
+    monkeypatch.setattr(bigfix_remote_session_relevance, "run_setup", lambda **kwargs: 64)
+
+    result = invoke("--setup-fastquery")
+
+    assert result.exit_code == 64
+
+
+def test_fastquery_output_is_labelled(captured, lab_connection):
+    """Even one answering computer gets a header: the reader needs to know which."""
+    captured["results"] = [result_for("web-01", ["Linux"], transport="fastquery")]
+
+    result = invoke("--fastquery", "lab", "--computer-id", "11", "name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert "== fastquery:web-01" in result.stdout
+
+
+def test_update_inventory_skips_fastquery_results(captured, tmp_path, monkeypatch):
+    """A computer's name is not an inventory host, even when the two match."""
+    _connections(("lab", "rest"))
+    platform_calls = _spy_on_update_inventory_platform(monkeypatch)
+    arch_calls = _spy_on_update_inventory_arch(monkeypatch)
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text(
+        '[hosts.web-01]\ntransport = "ssh"\n\n'
+        '[hosts.fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n',
+        encoding="utf-8",
+    )
+    captured["results"] = [
+        ClientRelevanceResult(
+            host="web-01",
+            transport="fastquery",
+            client_relevance="true",
+            platform="windows",
+            arch="x86_64",
+        )
+    ]
+
+    result = invoke("--inventory", str(inventory), "true")
+
+    assert result.exit_code == 0, result.output
+    assert platform_calls == [] and arch_calls == []
+
+
+def test_malformed_connection_config_names_its_cause(captured):
+    """Same advice, plus why: a broken file is not fixed by guessing."""
+    import os
+    from pathlib import Path
+
+    Path(os.environ["BFRSR_CONFIG"]).write_text("[[connections]\nname = ", encoding="utf-8")
+
+    result = invoke("--fastquery", "lab", "--computer-id", "1", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    message = result.stderr.strip()
+    assert message.startswith(NO_CONNECTION)
+    assert "cannot parse" in message
+    assert "targets" not in captured

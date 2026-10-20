@@ -78,7 +78,7 @@ from bigfix_remote_client_relevance.serialize import (
     result_to_dict,
     results_to_dicts,
 )
-from bigfix_remote_client_relevance.transports import Transport
+from bigfix_remote_client_relevance.transports import FanOutTransport, Transport
 from bigfix_remote_client_relevance.transports.container import (
     TransportContainer,
     reclaim_stray_containers,
@@ -111,6 +111,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "BigFixRelevanceError",
     "ClientRelevanceResult",
+    "FanOutTransport",
     "InventoryError",
     "ParsedQnaOutput",
     "ResolvedQna",
