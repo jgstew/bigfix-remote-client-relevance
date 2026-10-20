@@ -42,12 +42,11 @@ from bigfix_remote_client_relevance.orchestrate import (
     DEFAULT_MAX_PARALLEL,
     DEFAULT_PULL_PARALLEL,
     EXIT_QNA,
-    NO_FASTQUERY_CONNECTION,
     Target,
     count_work,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
-    fastquery_connection,
+    require_fastquery_connection,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.render import (
@@ -824,19 +823,15 @@ def evaluate(
                 computer_query=computer_query,
             )
         )
-    # One message whichever is wrong -- unknown, disabled, or not REST --
-    # because the fix is the same: set one up. An unparsable config file
-    # raises instead, with its cause appended.
-    try:
-        unusable = any(
-            fastquery_connection(target.connection) is None
-            for target in targets
-            if target.kind == "fastquery"
-        )
-    except ValueError as exc:
-        _fail(str(exc))
-    if unusable:
-        _fail(NO_FASTQUERY_CONNECTION)
+    # Only the ad hoc --fastquery target is checked up front: it is the whole
+    # run, so failing fast beats a one-line failed result. An inventory
+    # entry is left to the orchestrator, which reports it as that host's
+    # failure and still runs every other host.
+    if fastquery:
+        try:
+            require_fastquery_connection(fastquery)
+        except ValueError as exc:
+            _fail(str(exc))
     if local:
         # `become` stays whatever the caller passed (True/False/unspecified);
         # default_transport_factory is where an unspecified value resolves,

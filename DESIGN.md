@@ -822,9 +822,13 @@ bigfix-remote-client-relevance --setup-fastquery
   or `~/.bigfix/.remote_session_connections.toml`), with targets from
   `--computer-id ID` (repeatable) and/or `--computer-query
   SESSION_RELEVANCE`. It composes with `--inventory`. Usage errors (exit
-  64): no usable connection (unknown, disabled, or not REST) — always
-  "no REST or SaaS connection found, which Fast Query requires; run
-  --setup-fastquery", naming no other backend; `--fastquery` with
+  64): no usable connection for `--fastquery`, with the reason named —
+  unknown, disabled, or a backend without ClientQuery (e.g. "connection
+  'x' is a saas connection, and Fast Query only works through REST so
+  far; run --setup-fastquery to add a REST connection"). An inventory
+  fastquery host with an unusable connection is not a usage error: it
+  fails as that host's transport error and the other hosts still run;
+  `--fastquery` with
   `--local`, `--container`, `--online-evaluator` or `--qna-version`;
   `--computer-*` without `--fastquery`; `--fastquery` with no target. As
   with `--container`, every positional is client relevance, so a `HOST`

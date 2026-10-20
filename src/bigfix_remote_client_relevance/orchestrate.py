@@ -252,9 +252,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
 
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
-        conn = fastquery_connection(target.connection)
-        if conn is None:
-            raise ValueError(NO_FASTQUERY_CONNECTION)
+        conn = require_fastquery_connection(target.connection)
         # Not entered as a context manager: the transport owns it from here,
         # and the fan-out's _release closes it through TransportFastQuery.aclose.
         backend = RestBackend.from_config(conn, trust=TrustStore())
@@ -275,39 +273,42 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
     raise ValueError(f"unknown target kind {target.kind!r}")
 
 
-NO_FASTQUERY_CONNECTION = (
-    "no REST or SaaS connection found, which Fast Query requires; run --setup-fastquery"
-)
+SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST connection"
 
-# Backends with a ClientQuery API. SaaS joins once it has a supported one.
+# Backends with a ClientQuery API. SaaS joins once bigfix-remote-session-
+# relevance gives it one.
 FASTQUERY_BACKENDS = frozenset({"rest"})
 
 
-def fastquery_connection(name: str | None) -> ConnectionConfig | None:
-    """The enabled connection called ``name`` if Fast Query can use it, else None.
+def require_fastquery_connection(name: str | None) -> ConnectionConfig:
+    """The enabled connection called ``name``, if Fast Query can use it.
 
-    Unknown, disabled, and the wrong kind of connection are all the same
-    answer to a caller: there is nothing here to run Fast Query through.
-    A config file that cannot be read or parsed is different -- setting up
-    another connection would not fix it -- so that raises ``ValueError``
-    with the usual advice plus the cause.
+    Otherwise raises ``ValueError`` saying which of unknown, disabled, or
+    the wrong backend it is: "none found" for a SaaS connection that plainly
+    exists sent the user hunting for a config problem they did not have.
     """
     from bigfix_remote_session_relevance import ConfigError, load_config
 
     if not name:
-        return None
+        raise ValueError(f"Fast Query needs a connection; {SETUP_FASTQUERY_ADVICE}")
     try:
         config = load_config()
     except ConfigError as exc:
-        raise ValueError(f"{NO_FASTQUERY_CONNECTION} ({exc})") from exc
+        # No setup advice: the wizard would have to read this same file, so
+        # the cause is the whole message -- fixing the file is the fix.
+        raise ValueError(f"cannot read the connection config for Fast Query ({exc})") from exc
     try:
         conn = config.connection(name)
     except ConfigError as exc:
-        logger.debug("no usable Fast Query connection %r: %s", name, exc)
-        return None
-    if not conn.enabled or conn.backend not in FASTQUERY_BACKENDS:
-        logger.debug("connection %r is %s, not usable for Fast Query", name, conn.backend)
-        return None
+        logger.debug("no Fast Query connection %r: %s", name, exc)
+        raise ValueError(f"no connection named {name!r}; {SETUP_FASTQUERY_ADVICE}") from exc
+    if not conn.enabled:
+        raise ValueError(f"connection {name!r} is disabled; enable it to use Fast Query")
+    if conn.backend not in FASTQUERY_BACKENDS:
+        raise ValueError(
+            f"connection {name!r} is a {conn.backend} connection, and Fast Query "
+            f"only works through REST so far; {SETUP_FASTQUERY_ADVICE}"
+        )
     return conn
 
 

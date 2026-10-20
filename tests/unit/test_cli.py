@@ -1477,9 +1477,7 @@ def test_auto_discovery_ssh_list_goes_to_stderr_not_stdout(captured, tmp_path, m
 
 # --- Fast Query --------------------------------------------------------------
 
-NO_CONNECTION = (
-    "error: no REST or SaaS connection found, which Fast Query requires; run --setup-fastquery"
-)
+SETUP_ADVICE = "run --setup-fastquery to add a REST connection"
 
 
 def _connections(*entries: tuple[str, str]) -> None:
@@ -1487,8 +1485,11 @@ def _connections(*entries: tuple[str, str]) -> None:
     import os
     from pathlib import Path
 
+    # SaaS only accepts a real login host; anything else fails to parse.
+    servers = {"saas": "https://login.bigfix.com"}
     text = "".join(
-        f'[[connections]]\nname = "{name}"\nbackend = "{backend}"\nserver = "bigfix.example"\n'
+        f'[[connections]]\nname = "{name}"\nbackend = "{backend}"\n'
+        f'server = "{servers.get(backend, "bigfix.example")}"\n'
         'username = "op"\npassword = "<PASSWORD>"\n'
         for name, backend in entries
     )
@@ -1568,34 +1569,66 @@ def test_fastquery_requires_a_target(captured, lab_connection):
 
 
 @pytest.mark.parametrize(
-    "configured",
+    ("configured", "reason"),
     [
-        [],  # nothing configured at all
-        [("other", "rest")],  # the name is unknown
-        [("lab", "webreports")],  # the name is not a REST (or SaaS) connection
+        ([], "no connection named 'lab'"),  # nothing configured at all
+        ([("other", "rest")], "no connection named 'lab'"),  # the name is unknown
+        ([("lab", "webreports")], "'lab' is a webreports connection"),  # not REST
     ],
 )
-def test_no_usable_connection_suggests_setup_fastquery(captured, configured):
+def test_no_usable_connection_suggests_setup_fastquery(captured, configured, reason):
     _connections(*configured)
 
     result = invoke("--fastquery", "lab", "--computer-id", "1", "true")
 
     assert result.exit_code == USAGE_EXIT_CODE
-    assert result.stderr.strip() == NO_CONNECTION
+    message = result.stderr.strip()
+    assert reason in message and message.endswith(SETUP_ADVICE)
     assert "targets" not in captured
 
 
-def test_inventory_fastquery_host_without_a_usable_connection_is_refused(captured, tmp_path):
+def test_inventory_fastquery_host_without_a_usable_connection_does_not_halt(captured, tmp_path):
+    """One unusable inventory entry must not stop the rest of the run; the
+    orchestrator reports it as that host's failure instead."""
     inventory = tmp_path / "remote_clients.toml"
     inventory.write_text(
-        '[hosts.fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n',
+        '[hosts.fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n\n'
+        '[hosts.box]\ntransport = "ssh"\n',
         encoding="utf-8",
     )
 
     result = invoke("--inventory", str(inventory), "true")
 
+    assert result.exit_code == 0, result.output
+    assert [t.name for t in captured["targets"]] == ["fleet", "box"]
+
+
+def test_disabled_connection_says_so(captured):
+    import os
+    from pathlib import Path
+
+    _connections(("lab", "rest"))
+    path = Path(os.environ["BFRSR_CONFIG"])
+    path.write_text(path.read_text(encoding="utf-8") + "enabled = false\n", encoding="utf-8")
+
+    result = invoke("--fastquery", "lab", "--computer-id", "1", "true")
+
     assert result.exit_code == USAGE_EXIT_CODE
-    assert result.stderr.strip() == NO_CONNECTION
+    assert "connection 'lab' is disabled" in result.stderr
+    assert "targets" not in captured
+
+
+def test_saas_connection_says_fastquery_cannot_use_saas_yet(captured):
+    """A SaaS connection exists; "none found" sent the user looking for the
+    wrong problem."""
+    _connections(("james-saas", "saas"))
+
+    result = invoke("--fastquery", "james-saas", "--computer-id", "1", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    message = result.stderr.strip()
+    assert "'james-saas'" in message and "saas" in message and "REST" in message
+    assert "targets" not in captured
 
 
 def test_setup_fastquery_calls_run_setup_rest_only(captured, monkeypatch):
@@ -1674,6 +1707,7 @@ def test_malformed_connection_config_names_its_cause(captured):
 
     assert result.exit_code == USAGE_EXIT_CODE
     message = result.stderr.strip()
-    assert message.startswith(NO_CONNECTION)
     assert "cannot parse" in message
+    # Setup cannot repair a file it would have to parse first.
+    assert "--setup-fastquery" not in message
     assert "targets" not in captured

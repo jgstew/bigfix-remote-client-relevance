@@ -20,6 +20,7 @@ from bigfix_remote_client_relevance.orchestrate import (
     EXIT_TRANSPORT,
     Target,
     count_work,
+    default_transport_factory,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
     worst_exit_code,
@@ -2314,10 +2315,44 @@ def test_default_factory_builds_fastquery_from_the_named_rest_connection():
 def test_default_factory_refuses_an_unknown_fastquery_connection():
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
 
-    with pytest.raises(ValueError, match="no REST or SaaS connection found"):
+    with pytest.raises(ValueError, match="no connection named 'nope'.*--setup-fastquery"):
         default_transport_factory(
             Target(kind="fastquery", name="lab", connection="nope", computer_ids=(1,))
         )
+
+
+def test_default_factory_names_why_a_saas_connection_is_unusable():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "cloud"\nbackend = "saas"\nserver = "https://login.bigfix.com"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    with pytest.raises(ValueError, match="'cloud' is a saas connection.*REST"):
+        default_transport_factory(
+            Target(kind="fastquery", name="cloud", connection="cloud", computer_ids=(1,))
+        )
+
+
+async def test_unusable_fastquery_connection_fails_only_its_own_host():
+    """The factory's refusal becomes that host's result, not the run's end."""
+    results = await evaluate_client_relevance(
+        "true",
+        [
+            Target(kind="fastquery", name="fleet", connection="nope", computer_ids=(1,)),
+            Target(kind="ssh", name="host0"),
+        ],
+        transport_factory=lambda t: (
+            default_transport_factory(t) if t.kind == "fastquery" else FakeTransport(t.name)
+        ),
+    )
+
+    by_host = {r.host: r for r in results}
+    assert by_host["fleet"].error_kind == ERROR_KIND_TRANSPORT
+    assert "setup-fastquery" in (by_host["fleet"].error or "")
+    assert by_host["host0"].error is None
 
 
 def test_default_factory_names_a_malformed_connection_config():
@@ -2325,7 +2360,7 @@ def test_default_factory_names_a_malformed_connection_config():
 
     _write_connections("[[connections]\nname = ")
 
-    with pytest.raises(ValueError, match="no REST or SaaS connection found.*cannot parse"):
+    with pytest.raises(ValueError, match=r"cannot parse[^;]*\)$"):
         default_transport_factory(
             Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1,))
         )
