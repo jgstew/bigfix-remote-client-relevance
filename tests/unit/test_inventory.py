@@ -305,3 +305,87 @@ idle_ttl_s = 1800
     (target,) = load_inventory(path)
 
     assert target.idle_ttl_s == 1800
+
+
+# --- fastquery hosts --------------------------------------------------------
+
+
+def _load_one(tmp_path, body: str):
+    path = tmp_path / "remote_clients.toml"
+    path.write_text(body, encoding="utf-8")
+    return load_inventory(path)
+
+
+def test_fastquery_fields_populate_target(tmp_path):
+    [target] = _load_one(
+        tmp_path,
+        """
+[hosts.lab-fleet]
+transport = "fastquery"
+connection = "lab"
+computer_ids = [11, 12]
+computer_query = 'bes computers whose (name of it starts with "web")'
+""",
+    )
+
+    assert target.kind == "fastquery"
+    assert target.connection == "lab"
+    assert target.computer_ids == (11, 12)
+    assert target.computer_query == 'bes computers whose (name of it starts with "web")'
+
+
+def test_fastquery_host_may_give_only_a_computer_query(tmp_path):
+    [target] = _load_one(
+        tmp_path,
+        """
+[hosts.lab-fleet]
+transport = "fastquery"
+connection = "lab"
+computer_query = "bes computers"
+""",
+    )
+
+    assert target.computer_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("body", "complaint"),
+    [
+        ("computer_ids = [1]", "`connection`"),
+        ('connection = "lab"', "`computer_ids` or `computer_query`"),
+        ('connection = "lab"\ncomputer_ids = []', "`computer_ids` or `computer_query`"),
+        ('connection = "lab"\ncomputer_ids = ["web1"]', "integers"),
+        ('connection = "lab"\ncomputer_ids = 5', "integers"),
+        ('connection = "lab"\ncomputer_ids = [true]', "integers"),
+    ],
+)
+def test_fastquery_host_needs_connection_and_target(tmp_path, body, complaint):
+    with pytest.raises(InventoryError, match="lab-fleet") as excinfo:
+        _load_one(tmp_path, f'[hosts.lab-fleet]\ntransport = "fastquery"\n{body}\n')
+
+    assert complaint in str(excinfo.value)
+
+
+@pytest.mark.parametrize("key", ['platform = "windows"', 'arch = "x86_64"'])
+def test_fastquery_host_rejects_platform_and_arch(tmp_path, key):
+    """A fastquery host is many endpoints; one platform or arch fits none."""
+    with pytest.raises(InventoryError, match="lab-fleet") as excinfo:
+        _load_one(
+            tmp_path,
+            f'[hosts.lab-fleet]\ntransport = "fastquery"\nconnection = "lab"\n'
+            f"computer_ids = [1]\n{key}\n",
+        )
+
+    assert key.split()[0] in str(excinfo.value)
+
+
+def test_fastquery_host_ignores_a_defaults_platform(tmp_path):
+    """[defaults] apply to the hosts they fit; a fleet-wide arch is not an
+    error on the fastquery host that cannot use it."""
+    [target] = _load_one(
+        tmp_path,
+        '[defaults]\narch = "x86_64"\n\n'
+        '[hosts.lab-fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n',
+    )
+
+    assert target.arch is None and target.platform is None

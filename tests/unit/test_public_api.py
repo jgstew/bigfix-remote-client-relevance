@@ -38,6 +38,7 @@ EXPECTED_ROOT_EXPORTS = [
     "ResolvedQna",
     "ResultPayload",
     "SCHEMA_VERSION",
+    "FanOutTransport",
     "Target",
     "Transport",
     "TransportContainer",

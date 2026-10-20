@@ -1,7 +1,9 @@
 # bigfix-remote-client-relevance
 
 Evaluate BigFix **client relevance** on remote endpoints and inside containers
-via `qna`, without a full BES install — over SSH, in Docker, or locally.
+via `qna`, without a full BES install — over SSH, in Docker, or locally — or
+on managed endpoints with their own BES agent, through BigFix
+[Fast Query](#fast-query).
 
 The point is a fast edit → evaluate loop while authoring content, instead of
 the minutes-long action-deployment round trip. A future MCP server can import
@@ -10,7 +12,9 @@ this package so AI agents can write and test client relevance the same way.
 > **Client relevance, not session relevance.** This deals only with the dialect
 > `qna` and the BES client evaluate on an endpoint. Session relevance — the
 > `bes-*` object model queried through the root server's REST `/api/query` —
-> is a different dialect and out of scope.
+> is a different dialect and out of scope. (Fast Query's `--computer-query`
+> is the one exception: session relevance that only picks which computers to
+> ask.)
 
 See [DESIGN.md](DESIGN.md) for the full design and rationale.
 
@@ -207,6 +211,67 @@ transport = "container"
 image = "ubuntu:22.04"
 ```
 
+### Fast Query
+
+Fast Query sends client relevance to real managed endpoints through a BigFix
+server; each endpoint answers with its own installed agent, usually within
+seconds. It needs a REST connection, which this tool shares with
+[bigfix-remote-session-relevance](https://github.com/jgstew/bigfix-remote-session-relevance)
+(one config file, one certificate pin store, one login). Set one up once:
+
+```bash
+bigfix-remote-client-relevance --setup-fastquery
+```
+
+That runs session-relevance's setup wizard, limited to REST, and saves the
+connection to `$BFRSR_CONFIG` or `~/.bigfix/.remote_session_connections.toml`.
+(`uvx` only puts this package's own commands on PATH, which is why the flag
+is here.)
+
+Then name the connection and the computers to ask, by BigFix computer ID
+(`--computer-id`, repeatable) and/or by session relevance
+(`--computer-query`, resolved on the server with `ids of (...)`):
+
+```bash
+bigfix-remote-client-relevance --fastquery lab --computer-id 1234567 --computer-id 7654321 "name of operating system"
+bigfix-remote-client-relevance --fastquery lab --computer-query 'bes computers whose (name of it starts with "web")' "name of operating system"
+```
+
+Each computer that answers gets its own result, labelled with its name. The
+tool polls (after 2 s, then ×1.5 up to every 15 s, with the last check
+landing on `--timeout`) and stops as soon as every computer has answered. A
+computer that hasn't by then is reported as a transport error ("no answer
+within N s"). An inventory host can do the same:
+
+```toml
+[hosts.lab-web]
+transport = "fastquery"
+connection = "lab"           # a REST connection in the session-relevance config
+computer_ids = [1234567]     # and/or computer_query = "<session relevance>"
+```
+
+Requirements and limits:
+
+- Clients and relays must be **9.5 Patch 2 or later**, and reachable by UDP
+  notification or a persistent connection; otherwise they never answer.
+- Non-master operators need the **"Can Submit Queries"** permission. A
+  computer outside the operator's scope is accepted by the server but never
+  answers, so it shows up as "no answer".
+- Each client stops evaluating a query after its own limit, independent of
+  `--timeout`: `_BESClient_Query_NMOMaxQueryTime` (default 10 s) for
+  non-master operators and `_BESClient_Query_MOMaxQueryTime` (default 60 s)
+  for master operators, per HCL's
+  [How BigFix manages BigFix Query requests](https://help.hcl-software.com/bigfix/11.0/platform/Platform/Config/c_question_answer_flow.html).
+  A slow inspector can fail on the endpoint however long this tool waits.
+- Only the operator who submitted a query can read its results.
+- **No version pinning:** endpoints evaluate with whatever agent they have,
+  so `--fastquery` can't be combined with `--qna-version` (or `--local`,
+  `--container`, `--online-evaluator`). It composes with `--inventory`.
+- Answers come back as text without types, so `answer_types` is empty.
+  An empty plural answer can't be told apart from an empty string: both
+  come back as `answers` `[""]`, not `[]`.
+- REST only for now; BigFix SaaS is not supported yet.
+
 ## As a library
 
 ```python
@@ -354,7 +419,7 @@ return {
 | Need | Use |
 |---|---|
 | the tool body | `evaluate_client_relevance` (batched) or `evaluate_client_relevance_stream` (completion order) |
-| progress notifications | `count_work(targets, qna_version)` for the total |
+| progress notifications | `count_work(targets, qna_version)` for the total (a minimum when a Fast Query target answers per computer) |
 | `structuredContent` | `result_to_dict` / `results_to_dicts`, typed as `ResultPayload` |
 | `outputSchema` | `RESULT_JSON_SCHEMA` (JSON Schema 2020-12), versioned by `SCHEMA_VERSION` |
 | the text `content` block | `format_result` / `format_results` — the CLI's own rendering, without typer |
@@ -580,6 +645,7 @@ falls back to podman only if Docker is unreachable), `docker`, or `podman`.
 
 - Python 3.11+
 - Docker or podman for `--container`; SSH access for remote hosts
+- A BigFix REST connection for `--fastquery` (see § Fast Query)
 - On macOS, `qna` needs root — `--local` implies `--become` there automatically
   (pass `--no-become` to opt out); over SSH it stays opt-in, since the remote
   platform isn't known up front. `--become` uses `sudo -n`, so it needs

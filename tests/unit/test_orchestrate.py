@@ -1449,7 +1449,9 @@ async def test_online_evaluator_arch_probe_is_skipped_once_configured():
     assert results[0].arch == "x86_64"
 
 
-async def test_fastquery_arch_is_probed_when_inventory_backed():
+async def test_fastquery_arch_not_probed():
+    """One Fast Query target is many endpoints, so there is no one arch to
+    probe or persist, even for an updatable inventory host."""
     transport = FakeArchProbingTransport("deployment", "x86_64")
 
     results = await evaluate_client_relevance(
@@ -1458,8 +1460,8 @@ async def test_fastquery_arch_is_probed_when_inventory_backed():
         transport_factory=lambda t: transport,
     )
 
-    assert transport.probed == 1
-    assert results[0].arch == "x86_64"
+    assert transport.probed == 0
+    assert results[0].arch is None
 
 
 async def test_fastquery_arch_is_not_probed_for_an_ad_hoc_target():
@@ -1621,7 +1623,7 @@ async def test_a_failed_evaluation_still_closes_its_transport():
 
 
 async def test_a_transport_without_aclose_is_left_alone():
-    """local and fastquery have no aclose; the fan-out must not require one."""
+    """local has no aclose; the fan-out must not require one."""
     results = await evaluate_client_relevance(
         "true",
         [Target(kind="local", name="local")],
@@ -2131,3 +2133,171 @@ async def test_fallback_logging_stays_quiet_by_default(tmp_path, caplog):
     first_run, second_run = levels
     assert first_run == [logging.INFO]
     assert second_run and all(level == logging.DEBUG for level in second_run)
+
+
+# --- fan-out transports: one target, many results ---------------------------
+
+
+class FakeFanOutTransport:
+    """A Fast Query-style transport: every evaluation answers for several hosts."""
+
+    def __init__(self, hosts: list[str]) -> None:
+        self.hosts = hosts
+        self.single_calls = 0
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        self.single_calls += 1
+        return (await self.evaluate_client_relevance_fanout(client_relevance))[0]
+
+    async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+        return [
+            ClientRelevanceResult(
+                host=host,
+                transport="fastquery",
+                client_relevance=client_relevance,
+                answers=[f"{client_relevance}@{host}"],
+            )
+            for host in self.hosts
+        ]
+
+
+async def test_fanout_emits_every_result_without_overwrite():
+    transport = FakeFanOutTransport(["alpha", "beta", "gamma"])
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="lab"), Target(kind="ssh", name="host0")],
+        transport_factory=lambda t: transport if t.kind == "fastquery" else FakeTransport(t.name),
+    )
+
+    assert [r.host for r in results] == ["alpha", "beta", "gamma", "host0"]
+    assert transport.single_calls == 0
+
+
+async def test_fanout_results_also_stream():
+    results = [
+        result
+        async for result in evaluate_client_relevance_stream(
+            "true",
+            [Target(kind="fastquery", name="lab")],
+            transport_factory=lambda t: FakeFanOutTransport(["alpha", "beta"]),
+        )
+    ]
+
+    assert sorted(r.host for r in results) == ["alpha", "beta"]
+
+
+async def test_fanout_ordered_by_expression_then_host():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    results = await evaluate_many(
+        ["a", "b"],
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: FakeFanOutTransport(["alpha", "beta"]),
+    )
+
+    assert [(r.client_relevance, r.host) for r in results] == [
+        ("a", "alpha"),
+        ("a", "beta"),
+        ("b", "alpha"),
+        ("b", "beta"),
+    ]
+
+
+async def test_fanout_results_are_not_stamped_with_the_target_platform_or_arch():
+    """One target is many endpoints: a platform or arch set on it describes
+    none of them in particular, so it must not be copied onto each result."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="lab", platform="windows", arch="x86_64")],
+        transport_factory=lambda t: FakeFanOutTransport(["alpha", "beta"]),
+    )
+
+    assert all(r.elapsed_ms is not None for r in results)
+    assert all(r.platform is None and r.arch is None for r in results)
+
+
+async def test_fanout_that_raises_is_one_transport_failure():
+    class Exploding(FakeFanOutTransport):
+        async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+            raise RuntimeError("boom")
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: Exploding([]),
+    )
+
+    assert len(results) == 1
+    assert results[0].error_kind == ERROR_KIND_TRANSPORT
+    assert "boom" in (results[0].error or "")
+
+
+async def test_fanout_that_returns_nothing_still_answers_once():
+    """count_work promised at least one result per cell."""
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: FakeFanOutTransport([]),
+    )
+
+    assert len(results) == 1
+    assert results[0].error_kind == ERROR_KIND_TRANSPORT
+
+
+def _write_connections(text: str) -> None:
+    import os
+
+    path = Path(os.environ["BFRSR_CONFIG"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_default_factory_builds_fastquery_from_the_named_rest_connection():
+    from bigfix_remote_session_relevance import RestBackend
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "lab"\nbackend = "rest"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    transport = default_transport_factory(
+        Target(
+            kind="fastquery",
+            name="lab",
+            connection="lab",
+            computer_ids=(11, 12),
+            computer_query="bes computers",
+        )
+    )
+
+    assert isinstance(transport, TransportFastQuery)
+    assert isinstance(transport._backend, RestBackend)
+    assert transport._computer_ids == [11, 12]
+    assert transport._computer_query == "bes computers"
+
+
+def test_default_factory_refuses_an_unknown_fastquery_connection():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    with pytest.raises(ValueError, match="no REST or SaaS connection found"):
+        default_transport_factory(
+            Target(kind="fastquery", name="lab", connection="nope", computer_ids=(1,))
+        )
+
+
+def test_default_factory_names_a_malformed_connection_config():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    _write_connections("[[connections]\nname = ")
+
+    with pytest.raises(ValueError, match="no REST or SaaS connection found.*cannot parse"):
+        default_transport_factory(
+            Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1,))
+        )

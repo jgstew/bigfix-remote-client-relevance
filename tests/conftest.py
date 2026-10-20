@@ -31,6 +31,37 @@ def _isolated_compat_memory(tmp_path, monkeypatch):
     monkeypatch.setattr(compat_memory, "default_path", lambda: tmp_path / "compat_memory.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_bigfix_connections(request, tmp_path, monkeypatch):
+    """Never read or write the real ~/.bigfix session-relevance state.
+
+    bigfix-remote-session-relevance keeps its connection config and pinned
+    certificates under HOME, and falls back to ~/.besapi.conf, BES_*
+    variables and this machine's own root server credentials. Each is pointed
+    at nothing here. HOME itself is left alone on purpose: the container
+    transport finds the Docker socket under it, and without one the factory
+    tests try to start Docker Desktop. An existing (empty) config file is
+    what keeps load_config from falling back to ~/.besapi.conf.
+
+    A live Fast Query test keeps the real config, which is its whole point.
+    """
+    if "fastquery_live" in request.keywords:
+        return
+    from bigfix_remote_session_relevance import trust
+
+    state = tmp_path / "bfrsr-isolated"
+    state.mkdir()
+    config = state / ".remote_session_connections.toml"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BFRSR_CONFIG", str(config))
+    monkeypatch.setenv("BFRSR_LOCAL_ROOT_SERVER", "0")
+    for var in ("BES_ROOT_SERVER", "BES_USER_NAME", "BES_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        trust, "default_known_certs_path", lambda: state / ".remote_session_known_certs.toml"
+    )
+
+
 # --- fixture loaders -------------------------------------------------------
 
 
@@ -375,6 +406,18 @@ def pytest_collection_modifyitems(config, items):
             ok, reason = _ssh_windows_status()
             if not ok:
                 item.add_marker(pytest.mark.skip(reason=reason))
+        if "fastquery_live" in item.keywords and not (
+            os.environ.get("BFRCR_FASTQUERY_CONNECTION")
+            and os.environ.get("BFRCR_FASTQUERY_COMPUTER_ID")
+        ):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=(
+                        "set BFRCR_FASTQUERY_CONNECTION and BFRCR_FASTQUERY_COMPUTER_ID "
+                        "to run the live Fast Query test"
+                    )
+                )
+            )
         if "network" in item.keywords and os.environ.get("BFRCR_NETWORK_TESTS") != "1":
             item.add_marker(
                 pytest.mark.skip(reason="network tests are opt-in: set BFRCR_NETWORK_TESTS=1")

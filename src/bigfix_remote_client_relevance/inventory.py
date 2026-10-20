@@ -16,6 +16,11 @@ Example::
     [hosts.web-eval]
     transport = "online_evaluator"
     base_url = "https://developer.bigfix.com"
+
+    [hosts.lab-fleet]           # BigFix Fast Query, one result per computer
+    transport = "fastquery"
+    connection = "lab"          # a REST connection in the session-relevance config
+    computer_ids = [11, 12]     # and/or computer_query = "<session relevance>"
 """
 
 from __future__ import annotations
@@ -114,10 +119,28 @@ def _target_from_entry(
     if kind == "online_evaluator" and not base_url:
         raise InventoryError(f"online_evaluator host {name!r} in {path} needs a `base_url`")
 
+    connection = setting("connection")
+    computer_ids: tuple[int, ...] = ()
+    computer_query = setting("computer_query")
+    if kind == "fastquery":
+        # One host is many endpoints, so a platform or arch written on it
+        # would describe none of them; [defaults] ones are just not applied.
+        for key in ("platform", "arch"):
+            if key in config:
+                raise InventoryError(
+                    f"fastquery host {name!r} in {path} cannot set `{key}`: it stands for "
+                    "many computers, each answering for itself"
+                )
+        computer_ids = _fastquery_settings(name, path, connection, setting("computer_ids"))
+        if not computer_ids and not computer_query:
+            raise InventoryError(
+                f"fastquery host {name!r} in {path} needs `computer_ids` or `computer_query`"
+            )
+
     user = setting("user")
     version = setting("qna_version")
-    platform = setting("platform")
-    arch = setting("arch")
+    platform = setting("platform") if kind != "fastquery" else None
+    arch = setting("arch") if kind != "fastquery" else None
     become_raw = setting("become")
 
     return Target(
@@ -130,6 +153,9 @@ def _target_from_entry(
         become=bool(become_raw) if become_raw is not None else None,
         image=str(image) if image is not None else None,
         base_url=str(base_url) if base_url is not None else None,
+        connection=str(connection) if connection is not None else None,
+        computer_ids=computer_ids,
+        computer_query=str(computer_query) if computer_query else None,
         # None (rather than a hardcoded default) when unset, same as
         # `platform` below: ssh/local targets get it probed (see
         # orchestrate._one()); a container needs an explicit one, which the
@@ -142,6 +168,24 @@ def _target_from_entry(
         auto_setup=bool(setting("auto_setup", True)),
         verify_host_key=bool(setting("verify_host_key", True)),
     )
+
+
+def _fastquery_settings(
+    name: str, path: Path, connection: object, raw_ids: object
+) -> tuple[int, ...]:
+    """Check a fastquery host's `connection` and return its `computer_ids`."""
+    if not connection:
+        raise InventoryError(f"fastquery host {name!r} in {path} needs a `connection`")
+    if raw_ids is None:
+        return ()
+    # bool is an int subclass; `computer_ids = [true]` is a typo, not ID 1.
+    if not isinstance(raw_ids, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in raw_ids
+    ):
+        raise InventoryError(
+            f"fastquery host {name!r} in {path} has `computer_ids` that are not a list of integers"
+        )
+    return tuple(raw_ids)
 
 
 def _write_inventory_key(path: str | Path, host: str, key: str, value: str) -> None:

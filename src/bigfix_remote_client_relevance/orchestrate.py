@@ -30,7 +30,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError, fallback_floor
@@ -44,7 +44,10 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
-from bigfix_remote_client_relevance.transports import Transport
+from bigfix_remote_client_relevance.transports import FanOutTransport, Transport
+
+if TYPE_CHECKING:
+    from bigfix_remote_session_relevance import ConnectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -127,14 +130,26 @@ class Target:
     default, since pointing this at a live third-party service is an opt-in
     choice (see :class:`~...transports.online_evaluator.TransportOnlineEvaluator`)."""
 
+    connection: str | None = None
+    """``fastquery`` only. Name of a REST connection in the
+    bigfix-remote-session-relevance config (``$BFRSR_CONFIG`` or
+    ``~/.bigfix/.remote_session_connections.toml``)."""
+
+    computer_ids: tuple[int, ...] = ()
+    """``fastquery`` only. BigFix computer IDs to send the query to."""
+
+    computer_query: str | None = None
+    """``fastquery`` only. Session relevance selecting computers; the server
+    resolves it with ``ids of (...)``. Merged with ``computer_ids``."""
+
     inventory_backed: bool = False
     """True only when this target was loaded from a `remote_clients.toml` the
     CLI can write back to (``--inventory`` with ``--update-inventory``, the
     default -- set by the CLI, never by :func:`~...inventory.load_inventory`
-    itself). Meaningless for every kind except ``online_evaluator`` and
-    ``fastquery``: unlike ``local`` (a free ``sys.platform`` check) or ``ssh``
-    (probed anyway while resolving a version), their arch probe is a real
-    network round trip whose only purpose is a value to persist -- see
+    itself). Meaningless for every kind except ``online_evaluator``: unlike
+    ``local`` (a free ``sys.platform`` check) or ``ssh`` (probed anyway while
+    resolving a version), its arch probe is a real network round trip whose
+    only purpose is a value to persist -- see
     ``_one()``'s arch-probe block. False for every ad hoc target (CLI flags,
     or a `Target` built directly by a library caller) and for an inventory
     host loaded with ``--no-update-inventory``, since a probed value would
@@ -233,9 +248,22 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             coordinator=coordinator,  # type: ignore[arg-type]
         )
     if target.kind == "fastquery":
+        from bigfix_remote_session_relevance import RestBackend, TrustStore
+
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
-        return TransportFastQuery(target.extra.get("besapi_client"))
+        conn = fastquery_connection(target.connection)
+        if conn is None:
+            raise ValueError(NO_FASTQUERY_CONNECTION)
+        # Not entered as a context manager: the transport owns it from here,
+        # and the fan-out's _release closes it through TransportFastQuery.aclose.
+        backend = RestBackend.from_config(conn, trust=TrustStore())
+        return TransportFastQuery(
+            backend,
+            computer_ids=target.computer_ids,
+            computer_query=target.computer_query,
+            host=target.name,
+        )
     if target.kind == "online_evaluator":
         from bigfix_remote_client_relevance.transports.online_evaluator import (
             TransportOnlineEvaluator,
@@ -245,6 +273,42 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             raise ValueError("online_evaluator target needs base_url")
         return TransportOnlineEvaluator(target.base_url, host=target.name)
     raise ValueError(f"unknown target kind {target.kind!r}")
+
+
+NO_FASTQUERY_CONNECTION = (
+    "no REST or SaaS connection found, which Fast Query requires; run --setup-fastquery"
+)
+
+# Backends with a ClientQuery API. SaaS joins once it has a supported one.
+FASTQUERY_BACKENDS = frozenset({"rest"})
+
+
+def fastquery_connection(name: str | None) -> ConnectionConfig | None:
+    """The enabled connection called ``name`` if Fast Query can use it, else None.
+
+    Unknown, disabled, and the wrong kind of connection are all the same
+    answer to a caller: there is nothing here to run Fast Query through.
+    A config file that cannot be read or parsed is different -- setting up
+    another connection would not fix it -- so that raises ``ValueError``
+    with the usual advice plus the cause.
+    """
+    from bigfix_remote_session_relevance import ConfigError, load_config
+
+    if not name:
+        return None
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        raise ValueError(f"{NO_FASTQUERY_CONNECTION} ({exc})") from exc
+    try:
+        conn = config.connection(name)
+    except ConfigError as exc:
+        logger.debug("no usable Fast Query connection %r: %s", name, exc)
+        return None
+    if not conn.enabled or conn.backend not in FASTQUERY_BACKENDS:
+        logger.debug("connection %r is %s, not usable for Fast Query", name, conn.backend)
+        return None
+    return conn
 
 
 async def default_resolver(spec: str | None, target: Target) -> ResolvedQna:
@@ -335,13 +399,18 @@ def count_work(
     qna_version: str | Sequence[str] | None = None,
     expressions: Sequence[str] | int | None = None,
 ) -> int:
-    """How many results a fan-out over these arguments will produce.
+    """How many results a fan-out over these arguments will produce, at least.
 
     Exposed because a streaming caller has to decide how to format its first
     result before it knows how many follow, and this is not simply
     ``len(targets)``: per-host ``qna_version`` overrides mean each target can
     contribute a different number of pairs, and a batch multiplies each pair by
     its expressions.
+
+    Exact unless a target's transport is a
+    :class:`~.transports.FanOutTransport` (``fastquery``): such a cell yields
+    one result per endpoint that answers, which is only known once it has,
+    so there the count is a floor of one per cell.
     """
     if expressions is None:
         per_pair = 1
@@ -355,8 +424,8 @@ def count_work(
 async def _release(transport: object) -> None:
     """Hand a transport back once its work is done.
 
-    Optional by design: ``local`` and ``fastquery`` hold nothing that needs
-    releasing and expose no ``aclose``. A failure here is logged, never
+    Optional by design: ``local`` holds nothing that needs releasing and
+    exposes no ``aclose``. A failure here is logged, never
     raised -- a run that produced its answers must not fail on cleanup.
     """
     closer = getattr(transport, "aclose", None)
@@ -380,8 +449,8 @@ async def _evaluate_stream_indexed(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
-) -> AsyncIterator[tuple[int, ClientRelevanceResult]]:
-    """Shared core: yield ``(work_index, result)`` as each cell finishes.
+) -> AsyncIterator[tuple[tuple[int, int], ClientRelevanceResult]]:
+    """Shared core: yield ``((work_index, sub), result)`` as each result lands.
 
     The unit of *work* is a **group** -- one (target, version) pair -- and the
     unit of *result* is a cell, one expression within a group. A group builds
@@ -393,8 +462,11 @@ async def _evaluate_stream_indexed(
     ``work_index`` is the cell's position in target-then-version-then-expression
     order, kept so callers that need that ordering
     (:func:`evaluate_client_relevance`) can reconstruct it even though
-    completion order is whatever finishes first. Every failure mode is reported
-    inside a result rather than raised.
+    completion order is whatever finishes first. ``sub`` is 0 except for a
+    :class:`~.transports.FanOutTransport`, whose one cell yields a result per
+    endpoint numbered from 0 -- so sorting the keys gives
+    expression-then-host order with nothing overwritten. Every failure mode
+    is reported inside a result rather than raised.
     """
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
@@ -436,9 +508,9 @@ async def _evaluate_stream_indexed(
         """The same failure, once per expression.
 
         A group that never gets as far as evaluating still owes one result per
-        cell: ``count_work`` is the denominator a progress indicator commits to
-        before the first result arrives, and a short run would silently
-        misreport rather than fail.
+        cell: ``count_work`` is the denominator (a floor, for fan-out
+        targets) a progress indicator commits to before the first result
+        arrives, and a short run would silently misreport rather than fail.
         """
         return [_failure(target, kind, message, expression) for expression in expressions]
 
@@ -449,9 +521,7 @@ async def _evaluate_stream_indexed(
             resolutions[key] = asyncio.create_task(resolver(spec, target))
         return await resolutions[key]
 
-    async def _group(
-        target: Target, spec: str | None, emit: Callable[[int, ClientRelevanceResult], Any]
-    ) -> None:
+    async def _group(target: Target, spec: str | None, emit: Callable[..., None]) -> None:
         """Evaluate every expression against one (target, version) pair."""
         resolved: ResolvedQna | None = None
         # Captured before any probe-before-resolve replaces target.platform,
@@ -556,20 +626,22 @@ async def _evaluate_stream_indexed(
             # the common case for BigFix clients, is always a reasonable
             # fallback, so there is no analog to UnknownTargetError here.
             #
-            # online_evaluator and fastquery are different again: unlike ssh
-            # (whose probe earns its cost by picking the right artifact),
-            # theirs is a real network round trip whose only payoff is a
-            # value to display and persist -- there is no version to resolve
-            # for either (both refuse a spec earlier and return before this
-            # point), so `spec is not None` would never gate them the way it
-            # gates ssh. Paying for that round trip is only worth it when the
-            # result can actually be written back, so `inventory_backed`
-            # (set by the CLI only for `--inventory` hosts under
-            # `--update-inventory`) is the gate instead -- an ad hoc
-            # `--online-evaluator URL` never probes at all. For both, the
-            # probe itself is relevance ("architecture of the operating
-            # system" -- see probe_arch_via_relevance) sent as an ordinary
-            # evaluation, since neither has any other side channel.
+            # online_evaluator is different again: unlike ssh (whose probe
+            # earns its cost by picking the right artifact), its probe is a
+            # real network round trip whose only payoff is a value to display
+            # and persist -- there is no version to resolve (it refuses a spec
+            # earlier and returns before this point), so `spec is not None`
+            # would never gate it the way it gates ssh. Paying for that round
+            # trip is only worth it when the result can actually be written
+            # back, so `inventory_backed` (set by the CLI only for
+            # `--inventory` hosts under `--update-inventory`) is the gate
+            # instead -- an ad hoc `--online-evaluator URL` never probes at
+            # all. The probe itself is relevance ("architecture of the
+            # operating system" -- see probe_arch_via_relevance) sent as an
+            # ordinary evaluation, since there is no other side channel.
+            #
+            # fastquery never probes: one target is many endpoints, so there
+            # is no single arch to find or persist.
             arch_probe = getattr(transport, "resolve_arch", None)
             if (
                 target.arch is None
@@ -577,9 +649,7 @@ async def _evaluate_stream_indexed(
                 and (
                     spec is not None
                     or target.kind == "local"
-                    or (
-                        target.kind in ("online_evaluator", "fastquery") and target.inventory_backed
-                    )
+                    or (target.kind == "online_evaluator" and target.inventory_backed)
                 )
             ):
                 try:
@@ -633,6 +703,15 @@ async def _evaluate_stream_indexed(
 
             if not expressions:
                 await _prepare(resolved)
+                return
+
+            if isinstance(transport, FanOutTransport):
+                # One cell, many endpoints. Nothing to fall back through:
+                # fan-out transports evaluate with whatever each endpoint has.
+                for index, expression in enumerate(expressions):
+                    cell = await _evaluate_fanout(transport, target, expression)
+                    for sub, result in enumerate(cell):
+                        emit(index, result, sub)
                 return
 
             # A build already known to be too new here is skipped outright, so
@@ -735,6 +814,33 @@ async def _evaluate_stream_indexed(
                 return candidate, result
         return None
 
+    async def _evaluate_fanout(
+        transport: FanOutTransport, target: Target, client_relevance: str
+    ) -> list[ClientRelevanceResult]:
+        """One expression against a fan-out transport: at least one result."""
+        started = time.monotonic()
+        async with semaphore:
+            try:
+                results = await transport.evaluate_client_relevance_fanout(
+                    client_relevance, timeout_s=timeout_s
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad cell never fails the run
+                logger.debug("transport failed for %s: %s", target.label, exc)
+                results = []
+                message = f"{target.label}: {exc}"
+            else:
+                message = f"{target.label}: no results"
+        if not results:
+            # count_work promised at least one result for this cell.
+            return [_failure(target, ERROR_KIND_TRANSPORT, message, client_relevance)]
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        for result in results:
+            # No platform/arch stamping, unlike _evaluate_one: the target is
+            # many endpoints, so whatever it carries describes none of them.
+            if not result.elapsed_ms:
+                result.elapsed_ms = elapsed_ms
+        return results
+
     async def _evaluate_one(
         transport: Transport,
         target: Target,
@@ -818,11 +924,11 @@ async def _evaluate_stream_indexed(
     # A queue rather than as_completed: a group now produces several results,
     # and the whole point of the streaming form is that each one is handed
     # over the moment it lands rather than when its group finishes.
-    queue: asyncio.Queue[tuple[int, ClientRelevanceResult] | None] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[tuple[int, int], ClientRelevanceResult] | None] = asyncio.Queue()
 
     async def _run_group(base: int, target: Target, spec: str | None) -> None:
-        def emit(offset: int, result: ClientRelevanceResult) -> None:
-            queue.put_nowait((base + offset, result))
+        def emit(offset: int, result: ClientRelevanceResult, sub: int = 0) -> None:
+            queue.put_nowait(((base + offset, sub), result))
 
         try:
             await _group(target, spec, emit)
@@ -907,11 +1013,13 @@ async def evaluate_client_relevance(
     """Evaluate ``client_relevance`` on every target, for every version.
 
     Returns one result per (target, version) pair, in target-then-version
-    order. Every failure mode is reported inside a result rather than raised.
+    order -- or, for a fan-out target such as Fast Query, one per endpoint
+    that pair reached, in host order. Every failure mode is reported inside a
+    result rather than raised.
     Waits for the whole fan-out; for incremental results as they arrive, use
     :func:`evaluate_client_relevance_stream`.
     """
-    by_index: dict[int, ClientRelevanceResult] = {}
+    by_index: dict[tuple[int, int], ClientRelevanceResult] = {}
     async for index, result in _evaluate_stream_indexed(
         [client_relevance],
         targets,
@@ -925,7 +1033,7 @@ async def evaluate_client_relevance(
         compat_memory=compat_memory,
     ):
         by_index[index] = result
-    return [by_index[i] for i in range(len(by_index))]
+    return [by_index[key] for key in sorted(by_index)]
 
 
 async def evaluate_many_stream(
@@ -991,9 +1099,11 @@ async def evaluate_many(
 
     Every failure mode is reported inside a result rather than raised, and a
     group that dies before evaluating anything still answers once per
-    expression, so the result count always matches :func:`count_work`.
+    expression, so the result count matches :func:`count_work` -- exactly,
+    except that a fan-out target (Fast Query) adds a result per endpoint
+    beyond the first, so there it is at least that count.
     """
-    by_index: dict[int, ClientRelevanceResult] = {}
+    by_index: dict[tuple[int, int], ClientRelevanceResult] = {}
     async for index, result in _evaluate_stream_indexed(
         expressions,
         targets,
