@@ -1146,8 +1146,14 @@ async def test_online_evaluator_with_a_version_fails_at_resolution():
     """Same reasoning as fastquery: the environment is fixed, pinning is an error."""
     results = await evaluate_client_relevance(
         "true",
-        [Target(kind="online_evaluator", name="web-eval", base_url="https://example.invalid")],
-        qna_version="11.0",
+        [
+            Target(
+                kind="online_evaluator",
+                name="web-eval",
+                base_url="https://example.invalid",
+                qna_version="11.0",
+            )
+        ],
         transport_factory=lambda t: FakeTransport(t.name),
         resolver=make_resolver(),
     )
@@ -1161,8 +1167,7 @@ async def test_fastquery_with_a_version_fails_at_resolution():
     """Fast Query evaluates with whatever agent is installed; pinning is an error."""
     results = await evaluate_client_relevance(
         "true",
-        [Target(kind="fastquery", name="deployment")],
-        qna_version="11.0",
+        [Target(kind="fastquery", name="deployment", qna_version="11.0")],
         transport_factory=lambda t: FakeTransport(t.name),
         resolver=make_resolver(),
     )
@@ -1170,6 +1175,29 @@ async def test_fastquery_with_a_version_fails_at_resolution():
     assert len(results) == 1
     assert results[0].error_kind in {ERROR_KIND_RESOLVE, ERROR_KIND_BOOTSTRAP}
     assert "version" in (results[0].error or "").lower()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        Target(kind="fastquery", name="deployment"),
+        Target(kind="online_evaluator", name="web-eval", base_url="https://example.invalid"),
+    ],
+)
+async def test_run_wide_version_skips_transports_that_cannot_pin(target):
+    """A run-wide version is meant for the hosts that can use it: a mixed
+    inventory run with --qna-version must not fail its fixed-agent hosts on
+    every run, so they evaluate unpinned instead."""
+    results = await evaluate_client_relevance(
+        "true",
+        [target],
+        qna_version=["11.0", "10.0"],
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 1
+    assert results[0].error is None
 
 
 # --- exit codes ------------------------------------------------------------

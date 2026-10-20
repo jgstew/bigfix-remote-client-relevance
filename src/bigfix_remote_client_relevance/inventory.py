@@ -33,7 +33,7 @@ import tomlkit
 from tomlkit.exceptions import ParseError
 
 from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
-from bigfix_remote_client_relevance.orchestrate import Target
+from bigfix_remote_client_relevance.orchestrate import UNPINNABLE_KINDS, Target
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,10 @@ def _target_from_entry(
             )
 
     user = setting("user")
-    version = setting("qna_version")
+    # Like platform/arch on fastquery: a [defaults] version is for the hosts
+    # that download qna, and is not applied to one evaluating with a fixed
+    # agent. Set on the host itself it is kept, so the run reports the mistake.
+    version = config.get("qna_version") if kind in UNPINNABLE_KINDS else setting("qna_version")
     platform = setting("platform") if kind != "fastquery" else None
     arch = setting("arch") if kind != "fastquery" else None
     become_raw = setting("become")

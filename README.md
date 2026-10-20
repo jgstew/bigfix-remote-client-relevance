@@ -198,6 +198,7 @@ or podman running, network access).
 # remote_clients.toml
 [defaults]
 qna_version = "11.0"        # version spec; overridable per host
+                            # (not applied to fastquery / online_evaluator hosts)
 
 [hosts.mac-test]            # table name is the ~/.ssh/config alias
 transport = "ssh"

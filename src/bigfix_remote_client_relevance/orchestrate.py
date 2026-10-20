@@ -384,8 +384,18 @@ def _is_too_new(result: ClientRelevanceResult) -> bool:
     )
 
 
+UNPINNABLE_KINDS = frozenset({"fastquery", "online_evaluator"})
+"""Transports that evaluate with an agent this tool does not supply, so a
+qna version spec means nothing to them."""
+
+
 def _version_specs(target: Target, run_wide: str | Sequence[str] | None) -> list[str | None]:
     """Which version specs apply to this target, per-target override winning."""
+    if target.kind in UNPINNABLE_KINDS and target.qna_version is None:
+        # A run-wide spec is for the hosts that download qna; failing every
+        # fixed-agent host in a mixed run, every run, told the user nothing.
+        # A spec set on the target itself still reaches _group and errors.
+        return [None]
     chosen = target.qna_version if target.qna_version is not None else run_wide
     if chosen is None:
         return [None]
@@ -562,7 +572,8 @@ async def _evaluate_stream_indexed(
                         target,
                         ERROR_KIND_RESOLVE,
                         f"cannot pin qna version {spec!r} for the fastquery transport: "
-                        "endpoints evaluate with their installed BES agent",
+                        "endpoints evaluate with their installed BES agent; "
+                        "remove qna_version from this host",
                     )
                 ):
                     emit(index, result)
@@ -578,7 +589,7 @@ async def _evaluate_stream_indexed(
                         ERROR_KIND_RESOLVE,
                         f"cannot pin qna version {spec!r} for the online_evaluator "
                         "transport: it evaluates on a fixed, remotely-managed "
-                        "environment",
+                        "environment; remove qna_version from this host",
                     )
                 ):
                     emit(index, result)

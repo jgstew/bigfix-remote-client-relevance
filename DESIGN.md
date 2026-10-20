@@ -882,6 +882,7 @@ Inventory format (`inventory.py`, loaded via `--inventory`):
 # remote_clients.toml
 [defaults]
 qna_version = "11.0"        # version spec; overridable per host
+                            # (not applied to fastquery / online_evaluator hosts)
 
 [hosts.mac-test]            # table name = ~/.ssh/config alias by default
 transport = "ssh"

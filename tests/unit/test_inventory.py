@@ -389,3 +389,29 @@ def test_fastquery_host_ignores_a_defaults_platform(tmp_path):
     )
 
     assert target.arch is None and target.platform is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        'transport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n',
+        'transport = "online_evaluator"\nbase_url = "https://example.invalid"\n',
+    ],
+)
+def test_defaults_qna_version_skips_hosts_that_cannot_pin(tmp_path, host):
+    """A fleet-wide qna_version is for the hosts that download qna; applied to
+    one evaluating with a fixed agent it only produced an error every run."""
+    [target] = _load_one(tmp_path, f'[defaults]\nqna_version = "11.0"\n\n[hosts.fixed]\n{host}')
+
+    assert target.qna_version is None
+
+
+def test_fastquery_host_keeps_its_own_qna_version(tmp_path):
+    """Written on the host itself it is a real mistake, left for the run to report."""
+    [target] = _load_one(
+        tmp_path,
+        '[hosts.lab-fleet]\ntransport = "fastquery"\nconnection = "lab"\n'
+        'computer_ids = [1]\nqna_version = "11.0"\n',
+    )
+
+    assert target.qna_version == "11.0"
