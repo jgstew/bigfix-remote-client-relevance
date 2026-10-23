@@ -89,7 +89,9 @@ exclude-newer = "-P7D"
 # The fixed date lifts the quarantine for that one release only; remove this
 # once the rolling window has passed it (after 2026-10-27), or it would hold
 # the package back from then on.
-exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-21T00:00:00Z" }
+# certifi 2026.10.19 (uploaded 2026-10-20) fixes GHSA-6q48-6c7w-9gw2, which
+# fails the uv-audit hook; same lift, remove after 2026-10-27.
+exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-21T00:00:00Z", certifi = "2026-10-21T00:00:00Z" }
 
 # --- Tooling ---------------------------------------------------------------
 
