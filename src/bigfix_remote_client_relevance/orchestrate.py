@@ -284,7 +284,8 @@ SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST connection"
 
 # Backends Fast Query can use. bigfix-remote-session-relevance 1.3.0 gave
 # SaasBackend a ClientQuery API too, but it takes one computer per query, so
-# SaaS joins once TransportFastQuery fans out a query per computer.
+# SaaS joins once TransportFastQuery fans out a query per computer:
+# https://github.com/jgstew/bigfix-remote-client-relevance/issues/74
 FASTQUERY_BACKENDS = frozenset({"rest"})
 
 

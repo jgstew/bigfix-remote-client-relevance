@@ -294,7 +294,8 @@ Requirements and limits:
 - Answers come back as text without types, so `answer_types` is empty.
   An empty plural answer can't be told apart from an empty string: both
   come back as `answers` `[""]`, not `[]`.
-- REST only for now; BigFix SaaS is not supported yet.
+- REST only for now; BigFix SaaS is not supported yet
+  ([#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)).
 
 ## As a library
 

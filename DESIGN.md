@@ -1161,7 +1161,7 @@ answers cross an untrusted network.
 - The MCP server itself (design keeps the surface compatible).
 - Fast Query over BigFix SaaS (REST only for now; session-relevance 1.3.0's
   `SaasBackend` has ClientQuery, but one computer per query, so it needs a
-  per-computer fan-out here first), targeting by computer
+  per-computer fan-out here first; #74), targeting by computer
   name, group or custom relevance, streaming per-computer results as they
   arrive, and reporting each endpoint's agent version in `qna_version`.
 - Windows containers, and publishing our own qna-preloaded images to a
