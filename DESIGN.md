@@ -27,7 +27,9 @@ Corrections implementation forced, all applied below:
 
 Remaining: rpm-family and SUSE bootstraps are specified but only the
 Debian/Ubuntu and macOS extract paths are exercised; Fast Query is REST
-only (SaaS is a follow-up); the MCP server is a separate task.
+only (SaaS is a follow-up,
+[#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74));
+the MCP server is a separate task.
 
 ## Testing
 `uv run pytest` runs the offline unit suite on a bare machine. Tests
@@ -851,7 +853,9 @@ bigfix-remote-client-relevance --setup-fastquery
   64): no usable connection for `--fastquery`, with the reason named —
   unknown, disabled, or a backend without ClientQuery (e.g. "connection
   'x' is a saas connection, and Fast Query only works through REST so
-  far; run --setup-fastquery to add a REST connection"). An inventory
+  far; run --setup-fastquery to add a REST connection"; SaaS support is
+  [#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)).
+  An inventory
   fastquery host with an unusable connection is not a usage error: it
   fails as that host's transport error and the other hosts still run;
   `--fastquery` with
@@ -1161,9 +1165,11 @@ answers cross an untrusted network.
 - The MCP server itself (design keeps the surface compatible).
 - Fast Query over BigFix SaaS (REST only for now; session-relevance 1.3.0's
   `SaasBackend` has ClientQuery, but one computer per query, so it needs a
-  per-computer fan-out here first; #74), targeting by computer
-  name, group or custom relevance, streaming per-computer results as they
-  arrive, and reporting each endpoint's agent version in `qna_version`.
+  per-computer fan-out here first;
+  [#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)),
+  targeting by computer name, group or custom relevance, streaming
+  per-computer results as they arrive, and reporting each endpoint's agent
+  version in `qna_version`.
 - Windows containers, and publishing our own qna-preloaded images to a
   registry (noted for `TransportContainer` follow-ups). podman is supported
   via `PodmanEngine`/`--engine podman`; niche rootless-podman configurations
@@ -1193,7 +1199,9 @@ order.
    `inventory.py`, `cli.py`, `--json` output.
 
 Follow-ups after M5: rpm-family + SUSE bootstraps, remaining arches,
-SaaS Fast Query, MCP server (separate task). Fine-grained work items live in
+SaaS Fast Query
+([#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)),
+MCP server (separate task). Fine-grained work items live in
 GitHub issues, not in this doc.
 
 ---
