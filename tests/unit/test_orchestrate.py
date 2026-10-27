@@ -2321,8 +2321,13 @@ def test_default_factory_refuses_an_unknown_fastquery_connection():
         )
 
 
-def test_default_factory_names_why_a_saas_connection_is_unusable():
+def test_default_factory_builds_fastquery_from_a_saas_connection():
+    """SaaS gets its own backend; the transport then sees a SaasBackend and
+    sends one query per computer."""
+    from bigfix_remote_session_relevance import SaasBackend
+
     from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
     _write_connections(
         "[[connections]]\n"
@@ -2330,9 +2335,92 @@ def test_default_factory_names_why_a_saas_connection_is_unusable():
         'username = "op"\npassword = "<PASSWORD>"\n'
     )
 
-    with pytest.raises(ValueError, match="'cloud' is a saas connection.*REST"):
+    transport = default_transport_factory(
+        Target(kind="fastquery", name="cloud", connection="cloud", computer_ids=(1, 2))
+    )
+
+    assert isinstance(transport, TransportFastQuery)
+    assert isinstance(transport._backend, SaasBackend)
+    assert transport._one_computer_per_query is True
+
+
+def test_default_factory_saas_targets_share_one_session_per_pool():
+    """Each SaaS sign-in counts toward a permanent lockout after 100 failures,
+    so the targets of one run share one session per account: one login, and
+    one cached failure, not one per target."""
+    from bigfix_remote_session_relevance.backends.saas import SaasSessionPool
+
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "cloud"\nbackend = "saas"\nserver = "https://login.bigfix.com"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+    pool = SaasSessionPool()
+
+    def build(name: str, ids: tuple[int, ...]):
+        target = Target(kind="fastquery", name=name, connection="cloud", computer_ids=ids)
+        return default_transport_factory(target, saas_sessions=pool)
+
+    first, second = build("web", (1,)), build("db", (2,))
+
+    assert first._backend._session is second._backend._session  # type: ignore[attr-defined]
+
+
+async def test_one_saas_session_pool_per_run(monkeypatch):
+    """The run's default factory hands every target the same pool, like the
+    image coordinator, and a new run gets a new one."""
+    from bigfix_remote_client_relevance import orchestrate
+
+    pools: list[object] = []
+
+    def fake_factory(target, *, coordinator=None, saas_sessions=None):
+        pools.append(saas_sessions)
+        raise ValueError("not building anything")
+
+    monkeypatch.setattr(orchestrate, "default_transport_factory", fake_factory)
+    targets = [
+        Target(kind="fastquery", name=name, connection="cloud", computer_ids=(1,))
+        for name in ("web", "db")
+    ]
+
+    await evaluate_client_relevance("true", targets)
+    await evaluate_client_relevance("true", targets[:1])
+
+    assert pools[0] is not None
+    assert pools[0] is pools[1]
+    assert pools[2] is not pools[0]
+
+
+def test_default_factory_rest_connection_keeps_one_query_for_all():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "lab"\nbackend = "rest"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    transport = default_transport_factory(
+        Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1, 2))
+    )
+
+    assert transport._one_computer_per_query is False  # type: ignore[attr-defined]
+
+
+def test_default_factory_names_why_a_webreports_connection_is_unusable():
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "reports"\nbackend = "webreports"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    with pytest.raises(ValueError, match="'reports' is a webreports connection.*REST or SaaS"):
         default_transport_factory(
-            Target(kind="fastquery", name="cloud", connection="cloud", computer_ids=(1,))
+            Target(kind="fastquery", name="reports", connection="reports", computer_ids=(1,))
         )
 
 

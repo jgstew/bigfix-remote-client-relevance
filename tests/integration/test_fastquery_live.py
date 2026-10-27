@@ -1,6 +1,6 @@
 """Live Fast Query round trip against a real BigFix server.
 
-Opt-in: set ``BFRCR_FASTQUERY_CONNECTION`` to a REST connection name in the
+Opt-in: set ``BFRCR_FASTQUERY_CONNECTION`` to a REST or SaaS connection name in the
 bigfix-remote-session-relevance config and ``BFRCR_FASTQUERY_COMPUTER_ID`` to
 a computer that operator can see. The endpoint must be online and reachable
 by UDP notification (or a persistent connection), on 9.5 Patch 2 or later.

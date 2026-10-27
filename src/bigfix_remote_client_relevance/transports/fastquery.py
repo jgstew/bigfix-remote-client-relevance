@@ -1,14 +1,22 @@
-"""BigFix Client Fast Query transport, through the REST ClientQuery API.
+"""BigFix Client Fast Query transport, through REST ClientQuery or BigFix SaaS.
 
 Fast Query has the server push a client-relevance query out to managed
 endpoints through relays; each endpoint evaluates it with its own installed
 BES agent and the answers accumulate on the server. The wire layer -- config,
-credentials, certificate pinning, ``POST /api/clientquery`` and
-``GET /api/clientqueryresults/{id}`` -- belongs to bigfix-remote-session-relevance
+credentials, certificate pinning, and the submit/results calls (REST
+``/api/clientquery``, SaaS ``clientquery/create``) -- belongs to
+bigfix-remote-session-relevance
 (:class:`~bigfix_remote_session_relevance.ClientQueryExtras`). This module owns
 what that package deliberately leaves to the caller: which computers to target,
 polling until they answer or time runs out, and turning rows into one
 :class:`ClientRelevanceResult` per computer.
+
+**BigFix SaaS takes one computer per query.** Through a ``SaasBackend`` the
+transport sends one query per computer and polls each on its own, all
+against the one deadline, with at most :data:`MAX_CONCURRENT_CALLS` server
+calls in flight. A failed submit is that computer's result and is never
+resent: SaaS answers most failures with a bare 500, possibly after the query
+reached the root server.
 
 **Version pinning does not apply to this transport.** Fast Query evaluates with
 whatever BES agent happens to be installed on each endpoint; there is no way to
@@ -19,6 +27,7 @@ limitation, so passing a resolved version is an error rather than a hint.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -43,7 +52,8 @@ if TYPE_CHECKING:
     )
 
     class FastQueryBackend(ClientQueryExtras, Protocol):
-        """ClientQuery plus plain ``evaluate``, for ``computer_query``: a ``RestBackend``."""
+        """ClientQuery plus plain ``evaluate``, for ``computer_query``: a
+        ``RestBackend`` or a ``SaasBackend``."""
 
         async def evaluate(self, session_relevance: str) -> SessionRelevanceResult: ...
 
@@ -64,6 +74,13 @@ POLL_MAX_S = 15.0
 # default) per call. The floor still lets a call made at the very end -- the
 # one results check after a slow submit -- have a moment to answer.
 CALL_FLOOR_S = 5.0
+
+# Server calls in flight at once while sending one query per computer, so a
+# computer_query matching hundreds of endpoints does not open hundreds of
+# submits together. Four concurrent submits drew no throttling and no
+# rate-limit headers from BigFix SaaS (2026-10-27, DESIGN.md); larger bursts
+# are untested, and a submit (~0.3-0.5 s) is short next to waiting for agents.
+MAX_CONCURRENT_CALLS = 4
 
 _T = TypeVar("_T")
 
@@ -93,6 +110,7 @@ class TransportFastQuery:
         computer_ids: Sequence[int] = (),
         computer_query: str | None = None,
         use_client_context: bool | None = None,
+        one_computer_per_query: bool | None = None,
         host: str = TRANSPORT_NAME,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
@@ -100,7 +118,7 @@ class TransportFastQuery:
         """
         Args:
             backend: A session-relevance backend with the ClientQuery calls
-                (a ``RestBackend``). Closed by :meth:`aclose`.
+                (a ``RestBackend`` or ``SaasBackend``). Closed by :meth:`aclose`.
             computer_ids: BigFix computer IDs to target.
             computer_query: Session relevance selecting more computers; the
                 server resolves it with ``ids of (...)`` under the same
@@ -113,6 +131,11 @@ class TransportFastQuery:
                 out of the request entirely, for servers that predate it
                 (it is in the BESAPI 11.0.7.61 schema). Recorded on every
                 result.
+            one_computer_per_query: Send one query per computer instead of
+                one for all. ``None`` decides from the backend's type: only
+                a ``SaasBackend`` needs it. Decided before sending, never
+                from the error: SaaS refuses several ids without sending
+                anything, so that error says nothing about the computers.
             host: What a result is reported under when no computer can be
                 (nothing targeted, or the submit failed).
             clock, sleep: Injected so tests never wait.
@@ -121,6 +144,11 @@ class TransportFastQuery:
         self._computer_ids = list(computer_ids)
         self._computer_query = computer_query
         self._use_client_context = use_client_context
+        if one_computer_per_query is None:
+            from bigfix_remote_session_relevance import SaasBackend
+
+            one_computer_per_query = isinstance(backend, SaasBackend)
+        self._one_computer_per_query = one_computer_per_query
         self._host = host
         self._clock = clock
         self._sleep = sleep
@@ -191,8 +219,19 @@ class TransportFastQuery:
             return fail(str(exc))
 
     async def _call(self, what: str, call: Coroutine[Any, Any, _T], deadline: float) -> _T:
-        """``call``, bounded by the time left before ``deadline`` (at least the floor)."""
-        limit = max(deadline - self._clock(), CALL_FLOOR_S)
+        """``call``, bounded by the time left before ``deadline`` (at least the floor).
+
+        The floor never reaches past ``deadline + CALL_FLOOR_S``, one hard stop
+        shared by every call: with one query per computer, every computer's
+        last check falls due on the deadline and queues behind the cap, and a
+        fresh floor for each would overrun by the floor times computers / cap.
+        A call due after the hard stop is not made at all.
+        """
+        now = self._clock()
+        limit = min(max(deadline - now, CALL_FLOOR_S), deadline + CALL_FLOOR_S - now)
+        if limit <= 0:
+            call.close()  # never started; closing it avoids "never awaited"
+            raise _CallTimeout(f"{what} not checked: the timeout ran out first")
         try:
             return await asyncio.wait_for(call, timeout=limit)
         except TimeoutError:
@@ -219,6 +258,8 @@ class TransportFastQuery:
         ids = list(dict.fromkeys(ids))  # merged, first appearance wins
         if not ids:
             return fail("no computers to query (the computer query matched none)")
+        if self._one_computer_per_query:
+            return await self._run_per_computer(client_relevance, ids, deadline, timeout_s, started)
 
         submitted = await self._call(
             "Fast Query submit",
@@ -233,7 +274,99 @@ class TransportFastQuery:
         logger.info("Fast Query %s submitted to %d computer(s)", submitted.query_id, len(ids))
 
         rows, poll_error = await self._poll(submitted.query_id, set(ids), deadline)
+        silence = poll_error or f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
+        return self._merge(client_relevance, ids, rows, dict.fromkeys(ids, silence), started)
 
+    async def _run_per_computer(
+        self,
+        client_relevance: str,
+        ids: list[int],
+        deadline: float,
+        timeout_s: float,
+        started: float,
+    ) -> list[ClientRelevanceResult]:
+        """One query per computer, side by side, merged like one query's rows."""
+        logger.info(
+            "Fast Query: one query per computer for %d computer(s) "
+            "(BigFix SaaS takes one computer per query)",
+            len(ids),
+        )
+        calls = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+        outcomes = await asyncio.gather(
+            *(
+                self._one_computer(client_relevance, computer_id, deadline, timeout_s, calls)
+                for computer_id in ids
+            )
+        )
+        rows = [result_row for computer_rows, _ in outcomes for result_row in computer_rows]
+        reasons = {
+            computer_id: reason
+            for computer_id, (_, reason) in zip(ids, outcomes, strict=True)
+            if reason is not None
+        }
+        return self._merge(client_relevance, ids, rows, reasons, started)
+
+    async def _one_computer(
+        self,
+        client_relevance: str,
+        computer_id: int,
+        deadline: float,
+        timeout_s: float,
+        calls: asyncio.Semaphore,
+    ) -> tuple[list[ClientQueryRow], str | None]:
+        """This computer's rows, or why it has none; never raises.
+
+        Anything going wrong here -- a refused submit, a raise, a call that
+        times out -- is this computer's alone; the others carry on.
+        """
+        try:
+            async with calls:
+                if self._clock() >= deadline:
+                    # Sent this late, its answer could not count anyway.
+                    return [], f"not submitted: the {timeout_s:g} s timeout ran out first"
+                submitted = await self._call(
+                    "Fast Query submit",
+                    self._backend.submit_client_query(
+                        client_relevance,
+                        [computer_id],
+                        use_client_context=self._use_client_context,
+                    ),
+                    deadline,
+                )
+        except _CallTimeout as exc:  # already says it was the submit
+            return [], str(exc)
+        except Exception as exc:  # this computer's failure, not the run's
+            logger.debug("Fast Query submit to computer %d raised", computer_id, exc_info=True)
+            return [], f"Fast Query submit failed: {exc}"
+        if submitted.error is not None or submitted.query_id is None:
+            # Never resent: SaaS answers a bare 500 for most failures,
+            # possibly after the query reached the root server.
+            message = submitted.error.message if submitted.error else "no query id returned"
+            return [], f"Fast Query submit failed: {message}"
+        logger.debug("Fast Query %s submitted to computer %d", submitted.query_id, computer_id)
+        try:
+            rows, poll_error = await self._poll(
+                submitted.query_id, {computer_id}, deadline, calls=calls
+            )
+        except Exception as exc:  # this computer's failure, not the run's
+            logger.debug("Fast Query results for computer %d raised", computer_id, exc_info=True)
+            return [], f"Fast Query results failed: {exc}"
+        if any(result_row.computer_id == computer_id for result_row in rows):
+            return rows, None
+        return rows, poll_error or f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
+
+    def _merge(
+        self,
+        client_relevance: str,
+        ids: list[int],
+        rows: list[ClientQueryRow],
+        reasons: dict[int, str],
+        started: float,
+    ) -> list[ClientRelevanceResult]:
+        """Answered computers by name, then the rest in targeting order.
+
+        ``reasons`` says why each unanswered computer has no answer.
+        """
         by_computer: dict[int, list[ClientQueryRow]] = {}
         for result_row in rows:
             by_computer.setdefault(result_row.computer_id, []).append(result_row)
@@ -246,13 +379,12 @@ class TransportFastQuery:
             ),
             key=lambda result: result.host.lower(),
         )
-        silence = poll_error or f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
         unanswered = [
             ClientRelevanceResult(
                 host=str(computer_id),
                 transport=TRANSPORT_NAME,
                 client_relevance=client_relevance,
-                error=silence,
+                error=reasons[computer_id],
                 error_kind=ERROR_KIND_TRANSPORT,
                 elapsed_ms=elapsed_ms,
                 use_client_context=self._use_client_context,
@@ -263,14 +395,20 @@ class TransportFastQuery:
         return answered + unanswered
 
     async def _poll(
-        self, query_id: int, targeted: set[int], deadline: float
+        self,
+        query_id: int,
+        targeted: set[int],
+        deadline: float,
+        *,
+        calls: asyncio.Semaphore | None = None,
     ) -> tuple[list[ClientQueryRow], str | None]:
         """Every row so far, polled until all targets answered or time is up.
 
         Results accumulate server-side, so each poll returns everything and
         the latest one wins. There is always at least one check, even when
         resolving and submitting used up the whole timeout: computers that
-        answered must not be reported as silent. A poll error ends polling:
+        answered must not be reported as silent. ``calls``, when given, is
+        held for each results call, never across a sleep. A poll error ends polling:
         the observed ones (a query id from another operator, say) do not
         clear up on retry. A poll that times out ends it too, keeping the
         rows already seen.
@@ -285,9 +423,12 @@ class TransportFastQuery:
                 delay = min(delay * POLL_GROWTH, POLL_MAX_S)
             checked = True
             try:
-                response = await self._call(
-                    "Fast Query results", self._backend.client_query_results(query_id), deadline
-                )
+                async with calls or contextlib.nullcontext():
+                    response = await self._call(
+                        "Fast Query results",
+                        self._backend.client_query_results(query_id),
+                        deadline,
+                    )
             except _CallTimeout as exc:
                 return rows, str(exc)
             if response.error is not None:
@@ -330,4 +471,4 @@ class TransportFastQuery:
         )
 
 
-__all__ = ["NO_ANSWER_CAUSES", "TransportFastQuery"]
+__all__ = ["MAX_CONCURRENT_CALLS", "NO_ANSWER_CAUSES", "TransportFastQuery"]

@@ -48,6 +48,7 @@ from bigfix_remote_client_relevance.transports import FanOutTransport, Transport
 
 if TYPE_CHECKING:
     from bigfix_remote_session_relevance import ConnectionConfig
+    from bigfix_remote_session_relevance.backends.saas import SaasSessionPool
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ class Target:
     choice (see :class:`~...transports.online_evaluator.TransportOnlineEvaluator`)."""
 
     connection: str | None = None
-    """``fastquery`` only. Name of a REST connection in the
+    """``fastquery`` only. Name of a REST or SaaS connection in the
     bigfix-remote-session-relevance config (``$BFRSR_CONFIG`` or
     ``~/.bigfix/.remote_session_connections.toml``)."""
 
@@ -180,12 +181,18 @@ TransportFactory = Callable[[Target], Transport]
 Resolver = Callable[[str | None, Target], Coroutine[Any, Any, ResolvedQna]]
 
 
-def default_transport_factory(target: Target, *, coordinator: object | None = None) -> Transport:
+def default_transport_factory(
+    target: Target,
+    *,
+    coordinator: object | None = None,
+    saas_sessions: SaasSessionPool | None = None,
+) -> Transport:
     """Build the transport a target calls for.
 
     ``coordinator`` is how a fan-out shares image work between the transports
-    it builds; it is keyword-only and optional so the one-argument
-    :data:`TransportFactory` signature still holds.
+    it builds, and ``saas_sessions`` how its SaaS Fast Query targets share one
+    sign-in per account; both are keyword-only and optional so the
+    one-argument :data:`TransportFactory` signature still holds.
     """
     if target.kind == "local":
         from bigfix_remote_client_relevance.transports.local import TransportLocal
@@ -254,14 +261,20 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             coordinator=coordinator,  # type: ignore[arg-type]
         )
     if target.kind == "fastquery":
-        from bigfix_remote_session_relevance import RestBackend, TrustStore
+        from bigfix_remote_session_relevance import RestBackend, SaasBackend, TrustStore
 
         from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
         conn = require_fastquery_connection(target.connection)
+        backend_class = SaasBackend if conn.backend == "saas" else RestBackend
         # Not entered as a context manager: the transport owns it from here,
         # and the fan-out's _release closes it through TransportFastQuery.aclose.
-        backend = RestBackend.from_config(conn, trust=TrustStore())
+        # The transport sees a SaasBackend and sends one query per computer.
+        backend = backend_class.from_config(conn, trust=TrustStore())
+        if isinstance(backend, SaasBackend) and saas_sessions is not None:
+            # One login and one cached failure per account, not per target:
+            # 100 failed SaaS logins lock the account for good.
+            saas_sessions.attach(backend)
         return TransportFastQuery(
             backend,
             computer_ids=target.computer_ids,
@@ -280,13 +293,12 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
     raise ValueError(f"unknown target kind {target.kind!r}")
 
 
-SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST connection"
+SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST or SaaS connection"
 
-# Backends Fast Query can use. bigfix-remote-session-relevance 1.3.0 gave
-# SaasBackend a ClientQuery API too, but it takes one computer per query, so
-# SaaS joins once TransportFastQuery fans out a query per computer:
-# https://github.com/jgstew/bigfix-remote-client-relevance/issues/74
-FASTQUERY_BACKENDS = frozenset({"rest"})
+# Backends with bigfix-remote-session-relevance's ClientQuery API. SaaS
+# (since its 1.3.0) takes one computer per query, so TransportFastQuery sends
+# it one query per computer.
+FASTQUERY_BACKENDS = frozenset({"rest", "saas"})
 
 
 def require_fastquery_connection(name: str | None) -> ConnectionConfig:
@@ -316,7 +328,7 @@ def require_fastquery_connection(name: str | None) -> ConnectionConfig:
     if conn.backend not in FASTQUERY_BACKENDS:
         raise ValueError(
             f"connection {name!r} is a {conn.backend} connection, and Fast Query "
-            f"only works through REST so far; {SETUP_FASTQUERY_ADVICE}"
+            f"only works through REST or SaaS; {SETUP_FASTQUERY_ADVICE}"
         )
     return conn
 
@@ -494,9 +506,16 @@ async def _evaluate_stream_indexed(
         from bigfix_remote_client_relevance.transports.coordination import ImageCoordinator
 
         coordinator = ImageCoordinator()
+        # Likewise one SaaS session pool per run (not per process: a session
+        # is tied to the run's event loop and should not outlive it).
+        from bigfix_remote_session_relevance.backends.saas import SaasSessionPool
+
+        saas_sessions = SaasSessionPool()
 
         def _default_transport_factory(target: Target) -> Transport:
-            return default_transport_factory(target, coordinator=coordinator)
+            return default_transport_factory(
+                target, coordinator=coordinator, saas_sessions=saas_sessions
+            )
 
         transport_factory = _default_transport_factory
 
