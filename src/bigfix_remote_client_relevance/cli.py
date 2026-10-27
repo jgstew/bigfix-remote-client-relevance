@@ -311,14 +311,14 @@ def _auto_discover() -> list[str]:
 
 
 def _setup_fastquery() -> int:
-    """bigfix-remote-session-relevance's setup wizard, limited to REST.
+    """bigfix-remote-session-relevance's setup wizard, limited to the Fast Query backends.
 
     Here because `uvx bigfix-remote-client-relevance` puts only this
     package's own commands on PATH, so its `--setup` is out of reach.
     """
     import bigfix_remote_session_relevance
 
-    return bigfix_remote_session_relevance.run_setup(backends=("rest",))
+    return bigfix_remote_session_relevance.run_setup(backends=("rest", "saas"))
 
 
 def _interactive() -> bool:
@@ -411,11 +411,12 @@ def evaluate(
             metavar="CONNECTION",
             help=(
                 "Evaluate on managed endpoints with BigFix Fast Query, through the "
-                "named REST connection in bigfix-remote-session-relevance's config "
+                "named REST or BigFix SaaS connection in bigfix-remote-session-relevance's config "
                 "($BFRSR_CONFIG or ~/.bigfix/.remote_session_connections.toml). "
                 "Needs --computer-id and/or --computer-query; one result per "
-                "computer. Uses each endpoint's installed agent, so it cannot pin "
-                "a qna version. Composes with --inventory."
+                "computer (on SaaS, one query per computer, each in the console's "
+                "query history). Uses each endpoint's installed agent, so it cannot "
+                "pin a qna version. Composes with --inventory."
             ),
         ),
     ] = None,
@@ -457,7 +458,7 @@ def evaluate(
         typer.Option(
             "--setup-fastquery",
             help=(
-                "Add a REST connection for --fastquery to bigfix-remote-session-"
+                "Add a REST or SaaS connection for --fastquery to bigfix-remote-session-"
                 "relevance's config, interactively."
             ),
         ),

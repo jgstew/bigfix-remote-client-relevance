@@ -1477,7 +1477,7 @@ def test_auto_discovery_ssh_list_goes_to_stderr_not_stdout(captured, tmp_path, m
 
 # --- Fast Query --------------------------------------------------------------
 
-SETUP_ADVICE = "run --setup-fastquery to add a REST connection"
+SETUP_ADVICE = "run --setup-fastquery to add a REST or SaaS connection"
 
 
 def _connections(*entries: tuple[str, str]) -> None:
@@ -1618,20 +1618,18 @@ def test_disabled_connection_says_so(captured):
     assert "targets" not in captured
 
 
-def test_saas_connection_says_fastquery_cannot_use_saas_yet(captured):
-    """A SaaS connection exists; "none found" sent the user looking for the
-    wrong problem."""
+def test_fastquery_accepts_a_saas_connection(captured):
     _connections(("james-saas", "saas"))
 
-    result = invoke("--fastquery", "james-saas", "--computer-id", "1", "true")
+    result = invoke("--fastquery", "james-saas", "--computer-id", "1", "--computer-id", "2", "true")
 
-    assert result.exit_code == USAGE_EXIT_CODE
-    message = result.stderr.strip()
-    assert "'james-saas'" in message and "saas" in message and "REST" in message
-    assert "targets" not in captured
+    assert result.exit_code == 0, result.output
+    [target] = captured["targets"]
+    assert target.connection == "james-saas"
+    assert target.computer_ids == (1, 2)
 
 
-def test_setup_fastquery_calls_run_setup_rest_only(captured, monkeypatch):
+def test_setup_fastquery_offers_rest_and_saas(captured, monkeypatch):
     import bigfix_remote_session_relevance
 
     calls: list[dict] = []
@@ -1645,7 +1643,7 @@ def test_setup_fastquery_calls_run_setup_rest_only(captured, monkeypatch):
     result = invoke("--setup-fastquery")
 
     assert result.exit_code == 0, result.output
-    assert calls == [{"path": None, "backends": ("rest",)}]
+    assert calls == [{"path": None, "backends": ("rest", "saas")}]
     assert "targets" not in captured
 
 

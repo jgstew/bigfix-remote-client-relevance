@@ -494,3 +494,415 @@ async def test_client_context_is_recorded_on_a_failure_before_submitting():
 
     assert result.error_kind == ERROR_KIND_TRANSPORT
     assert result.use_client_context is True
+
+
+# --- one computer per query (BigFix SaaS) -----------------------------------
+
+
+class VirtualClock:
+    """Fake time shared by concurrent sleepers.
+
+    :class:`FakeClock` adds every sleep to one total, which is right for one
+    task but would make five computers polling side by side look five times
+    as slow. Here time jumps to the earliest wake-up only once every other
+    task has had its turn, so concurrent sleeps overlap the way real ones do.
+    """
+
+    def __init__(self) -> None:
+        import itertools
+
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self._waiting: list[tuple[float, int, object]] = []
+        self._order = itertools.count()
+        self._ticker = None
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        import asyncio
+        import heapq
+
+        self.sleeps.append(seconds)
+        woken = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiting, (self.now + seconds, next(self._order), woken))
+        if self._ticker is None or self._ticker.done():
+            self._ticker = asyncio.ensure_future(self._tick())
+        await woken
+
+    async def _tick(self) -> None:
+        import asyncio
+        import heapq
+
+        while self._waiting:
+            for _ in range(50):  # every runnable task reaches its next sleep
+                await asyncio.sleep(0)
+            wake, _, woken = heapq.heappop(self._waiting)
+            self.now = max(self.now, wake)
+            woken.set_result(None)  # type: ignore[attr-defined]
+
+
+class FakeOneTargetBackend(FakeClientQueryBackend):
+    """Takes one computer per query, the way ``SaasBackend`` does.
+
+    Several ids are an ``unsupported_feature`` / ``multiple_targets`` result
+    and ids <= 0 raise ``ValueError``, both before anything is "sent". Each
+    submit gets its own query id, ``100 + computer id``; ``answers`` maps a
+    computer id to the rows its query returns (after ``answer_after`` polls),
+    and ``refuse`` maps one to the error its submit returns.
+    """
+
+    def __init__(
+        self,
+        *,
+        answers: dict[int, Sequence[ClientQueryRow]] | None = None,
+        refuse: dict[int, ResultError] | None = None,
+        answer_after: int = 1,
+        ids: Sequence[str] | ResultError = (),
+    ) -> None:
+        super().__init__(ids=ids)
+        self._answers = answers or {}
+        self._refuse = refuse or {}
+        self._answer_after = answer_after
+        self._polls_by_query: dict[int, int] = {}
+        self.in_flight = 0
+        self.most_in_flight = 0
+
+    async def _busy(self) -> None:
+        import asyncio
+
+        self.in_flight += 1
+        self.most_in_flight = max(self.most_in_flight, self.in_flight)
+        for _ in range(3):  # stay in flight while the others get going
+            await asyncio.sleep(0)
+        self.in_flight -= 1
+
+    async def submit_client_query(self, client_relevance, computer_ids, *, use_client_context):
+        ids = list(computer_ids)
+        if any(computer_id <= 0 for computer_id in ids):
+            raise ValueError(f"computer_ids must be positive, got {ids}")
+        if len(ids) > 1:
+            return _response(
+                error=ResultError(
+                    kind="unsupported_feature",
+                    code="multiple_targets",
+                    message="BigFix SaaS fast query targets one computer per query",
+                )
+            )
+        await self._busy()
+        self.submitted.append((client_relevance, ids))
+        self.contexts.append(use_client_context)
+        if ids[0] in self._refuse:
+            return _response(error=self._refuse[ids[0]])
+        return _response(query_id=100 + ids[0])
+
+    async def client_query_results(self, query_id):
+        await self._busy()
+        self.polled.append(query_id)
+        polls = self._polls_by_query[query_id] = self._polls_by_query.get(query_id, 0) + 1
+        computer_id = query_id - 100
+        if polls < self._answer_after or computer_id not in self._answers:
+            return _response(query_id=query_id)
+        return _response(query_id=query_id, rows=self._answers[computer_id])
+
+
+SERVER_500 = ResultError(
+    kind="http",
+    http_status=500,
+    message=(
+        "Server Error (BigFix SaaS answers 500 for any failed client query submit, "
+        "including client relevance the root server rejects)"
+    ),
+)
+
+
+def make_one_target(backend, clock=None, **kwargs) -> TransportFastQuery:
+    clock = clock or VirtualClock()
+    return TransportFastQuery(
+        backend, clock=clock, sleep=clock.sleep, one_computer_per_query=True, **kwargs
+    )
+
+
+async def test_one_target_backend_gets_one_query_per_computer():
+    backend = FakeOneTargetBackend(
+        answers={11: [row(11, "a")], 12: [row(12, "b")], 13: [row(13, "c")]}
+    )
+
+    results = await make_one_target(
+        backend, computer_ids=[11, 12, 13]
+    ).evaluate_client_relevance_fanout("name of operating system", timeout_s=30)
+
+    assert sorted(backend.submitted) == [
+        ("name of operating system", [11]),
+        ("name of operating system", [12]),
+        ("name of operating system", [13]),
+    ]
+    assert set(backend.polled) == {111, 112, 113}
+    assert [r.answers for r in results] == [["a"], ["b"], ["c"]]
+    assert all(r.error_kind is None for r in results)
+
+
+async def test_one_target_computer_query_ids_each_get_their_own_query():
+    backend = FakeOneTargetBackend(ids=["12", "13"], answers={12: [row(12, "b")]})
+
+    await make_one_target(
+        backend, computer_ids=[12], computer_query="bes computers"
+    ).evaluate_client_relevance_fanout("true", timeout_s=30)
+
+    assert backend.evaluated == ["ids of (bes computers)"]
+    assert sorted(ids for _, ids in backend.submitted) == [[12], [13]]
+
+
+async def test_one_target_results_answered_by_name_then_unanswered_in_targeting_order():
+    backend = FakeOneTargetBackend(
+        answers={
+            30: [row(30, "m", name="mike")],
+            11: [row(11, "z", name="zulu")],
+            12: [row(12, "a", name="Alpha")],
+        }
+    )
+
+    results = await make_one_target(
+        backend, computer_ids=[30, 11, 99, 12, 98]
+    ).evaluate_client_relevance_fanout("true", timeout_s=20)
+
+    assert [r.host for r in results] == ["Alpha", "mike", "zulu", "99", "98"]
+    assert results[3].error == (
+        "no answer within 20 s (offline, UDP notifications blocked, or "
+        "client/relay older than 9.5 Patch 2)"
+    )
+
+
+async def test_one_target_submit_failure_is_that_computers_result_and_never_resent():
+    """SaaS answers a bare 500 for most failed submits, possibly after the
+    query reached the root server: a resend could run it twice."""
+    backend = FakeOneTargetBackend(
+        answers={11: [row(11, "a", name="alpha")], 13: [row(13, "c", name="charlie")]},
+        refuse={12: SERVER_500},
+    )
+
+    results = await make_one_target(
+        backend, computer_ids=[11, 12, 13]
+    ).evaluate_client_relevance_fanout("true", timeout_s=30)
+
+    assert [r.host for r in results] == ["alpha", "charlie", "12"]
+    failed = results[2]
+    assert failed.error_kind == ERROR_KIND_TRANSPORT
+    assert failed.transport == "fastquery"
+    assert failed.error is not None
+    assert failed.error.startswith("Fast Query submit failed: Server Error")
+    assert [ids for _, ids in backend.submitted].count([12]) == 1
+    assert 112 not in backend.polled
+
+
+async def test_one_target_exception_for_one_computer_spares_the_others():
+    """A raise (here SaasBackend's ValueError for an id <= 0) fails only the
+    computer it was raised for."""
+    backend = FakeOneTargetBackend(answers={11: [row(11, "a", name="alpha")]})
+
+    results = await make_one_target(backend, computer_ids=[11, 0]).evaluate_client_relevance_fanout(
+        "true", timeout_s=30
+    )
+
+    assert [r.host for r in results] == ["alpha", "0"]
+    assert results[0].answers == ["a"]
+    assert results[1].error_kind == ERROR_KIND_TRANSPORT
+    assert (results[1].error or "").startswith("Fast Query submit failed: ")
+    assert "must be positive" in (results[1].error or "")
+
+
+async def test_one_target_queries_share_one_deadline():
+    """Every per-computer query polls until the same --timeout, not a
+    timeout each one after another."""
+    backend = FakeOneTargetBackend()  # nobody ever answers
+    clock = VirtualClock()
+
+    results = await make_one_target(
+        backend, clock, computer_ids=[11, 12, 13, 14, 15]
+    ).evaluate_client_relevance_fanout("true", timeout_s=60)
+
+    assert clock.now == pytest.approx(60.0)
+    assert [r.host for r in results] == ["11", "12", "13", "14", "15"]
+    assert all("no answer within 60 s" in (r.error or "") for r in results)
+    # Each computer got the usual backoff, the last check on the timeout.
+    assert sorted(backend.polled).count(111) == 8
+
+
+async def test_one_target_never_submits_once_the_deadline_has_passed(monkeypatch):
+    """Submits waiting their turn behind the cap are dropped at the deadline
+    rather than sent late, when no answer could still count."""
+    from bigfix_remote_client_relevance.transports import fastquery
+
+    monkeypatch.setattr(fastquery, "MAX_CONCURRENT_CALLS", 1)
+    clock = VirtualClock()
+
+    class SlowSubmit(FakeOneTargetBackend):
+        async def submit_client_query(self, client_relevance, computer_ids, **kwargs):
+            clock.now += 8.0  # 12 finishes at 16: late, but within deadline + floor
+            return await super().submit_client_query(client_relevance, computer_ids, **kwargs)
+
+    backend = SlowSubmit(
+        answers={11: [row(11, "a", name="alpha")], 12: [row(12, "b", name="bravo")]}
+    )
+
+    results = await make_one_target(
+        backend, clock, computer_ids=[11, 12, 13]
+    ).evaluate_client_relevance_fanout("true", timeout_s=15)
+
+    assert [ids for _, ids in backend.submitted] == [[11], [12]]
+    assert [r.host for r in results] == ["alpha", "bravo", "13"]
+    assert results[2].error_kind == ERROR_KIND_TRANSPORT
+    assert results[2].error == "not submitted: the 15 s timeout ran out first"
+
+
+async def test_one_target_concurrency_is_capped():
+    from bigfix_remote_client_relevance.transports.fastquery import MAX_CONCURRENT_CALLS
+
+    ids = list(range(1, 3 * MAX_CONCURRENT_CALLS + 1))
+    backend = FakeOneTargetBackend(answers={i: [row(i, "x")] for i in ids}, answer_after=2)
+
+    results = await make_one_target(backend, computer_ids=ids).evaluate_client_relevance_fanout(
+        "true", timeout_s=30
+    )
+
+    assert len(backend.submitted) == len(ids)
+    assert backend.most_in_flight == MAX_CONCURRENT_CALLS
+    assert all(r.answers == ["x"] for r in results)
+
+
+@pytest.mark.parametrize("use_client_context", [True, False, None])
+async def test_one_target_client_context_goes_on_every_submit(use_client_context):
+    backend = FakeOneTargetBackend(answers={11: [row(11, "a", name="alpha")]})
+
+    results = await make_one_target(
+        backend, computer_ids=[11, 12, 13], use_client_context=use_client_context
+    ).evaluate_client_relevance_fanout("true", timeout_s=20)
+
+    assert backend.contexts == [use_client_context] * 3
+    assert len(results) == 3
+    assert all(r.use_client_context is use_client_context for r in results)
+
+
+async def test_one_target_single_result_method_still_works():
+    backend = FakeOneTargetBackend(answers={1: [row(1, "y", name="alpha")]})
+
+    result = await make_one_target(backend, computer_ids=[1, 2]).evaluate_client_relevance(
+        "true", timeout_s=30
+    )
+
+    assert result.host == "alpha"
+
+
+# --- a real SaasBackend, offline ---------------------------------------------
+
+SAAS_FIXTURES = Path(__file__).parent.parent / "fixtures" / "saas_fastquery"
+
+
+class FakeSaasService:
+    """Just enough of BigFix SaaS for ``SaasBackend``: sign-in, one
+    ``clientquery/create`` per computer and ``listresults``, answering with
+    the captured bodies. Computer 11 answers; any other id gets the captured
+    500, as an id the deployment does not have did live."""
+
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+
+    def transport(self):
+        import httpx
+
+        return httpx.MockTransport(self._handle)
+
+    def _handle(self, request):
+        import httpx
+
+        def captured(name: str, status: int = 200):
+            return httpx.Response(
+                status,
+                text=(SAAS_FIXTURES / name).read_text(encoding="utf-8"),
+                headers={"content-type": "application/json"},
+            )
+
+        data = json.loads(request.content or b"{}").get("data")
+        if request.url.path == "/auth/v1/user/login":
+            return httpx.Response(
+                200,
+                json={"status": 200, "data": {"iat": 0, "exp": 3600, "pids": {"bf": {}}}},
+                headers=[
+                    ("set-cookie", "accessToken=ACCESS; Path=/; HttpOnly; Secure"),
+                    ("set-cookie", "refreshToken=REFRESH; Path=/; HttpOnly; Secure"),
+                ],
+            )
+        if request.url.path == "/core/v2/clientquery/create":
+            self.created.append(data)
+            if data["target"] == {"computerId": 11}:
+                return captured("create_ok.json")
+            return captured("create_500.json", status=500)
+        if request.url.path == "/bfproxy/v1/clientquery/listresults":
+            return captured("listresults_answered.json")
+        return httpx.Response(404)
+
+
+async def test_a_saas_backend_is_fanned_out_without_being_told():
+    """The backend's type decides it, before anything is sent: SaasBackend
+    refuses several ids without sending them, so its error is no signal to
+    retry on and must never be relied on."""
+    from bigfix_remote_session_relevance import SaasBackend
+
+    service = FakeSaasService()
+    backend = SaasBackend(
+        "login.bigfix.com",
+        username="operator@example.com",
+        password="<PASSWORD>",
+        transport=service.transport(),
+    )
+    clock = VirtualClock()
+
+    results = await TransportFastQuery(
+        backend, computer_ids=[11, 12], clock=clock, sleep=clock.sleep
+    ).evaluate_client_relevance_fanout("name of operating system", timeout_s=30)
+
+    assert [entry["target"] for entry in service.created] == [
+        {"computerId": 11},
+        {"computerId": 12},
+    ]
+    assert [r.host for r in results] == ["pc11", "12"]
+    assert results[0].answers == ["Win11"]
+    assert results[1].error_kind == ERROR_KIND_TRANSPORT
+    assert "500" in (results[1].error or "")
+
+
+@pytest.mark.parametrize("hung", [True, False], ids=["hung-server", "slow-server"])
+async def test_one_target_calls_after_the_deadline_share_one_hard_stop(monkeypatch, hung):
+    """Every computer's last check lands on the deadline and they queue
+    behind the cap; each getting its own CALL_FLOOR_S let a run overrun by
+    the floor times computers / cap. All of them share deadline + floor."""
+    import asyncio
+    import time
+
+    from bigfix_remote_client_relevance.transports import fastquery
+
+    monkeypatch.setattr(fastquery, "CALL_FLOOR_S", 0.2)
+    timeout_s = 0.2
+
+    class Slow(FakeOneTargetBackend):
+        async def client_query_results(self, query_id):
+            self.polled.append(query_id)
+            await asyncio.sleep(3600 if hung else 0.15)
+            return _response(query_id=query_id)
+
+    backend = Slow()
+    ids = list(range(1, 4 * fastquery.MAX_CONCURRENT_CALLS + 1))
+    transport = _real_time(backend, computer_ids=ids, one_computer_per_query=True)
+
+    started = time.monotonic()
+    results = await transport.evaluate_client_relevance_fanout("true", timeout_s=timeout_s)
+    elapsed = time.monotonic() - started
+
+    # deadline + floor = 0.4 s; a floor per queued call would be ~1 s.
+    assert elapsed < 0.65
+    assert [r.host for r in results] == [str(i) for i in ids]
+    assert all(r.error_kind == ERROR_KIND_TRANSPORT for r in results)
+    skipped = [r for r in results if "not checked" in (r.error or "")]
+    assert skipped, [r.error for r in results]
+    assert skipped[0].error == "Fast Query results not checked: the timeout ran out first"

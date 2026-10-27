@@ -19,7 +19,7 @@ Example::
 
     [hosts.lab-fleet]           # BigFix Fast Query, one result per computer
     transport = "fastquery"
-    connection = "lab"          # a REST connection in the session-relevance config
+    connection = "lab"          # a REST or SaaS connection in the session-relevance config
     computer_ids = [11, 12]     # and/or computer_query = "<session relevance>"
     use_client_context = true   # fixlet/site inspectors; fastquery only
 """

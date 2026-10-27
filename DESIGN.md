@@ -26,10 +26,8 @@ Corrections implementation forced, all applied below:
    rule.
 
 Remaining: rpm-family and SUSE bootstraps are specified but only the
-Debian/Ubuntu and macOS extract paths are exercised; Fast Query is REST
-only (SaaS is a follow-up,
-[#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74));
-the MCP server is a separate task.
+Debian/Ubuntu and macOS extract paths are exercised; the MCP server is a
+separate task.
 
 ## Testing
 `uv run pytest` runs the offline unit suite on a bare machine. Tests
@@ -41,7 +39,7 @@ needing a real prerequisite carry a marker and auto-skip without it:
 | `docker` | a reachable Docker daemon | `uv run pytest -m docker` |
 | `ssh_localhost` | sshd on localhost with key auth | `uv run pytest -m ssh_localhost` |
 | `network` | support.bigfix.com | `BFRCR_NETWORK_TESTS=1 uv run pytest -m network` |
-| `fastquery_live` | a BigFix server, a REST connection in the session-relevance config, and an online endpoint | `BFRCR_FASTQUERY_CONNECTION=<NAME> BFRCR_FASTQUERY_COMPUTER_ID=<COMPUTER_ID> uv run pytest -m fastquery_live` |
+| `fastquery_live` | a BigFix server, a REST or SaaS connection in the session-relevance config, and an online endpoint | `BFRCR_FASTQUERY_CONNECTION=<NAME> BFRCR_FASTQUERY_COMPUTER_ID=<COMPUTER_ID> uv run pytest -m fastquery_live` |
 
 Every test runs against throwaway bigfix-remote-session-relevance state:
 `tests/conftest.py` points `BFRSR_CONFIG` at an empty temp file, redirects
@@ -466,12 +464,14 @@ Five concrete transports, all class-named `Transport<Kind>`:
   use_client_context=None, host="fastquery")` — BigFix Fast Query: the
   server sends client relevance to managed endpoints, which answer with
   their installed agent. `backend`
-  is a bigfix-remote-session-relevance `RestBackend` (typed as its
-  `ClientQueryExtras` protocol plus `evaluate`); that package owns config,
-  credentials, certificate pinning and the two wire calls (`POST
-  /api/clientquery`, whose XML body carries the expression as `QueryText` —
-  an API-vocabulary exception to the naming rule — and `GET
-  /api/clientqueryresults/{id}?output=json`). This transport owns the rest:
+  is a bigfix-remote-session-relevance `RestBackend` or `SaasBackend`
+  (typed as its `ClientQueryExtras` protocol plus `evaluate`); that package
+  owns config, credentials, certificate pinning and the two wire calls (on
+  REST `POST /api/clientquery`, whose XML body carries the expression as
+  `QueryText` — an API-vocabulary exception to the naming rule — and `GET
+  /api/clientqueryresults/{id}?output=json`; on SaaS core v2
+  `clientquery/create` and bfproxy v1 `clientquery/listresults`). This
+  transport owns the rest:
   1. `computer_query` (session relevance) is resolved on the server with
      `ids of (<expr>)`, under the operator's own scope, and merged with
      `computer_ids`. No IDs → one `transport` result.
@@ -485,7 +485,12 @@ Five concrete transports, all class-named `Transport<Kind>`:
      such as another operator's query id, do not clear up on retry). Every
      server call is bounded with `asyncio.wait_for` by the time left (with a
      5 s floor), so a server that goes quiet cannot hold the run for
-     session-relevance's own read timeout per call.
+     session-relevance's own read timeout per call. The floor never reaches
+     past one hard stop, `timeout_s` + 5 s, shared by every call; a call
+     due after it is not made ("Fast Query results not checked: the timeout
+     ran out first"). One query has one call after the deadline at most,
+     but one query per computer (below) queues every computer's last check
+     there, and a floor each would overrun by 5 s × computers / cap.
   4. One result per computer, answered ones ordered by name: `host` is the
      computer name, `answers` its non-failure rows in order (a plural answer
      is one row per value), `answer_types` empty (the JSON carries none),
@@ -496,6 +501,65 @@ Five concrete transports, all class-named `Transport<Kind>`:
      Patch 2)". The server accepts IDs outside the operator's scope
      silently, and those never answer, so the deadline is what bounds them.
   5. No exception escapes. `aclose` closes the backend.
+
+  **One computer per query (BigFix SaaS).** A SaaS fast query targets one
+  computer: `SaasBackend` turns several ids into an `unsupported_feature` /
+  `multiple_targets` result and sends nothing. So with
+  `one_computer_per_query` (default `None`: true exactly when `backend` is
+  a `SaasBackend`) steps 2–4 run once per computer instead:
+  - Detected from the backend's type, before anything is sent. Session-
+    relevance 1.3.0 exposes no "targets per query" capability, and the
+    `multiple_targets` error is not a signal to retry on: reacting to it
+    would cost a wasted round trip on every run. The flag is explicit for
+    tests and for a future one-target backend.
+  - Each computer gets its own submit and its own polling (same backoff),
+    all against the one `timeout_s` deadline, so five silent computers take
+    one timeout, not five. At most `MAX_CONCURRENT_CALLS` (4) server calls
+    are in flight, submits and results calls alike; the semaphore is never
+    held across a poll's sleep. A submit still waiting for its turn when
+    the deadline passes is not sent ("not submitted: the N s timeout ran
+    out first"), since its answer could not count.
+  - A failed submit is that computer's `transport` result and **is never
+    resent**: SaaS answers most failures with a bare HTTP 500, possibly
+    after the query reached the root server. An error result or a raise
+    (such as the `ValueError` for an id ≤ 0) reads "Fast Query submit
+    failed: …", a timeout "Fast Query submit timed out after N s". A raise
+    while polling reads "Fast Query results failed: …". The other computers
+    carry on.
+  - Results merge exactly as for one query: answered computers by name,
+    then every unanswered one (silent, refused, not submitted) in targeting
+    order with its own reason.
+  - One INFO line says the run is one query per computer; each submit is
+    DEBUG, since a large `computer_query` would otherwise bury the answers.
+
+  **Observed (BigFix SaaS, 2026-10-27, session-relevance 1.3.0; a
+  deployment with two Windows agents on 11.0.5.204, one reporting and one
+  silent for months):**
+  - `--computer-query` works through `SaasBackend.evaluate`: `ids of (bes
+    computers whose (id of it = N))` resolved under the operator's scope
+    and that computer answered `name of operating system` in about 12 s.
+  - Four concurrent `clientquery/create` submits finished in 0.53 s, all
+    accepted, all answered. No throttling, and no rate-limit headers (the
+    responses carry only `content-type`). That sets the cap at 4; larger
+    bursts are untested.
+  - Failed submits are a bare 500 with one fixed body, `{"status":500,
+    "message":"Internal Server Error","data":{"errorMessage":"Server
+    Error"}}` (`tests/fixtures/saas_fastquery/create_500.json`), for two
+    different causes: a computer id the deployment does not have (on REST
+    the same id is accepted silently and never answers) and client
+    relevance containing a control character. The body never says which.
+  - Release check, `values of headers "X-Fixlet-Source-Release-Date" of
+    relevant fixlets of sites` to the reporting agent, the silent one and
+    an unknown id, `--timeout 60`: without `--use-client-context` the agent
+    answered one failure row `InspectorFixletContextError`, the silent one
+    "no answer within 60 s" and the unknown id "Fast Query submit failed:
+    Server Error …", each its own result (exit 3). With it, 136 rows; the
+    silent one again "no answer". The on-prem REST path still sends one
+    query for several computers (three agents, `--use-client-context`, all
+    answered), and `fastquery_live` passes against the SaaS connection.
+  - Each submit is a separate entry in the operator's console query
+    history; the README warns about it rather than limiting it. Whether a
+    500 submit still reached the root server could not be seen from here.
 
   **Client context.** By default an endpoint evaluates a Fast Query like
   qna, without fixlet context: `number of relevant fixlets of sites`
@@ -852,9 +916,26 @@ bigfix-remote-client-relevance --setup-fastquery
   SESSION_RELEVANCE`. It composes with `--inventory`. Usage errors (exit
   64): no usable connection for `--fastquery`, with the reason named —
   unknown, disabled, or a backend without ClientQuery (e.g. "connection
-  'x' is a saas connection, and Fast Query only works through REST so
-  far; run --setup-fastquery to add a REST connection"; SaaS support is
-  [#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)).
+  'x' is a webreports connection, and Fast Query only works through REST
+  or SaaS; run --setup-fastquery to add a REST or SaaS connection"). A
+  `rest` connection builds a `RestBackend`, a `saas` one a `SaasBackend`.
+  The SaaS backends of one run share a session per account through one
+  `SaasSessionPool` (made per run, like the image coordinator; a session
+  holds an `asyncio.Lock`, so it cannot outlive the run's event loop): one
+  login and one cached failure for all of an account's targets, since 100
+  failed SaaS logins lock the account for good. `SaasSessionPool` is not
+  exported from session-relevance's top level, so it is imported from
+  `bigfix_remote_session_relevance.backends.saas`.
+  **SaaS accounts that require MFA cannot be used yet.** No TOTP prompt is
+  passed to `SaasBackend`, so the sign-in fails with session-relevance's
+  "this account requires a TOTP code (MFA); run interactively to enter it"
+  in every computer's `transport` result ("Fast Query submit failed: …"),
+  on every run, however it is run. `--setup-fastquery` still saves such an account, because the wizard
+  answers the TOTP challenge itself. Whether those refused sign-ins count
+  toward the lockout is unknown.
+  `--setup-fastquery` runs session-relevance's wizard limited to
+  `("rest", "saas")`: both are now usable, and the wizard already knows how
+  to sign in to SaaS and save one connection per server.
   An inventory
   fastquery host with an unusable connection is not a usage error: it
   fails as that host's transport error and the other hosts still run;
@@ -946,7 +1027,7 @@ base_url = "https://developer.bigfix.com"
 
 [hosts.lab-web]
 transport = "fastquery"
-connection = "lab"            # required: a session-relevance REST connection
+connection = "lab"            # required: a session-relevance REST or SaaS connection
 computer_ids = [1234567]      # computer_ids and/or computer_query required
 computer_query = 'bes computers whose (name of it starts with "web")'
 use_client_context = true     # optional: fixlet/site inspectors (fastquery only)
@@ -1163,11 +1244,9 @@ answers cross an untrusted network.
 
 ## Out of scope (for this task)
 - The MCP server itself (design keeps the surface compatible).
-- Fast Query over BigFix SaaS (REST only for now; session-relevance 1.3.0's
-  `SaasBackend` has ClientQuery, but one computer per query, so it needs a
-  per-computer fan-out here first;
-  [#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)),
-  targeting by computer name, group or custom relevance, streaming
+- Fast Query with a SaaS account that requires MFA (TOTP); see the
+  `--fastquery` CLI notes.
+- Fast Query targeting by computer name, group or custom relevance, streaming
   per-computer results as they arrive, and reporting each endpoint's agent
   version in `qna_version`.
 - Windows containers, and publishing our own qna-preloaded images to a
@@ -1199,8 +1278,6 @@ order.
    `inventory.py`, `cli.py`, `--json` output.
 
 Follow-ups after M5: rpm-family + SUSE bootstraps, remaining arches,
-SaaS Fast Query
-([#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)),
 MCP server (separate task). Fine-grained work items live in
 GitHub issues, not in this doc.
 

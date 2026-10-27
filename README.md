@@ -216,15 +216,16 @@ image = "ubuntu:22.04"
 
 Fast Query sends client relevance to real managed endpoints through a BigFix
 server; each endpoint answers with its own installed agent, usually within
-seconds. It needs a REST connection, which this tool shares with
+seconds. It needs a connection to an on-prem root server's REST API or to
+BigFix SaaS, which this tool shares with
 [bigfix-remote-session-relevance](https://github.com/jgstew/bigfix-remote-session-relevance)
-(one config file, one certificate pin store, one login). Set one up once:
+(one config file, one set of credentials, one certificate pin store). Set one up once:
 
 ```bash
 bigfix-remote-client-relevance --setup-fastquery
 ```
 
-That runs session-relevance's setup wizard, limited to REST, and saves the
+That runs session-relevance's setup wizard, limited to REST and SaaS, and saves the
 connection to `$BFRSR_CONFIG` or `~/.bigfix/.remote_session_connections.toml`.
 (`uvx` only puts this package's own commands on PATH, which is why the flag
 is here.)
@@ -247,7 +248,7 @@ within N s"). An inventory host can do the same:
 ```toml
 [hosts.lab-web]
 transport = "fastquery"
-connection = "lab"           # a REST connection in the session-relevance config
+connection = "lab"           # a REST or SaaS connection in the session-relevance config
 computer_ids = [1234567]     # and/or computer_query = "<session relevance>"
 ```
 
@@ -294,8 +295,19 @@ Requirements and limits:
 - Answers come back as text without types, so `answer_types` is empty.
   An empty plural answer can't be told apart from an empty string: both
   come back as `answers` `[""]`, not `[]`.
-- REST only for now; BigFix SaaS is not supported yet
-  ([#74](https://github.com/jgstew/bigfix-remote-client-relevance/issues/74)).
+- **On BigFix SaaS, one query per computer.** A SaaS fast query targets a
+  single computer, so the tool sends each computer its own query, at most 4
+  server calls at a time, all within the one `--timeout` (calls already
+  due by then get at most 5 s more). Each one is a
+  separate entry in the operator's console query history, so a large
+  `--computer-query` leaves as many entries as it matches. A computer whose
+  submit fails gets that error as its result and is not retried: SaaS
+  answers most failures, including a computer id it does not know, with a
+  bare HTTP 500 that doesn't say why, possibly after the query went out.
+- **SaaS accounts that require MFA (a TOTP code) don't work yet.** The tool
+  can't ask for the code, so every run fails to sign in with "this account
+  requires a TOTP code (MFA)", even though `--setup-fastquery` can save the
+  account. Use a SaaS account without MFA, or an on-prem REST connection.
 
 ## As a library
 
@@ -671,7 +683,7 @@ falls back to podman only if Docker is unreachable), `docker`, or `podman`.
 
 - Python 3.11+
 - Docker or podman for `--container`; SSH access for remote hosts
-- A BigFix REST connection for `--fastquery` (see § Fast Query)
+- A BigFix REST or SaaS connection for `--fastquery` (see § Fast Query)
 - On macOS, `qna` needs root — `--local` implies `--become` there automatically
   (pass `--no-become` to opt out); over SSH it stays opt-in, since the remote
   platform isn't known up front. `--become` uses `sudo -n`, so it needs
