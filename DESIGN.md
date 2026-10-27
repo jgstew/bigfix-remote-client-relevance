@@ -461,8 +461,9 @@ Five concrete transports, all class-named `Transport<Kind>`:
   Ubuntu/Debian/RHEL/Amazon-Linux/etc. right now, no reservation required."
   Design notes below.
 - `TransportFastQuery(backend, *, computer_ids=(), computer_query=None,
-  host="fastquery")` — BigFix Fast Query: the server sends client relevance
-  to managed endpoints, which answer with their installed agent. `backend`
+  use_client_context=None, host="fastquery")` — BigFix Fast Query: the
+  server sends client relevance to managed endpoints, which answer with
+  their installed agent. `backend`
   is a bigfix-remote-session-relevance `RestBackend` (typed as its
   `ClientQueryExtras` protocol plus `evaluate`); that package owns config,
   credentials, certificate pinning and the two wire calls (`POST
@@ -494,6 +495,30 @@ Five concrete transports, all class-named `Transport<Kind>`:
      silently, and those never answer, so the deadline is what bounds them.
   5. No exception escapes. `aclose` closes the backend.
 
+  **Client context.** By default an endpoint evaluates a Fast Query like
+  qna, without fixlet context: `number of relevant fixlets of sites`
+  answers, but a fixlet's properties (`headers of relevant fixlets of
+  sites`) fail with `InspectorFixletContextError`. `use_client_context=True` is
+  passed through to session-relevance's `submit_client_query` (1.3.0+),
+  which adds `<UseClientContext>true</UseClientContext>` (BESAPI 11.0.7.61
+  schema) so the agent evaluates in its client context instead; `False`
+  sends it explicitly off. The default, `None`, leaves the element out, so
+  servers that predate it see the same request as before. Every result
+  for the target carries the requested value in
+  `ClientRelevanceResult.use_client_context` (schema 1.3), answered or
+  not, including failures before anything was submitted (the transport's
+  own and the orchestrator's, such as an unusable connection), since the
+  same expression can answer differently in the two contexts. **Observed
+  (through BigFix SaaS, which sends the same XML to its root server):**
+  with it, `values of headers "X-Fixlet-Source-Release-Date" of relevant
+  fixlets of sites` answered 135 rows; without it, one failure row
+  `InspectorFixletContextError`. **Observed on-prem (2026-10-27, through
+  REST to a lab root server whose own agent is 11.0.7.61):** the same
+  expression answered 721 dates with `True` and failed the same way with
+  the element omitted or `False`; omitted and `False` answered identically
+  (`number of relevant fixlets of sites` = 2595 in both). Which older
+  server versions accept the element is not confirmed.
+
   `evaluate_client_relevance_fanout(client_relevance, *, timeout_s)` is the
   native call (the orchestrator's `FanOutTransport`);
   `evaluate_client_relevance` returns the first result so plain-`Transport`
@@ -516,7 +541,8 @@ Five concrete transports, all class-named `Transport<Kind>`:
   `count_work` stays a lower bound. The arch probe and the CLI's inventory
   write-back skip fastquery, and a target's `platform`/`arch` are never
   stamped onto fan-out results (an inventory fastquery host may not set
-  them). `ClientRelevanceResult` is unchanged.
+  them). Fan-out leaves the result shape alone; the one Fast Query-only
+  field is `use_client_context` (above).
 - `TransportOnlineEvaluator(base_url, host=None, session=None,
   max_retries=1)` — speaks the small JSON contract behind BigFix's own
   "Online Evaluator" (<https://developer.bigfix.com/relevance/evaluate/>),
@@ -834,6 +860,13 @@ bigfix-remote-client-relevance --setup-fastquery
   with `--container`, every positional is client relevance, so a `HOST`
   cannot be given. Output is always labelled when a Fast Query target is
   present, since how many computers answer is unknown up front.
+  `--use-client-context` / `--no-use-client-context` (unset by default) set
+  `Target.use_client_context` on the `--fastquery` target and fill it in on
+  inventory fastquery hosts that do not set their own (a host's own value
+  wins). Given when the run has no Fast Query target at all, it is a usage
+  error rather than a no-op, checked once the targets are known so an
+  implied inventory counts, and also up front when no inventory exists
+  anywhere, so first-run discovery never runs for a run that would fail.
   `--setup-fastquery` runs session-relevance's `run_setup(backends=("rest",))`,
   because `uvx` only puts this package's own commands on PATH.
   bigfix-remote-session-relevance is a hard dependency, not an extra, so a
@@ -912,12 +945,18 @@ transport = "fastquery"
 connection = "lab"            # required: a session-relevance REST connection
 computer_ids = [1234567]      # computer_ids and/or computer_query required
 computer_query = 'bes computers whose (name of it starts with "web")'
+use_client_context = true     # optional: fixlet/site inspectors (fastquery only)
 ```
 
 A fastquery host is validated at load time next to the online_evaluator
 `base_url` check: it needs `connection`, and `computer_ids` (a list of
 integers) and/or `computer_query`. They land in explicit `Target.connection`,
-`Target.computer_ids` and `Target.computer_query` fields.
+`Target.computer_ids` and `Target.computer_query` fields. `use_client_context`
+must be a TOML boolean (`"true"` the string is an `InventoryError`, not a
+guess) and lands in `Target.use_client_context`. It may also sit in
+`[defaults]`, where, like `qna_version` on an unpinnable host, it is applied
+only to fastquery hosts; set on any other host it is an `InventoryError`,
+since qna has no client context to switch to.
 
 ### MCP-ready contract (server itself out of scope)
 The server is still out of scope; the affordances a server needs are not. The
@@ -1120,7 +1159,9 @@ answers cross an untrusted network.
 
 ## Out of scope (for this task)
 - The MCP server itself (design keeps the surface compatible).
-- Fast Query over BigFix SaaS (REST only for now), targeting by computer
+- Fast Query over BigFix SaaS (REST only for now; session-relevance 1.3.0's
+  `SaasBackend` has ClientQuery, but one computer per query, so it needs a
+  per-computer fan-out here first), targeting by computer
   name, group or custom relevance, streaming per-computer results as they
   arrive, and reporting each endpoint's agent version in `qna_version`.
 - Windows containers, and publishing our own qna-preloaded images to a

@@ -77,3 +77,4 @@ idle_ttl_s = 300
 # connection = "lab"
 # computer_ids = [1234567]
 # computer_query = 'bes computers whose (name of it starts with "web")'
+# use_client_context = true   # fixlet inspectors (headers etc.); fastquery only

@@ -142,6 +142,12 @@ class Target:
     """``fastquery`` only. Session relevance selecting computers; the server
     resolves it with ``ids of (...)``. Merged with ``computer_ids``."""
 
+    use_client_context: bool | None = None
+    """``fastquery`` only. ``True`` evaluates in the agent's client context
+    (fixlet and site inspectors available) instead of the default qna-like
+    one. ``None`` leaves ``UseClientContext`` out of the request, for servers
+    that predate it."""
+
     inventory_backed: bool = False
     """True only when this target was loaded from a `remote_clients.toml` the
     CLI can write back to (``--inventory`` with ``--update-inventory``, the
@@ -260,6 +266,7 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
             backend,
             computer_ids=target.computer_ids,
             computer_query=target.computer_query,
+            use_client_context=target.use_client_context,
             host=target.name,
         )
     if target.kind == "online_evaluator":
@@ -275,8 +282,9 @@ def default_transport_factory(target: Target, *, coordinator: object | None = No
 
 SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST connection"
 
-# Backends with a ClientQuery API. SaaS joins once bigfix-remote-session-
-# relevance gives it one.
+# Backends Fast Query can use. bigfix-remote-session-relevance 1.3.0 gave
+# SaasBackend a ClientQuery API too, but it takes one computer per query, so
+# SaaS joins once TransportFastQuery fans out a query per computer.
 FASTQUERY_BACKENDS = frozenset({"rest"})
 
 
@@ -513,6 +521,10 @@ async def _evaluate_stream_indexed(
             client_relevance=client_relevance,
             error=message,
             error_kind=kind,
+            # What was requested for the target, as on the transport's own
+            # failures: a host that failed before submitting still says
+            # which context it asked for.
+            use_client_context=target.use_client_context if target.kind == "fastquery" else None,
         )
 
     def _group_failure(target: Target, kind: str, message: str) -> list[ClientRelevanceResult]:

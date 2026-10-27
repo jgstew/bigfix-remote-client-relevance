@@ -251,6 +251,29 @@ connection = "lab"           # a REST connection in the session-relevance config
 computer_ids = [1234567]     # and/or computer_query = "<session relevance>"
 ```
 
+#### Client context
+
+By default an endpoint evaluates a Fast Query the way qna does, with no
+fixlet context: `number of relevant fixlets of sites` answers, but reading
+a fixlet's properties, such as `headers of relevant fixlets of sites`, fails
+with `InspectorFixletContextError`. `--use-client-context` asks each agent
+to evaluate in its client context instead, where those fixlet inspectors
+work:
+
+```bash
+bigfix-remote-client-relevance --fastquery lab --computer-id 1234567 --use-client-context 'values of headers "X-Fixlet-Source-Release-Date" of relevant fixlets of sites'
+```
+
+An inventory fastquery host can set `use_client_context = true` (or
+`false`), on the host or in `[defaults]`, where it applies only to fastquery
+hosts. With `--inventory`, the flag fills in the fastquery hosts that don't
+set their own. The server needs a ClientQuery API that supports
+`UseClientContext` (it is in the BESAPI 11.0.7.61 schema); left unset, the
+request is exactly what it was before the option existed, so older servers
+keep working. Each Fast Query result records the requested setting in
+`use_client_context` (`null` when none was requested), failures included,
+since the same expression can answer differently in the two contexts.
+
 Requirements and limits:
 
 - Clients and relays must be **9.5 Patch 2 or later**, and reachable by UDP
@@ -445,8 +468,9 @@ bigfix-remote-client-relevance --schema
 ```
 
 prints the JSON Schema for a single result and exits 0 — no target needed.
-The schema is versioned (`x-schema-version`, currently `1.2`) and only ever
-grows within a major version; 1.2 added `qna_fallback_from`. Then
+The schema is versioned (`x-schema-version`, currently `1.3`) and only ever
+grows within a major version; 1.2 added `qna_fallback_from` and 1.3
+`use_client_context`. Then
 `--jsonl` emits exactly one of those objects per line, flushed as each target
 answers, so a Node or Go server can stream progress off the pipe. `--json`
 emits the whole array once. stdout carries only the payload; logs and error

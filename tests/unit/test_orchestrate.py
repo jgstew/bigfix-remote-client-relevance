@@ -2364,3 +2364,86 @@ def test_default_factory_names_a_malformed_connection_config():
         default_transport_factory(
             Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1,))
         )
+
+
+@pytest.mark.parametrize("use_client_context", [None, True, False])
+def test_default_factory_passes_the_client_context(use_client_context):
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "lab"\nbackend = "rest"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    transport = default_transport_factory(
+        Target(
+            kind="fastquery",
+            name="lab",
+            connection="lab",
+            computer_ids=(1,),
+            use_client_context=use_client_context,
+        )
+    )
+
+    assert isinstance(transport, TransportFastQuery)
+    assert transport._use_client_context is use_client_context
+
+
+@pytest.mark.parametrize("use_client_context", [True, False])
+async def test_a_fastquery_factory_failure_carries_the_requested_client_context(
+    use_client_context,
+):
+    """The setting is what was requested for the target, so it is on the result
+    however early the target failed, the same as the transport's own failures."""
+
+    def refuse(target):
+        raise ValueError("no connection named 'nope'")
+
+    [result] = await evaluate_client_relevance(
+        "true",
+        [
+            Target(
+                kind="fastquery",
+                name="fleet",
+                connection="nope",
+                computer_ids=(1,),
+                use_client_context=use_client_context,
+            )
+        ],
+        transport_factory=refuse,
+    )
+
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.use_client_context is use_client_context
+
+
+async def test_fanout_results_keep_their_client_context():
+    """Grouping and ordering must not drop the field the transport set."""
+
+    class ContextTransport(FakeFanOutTransport):
+        async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+            results = await super().evaluate_client_relevance_fanout(client_relevance)
+            for result in results:
+                result.use_client_context = True
+            return results
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="fastquery", name="lab", use_client_context=True)],
+        transport_factory=lambda t: ContextTransport(["alpha", "beta"]),
+    )
+
+    assert [(r.host, r.use_client_context) for r in results] == [("alpha", True), ("beta", True)]
+
+
+async def test_non_fastquery_failures_leave_the_client_context_unset():
+    def refuse(target):
+        raise ValueError("unreachable")
+
+    [result] = await evaluate_client_relevance(
+        "true", [Target(kind="ssh", name="host0")], transport_factory=refuse
+    )
+
+    assert result.use_client_context is None

@@ -92,6 +92,7 @@ class TransportFastQuery:
         *,
         computer_ids: Sequence[int] = (),
         computer_query: str | None = None,
+        use_client_context: bool | None = None,
         host: str = TRANSPORT_NAME,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
@@ -106,6 +107,12 @@ class TransportFastQuery:
                 operator's scope. Note this one expression is *session*
                 relevance -- the dialect that picks endpoints -- while
                 everything evaluated on them is client relevance.
+            use_client_context: ``True`` evaluates in the agent's client
+                context (fixlet and site inspectors available) instead of
+                the default qna-like one; ``None`` leaves ``UseClientContext``
+                out of the request entirely, for servers that predate it
+                (it is in the BESAPI 11.0.7.61 schema). Recorded on every
+                result.
             host: What a result is reported under when no computer can be
                 (nothing targeted, or the submit failed).
             clock, sleep: Injected so tests never wait.
@@ -113,6 +120,7 @@ class TransportFastQuery:
         self._backend = backend
         self._computer_ids = list(computer_ids)
         self._computer_query = computer_query
+        self._use_client_context = use_client_context
         self._host = host
         self._clock = clock
         self._sleep = sleep
@@ -213,7 +221,11 @@ class TransportFastQuery:
             return fail("no computers to query (the computer query matched none)")
 
         submitted = await self._call(
-            "Fast Query submit", self._backend.submit_client_query(client_relevance, ids), deadline
+            "Fast Query submit",
+            self._backend.submit_client_query(
+                client_relevance, ids, use_client_context=self._use_client_context
+            ),
+            deadline,
         )
         if submitted.error is not None or submitted.query_id is None:
             message = submitted.error.message if submitted.error else "no query id returned"
@@ -243,6 +255,7 @@ class TransportFastQuery:
                 error=silence,
                 error_kind=ERROR_KIND_TRANSPORT,
                 elapsed_ms=elapsed_ms,
+                use_client_context=self._use_client_context,
             )
             for computer_id in ids
             if computer_id not in by_computer
@@ -284,9 +297,8 @@ class TransportFastQuery:
                 break
         return rows, None
 
-    @staticmethod
     def _computer_result(
-        client_relevance: str, rows: list[ClientQueryRow], elapsed_ms: int
+        self, client_relevance: str, rows: list[ClientQueryRow], elapsed_ms: int
     ) -> ClientRelevanceResult:
         first = rows[0]
         failures = [r.result for r in rows if r.is_failure]
@@ -301,6 +313,7 @@ class TransportFastQuery:
             error_kind=ERROR_KIND_RELEVANCE if failures else None,
             raw_qna_output=json.dumps([r.to_dict() for r in rows]),
             elapsed_ms=elapsed_ms,
+            use_client_context=self._use_client_context,
         )
 
     def _failure(
@@ -313,6 +326,7 @@ class TransportFastQuery:
             error=message,
             error_kind=kind,
             elapsed_ms=int((self._clock() - started) * 1000),
+            use_client_context=self._use_client_context,
         )
 
 

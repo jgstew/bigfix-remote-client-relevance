@@ -21,6 +21,7 @@ Example::
     transport = "fastquery"
     connection = "lab"          # a REST connection in the session-relevance config
     computer_ids = [11, 12]     # and/or computer_query = "<session relevance>"
+    use_client_context = true   # fixlet/site inspectors; fastquery only
 """
 
 from __future__ import annotations
@@ -122,6 +123,15 @@ def _target_from_entry(
     connection = setting("connection")
     computer_ids: tuple[int, ...] = ()
     computer_query = setting("computer_query")
+    use_client_context: bool | None = None
+    if kind != "fastquery" and "use_client_context" in config:
+        # Like platform on fastquery, the other way round: these hosts run
+        # qna (or a fixed evaluator), which has no client context to switch
+        # to. A [defaults] one is just not applied to them.
+        raise InventoryError(
+            f"{kind} host {name!r} in {path} cannot set `use_client_context`: only "
+            "fastquery hosts evaluate in an agent that has a client context"
+        )
     if kind == "fastquery":
         # One host is many endpoints, so a platform or arch written on it
         # would describe none of them; [defaults] ones are just not applied.
@@ -136,6 +146,18 @@ def _target_from_entry(
             raise InventoryError(
                 f"fastquery host {name!r} in {path} needs `computer_ids` or `computer_query`"
             )
+        raw_context = setting("use_client_context")
+        # A TOML boolean only: `"true"` the string is a typo, and coercing it
+        # (or 1) would guess which context the author meant.
+        if raw_context is not None and not isinstance(raw_context, bool):
+            # Point at the table to edit: a [defaults] typo is reported by
+            # the first fastquery host it reaches, but fixed in [defaults].
+            where = "" if "use_client_context" in config else " (from [defaults])"
+            raise InventoryError(
+                f"fastquery host {name!r} in {path} has `use_client_context` = "
+                f"{raw_context!r}{where}; it must be true or false"
+            )
+        use_client_context = raw_context
 
     user = setting("user")
     # Like platform/arch on fastquery: a [defaults] version is for the hosts
@@ -159,6 +181,7 @@ def _target_from_entry(
         connection=str(connection) if connection is not None else None,
         computer_ids=computer_ids,
         computer_query=str(computer_query) if computer_query else None,
+        use_client_context=use_client_context,
         # None (rather than a hardcoded default) when unset, same as
         # `platform` below: ssh/local targets get it probed (see
         # orchestrate._one()); a container needs an explicit one, which the

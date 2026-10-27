@@ -1711,3 +1711,77 @@ def test_malformed_connection_config_names_its_cause(captured):
     # Setup cannot repair a file it would have to parse first.
     assert "--setup-fastquery" not in message
     assert "targets" not in captured
+
+
+# --- Fast Query client context ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [([], None), (["--use-client-context"], True), (["--no-use-client-context"], False)],
+)
+def test_fastquery_client_context_reaches_the_target(captured, lab_connection, flags, expected):
+    result = invoke("--fastquery", "lab", "--computer-id", "1", *flags, "true")
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"][0].use_client_context is expected
+
+
+@pytest.mark.parametrize("flag", ["--use-client-context", "--no-use-client-context"])
+def test_client_context_flag_needs_a_fastquery_target(captured, flag):
+    result = invoke("--local", flag, "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert flag in result.stderr
+    assert "--fastquery" in result.stderr
+    assert "targets" not in captured
+
+
+def test_client_context_flag_needs_a_fastquery_host_in_the_inventory(captured, tmp_path):
+    """Nothing in the run could use it, so it is a mistake, not a no-op."""
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text('[hosts.box]\ntransport = "ssh"\n', encoding="utf-8")
+
+    result = invoke("--inventory", str(inventory), "--use-client-context", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--use-client-context" in result.stderr
+    assert "targets" not in captured
+
+
+def test_client_context_flag_fills_in_inventory_fastquery_hosts(captured, tmp_path):
+    """The flag sets fastquery hosts that say nothing; a host's own value wins."""
+    inventory = tmp_path / "remote_clients.toml"
+    inventory.write_text(
+        '[hosts.fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n\n'
+        '[hosts.own]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [2]\n'
+        "use_client_context = false\n\n"
+        '[hosts.box]\ntransport = "ssh"\n',
+        encoding="utf-8",
+    )
+
+    result = invoke("--inventory", str(inventory), "--use-client-context", "true")
+
+    assert result.exit_code == 0, result.output
+    by_name = {t.name: t.use_client_context for t in captured["targets"]}
+    assert by_name == {"fleet": True, "own": False, "box": None}
+
+
+def test_client_context_flag_alone_fails_before_first_run_discovery(
+    captured, tmp_path, monkeypatch
+):
+    """With no inventory anywhere nothing could supply a Fast Query target, so
+    the flag is refused before first-run discovery probes and writes anything."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    calls: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, calls)
+
+    result = invoke("--use-client-context", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--use-client-context" in result.stderr
+    assert calls == []
+    assert not user_inventory.exists()

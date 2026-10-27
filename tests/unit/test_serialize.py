@@ -174,3 +174,23 @@ def test_fallback_from_is_emitted():
 
 def test_fallback_from_defaults_to_null():
     assert result_to_dict(make_result())["qna_fallback_from"] is None
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_use_client_context_is_emitted(value):
+    payload = result_to_dict(make_result(transport="fastquery", use_client_context=value))
+
+    assert payload["use_client_context"] is value
+
+
+def test_use_client_context_defaults_to_null():
+    """Null both off Fast Query and on it when nothing was asked for."""
+    assert result_to_dict(make_result())["use_client_context"] is None
+
+
+def test_use_client_context_schema_is_a_nullable_boolean():
+    assert RESULT_JSON_SCHEMA["properties"]["use_client_context"]["type"] == ["boolean", "null"]
+
+
+def test_schema_version_records_the_client_context_field():
+    assert SCHEMA_VERSION == "1.3"

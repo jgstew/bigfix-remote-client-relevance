@@ -57,11 +57,12 @@ class ResultPayload(TypedDict):
     qna_fallback_from: str | None
     qna_path: str
     qna_time: str | None
+    use_client_context: bool | None
     elapsed_ms: int
     raw_qna_output: str
 
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
 """Bumped on any additive change to the result payload. See the module docstring."""
 
 SCHEMA_ID = (
@@ -87,6 +88,7 @@ _KEY_ORDER = (
     "qna_fallback_from",
     "qna_path",
     "qna_time",
+    "use_client_context",
     "elapsed_ms",
     "raw_qna_output",
 )
@@ -140,6 +142,7 @@ def result_to_dict(
         "qna_fallback_from": result.qna_fallback_from,
         "qna_path": result.qna_path,
         "qna_time": result.qna_time,
+        "use_client_context": result.use_client_context,
         "elapsed_ms": result.elapsed_ms,
         "raw_qna_output": raw,
     }
@@ -238,6 +241,17 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
         "qna_time": {
             "type": _STRING_OR_NULL,
             "description": "qna's own T: timing, distinct from elapsed_ms.",
+        },
+        "use_client_context": {
+            "type": ["boolean", "null"],
+            "description": (
+                "fastquery only: the UseClientContext requested for the target, also on "
+                "failures before anything was submitted. true = the agent's client context "
+                "(fixlet inspectors available), false = explicitly not; null = none "
+                "requested (left out, so the server's default, qna-like context) or not a "
+                "fastquery result. The same client relevance can answer differently in "
+                "the two contexts."
+            ),
         },
         "elapsed_ms": {
             "type": "integer",
