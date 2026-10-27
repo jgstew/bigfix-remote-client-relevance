@@ -128,6 +128,13 @@ def _fail(message: str) -> NoReturn:
     raise typer.Exit(USAGE_EXIT_CODE)
 
 
+def _fail_client_context_without_fastquery(use_client_context: bool) -> NoReturn:
+    flag = "--use-client-context" if use_client_context else "--no-use-client-context"
+    _fail(
+        f"{flag} only applies to Fast Query targets: --fastquery, or a fastquery host in --inventory"
+    )
+
+
 def _read_client_relevance(inline: list[str], from_file: Path | None) -> str:
     if from_file is not None:
         if inline:
@@ -727,6 +734,18 @@ def evaluate(
         # bare objects on the one channel that has to stay parseable.
         _fail("--json and --jsonl are two framings of the same records; pick one")
 
+    # The full check waits until the targets are known (below), but with no
+    # inventory anywhere nothing could supply a Fast Query target; refuse
+    # now, before first-run discovery probes this machine and writes a file.
+    if (
+        use_client_context is not None
+        and not fastquery
+        and inventory is None
+        and find_inventory_path() is None
+        and not user_inventory_path().exists()
+    ):
+        _fail_client_context_without_fastquery(use_client_context)
+
     # With an explicit target mode every positional is client relevance;
     # otherwise the first positional is the SSH host.
     host: str | None = None
@@ -878,11 +897,7 @@ def evaluate(
     # fastquery host could not use the flag either. A no-op flag would let
     # someone believe they compared the two contexts when they did not.
     if use_client_context is not None and not any(t.kind == "fastquery" for t in targets):
-        flag = "--use-client-context" if use_client_context else "--no-use-client-context"
-        _fail(
-            f"{flag} only applies to Fast Query targets: --fastquery, or a "
-            "fastquery host in --inventory"
-        )
+        _fail_client_context_without_fastquery(use_client_context)
 
     # --json and --diff are the whole-set views -- one array, and a grouping
     # that only exists once every answer is in -- so they alone wait for the

@@ -270,9 +270,9 @@ hosts. With `--inventory`, the flag fills in the fastquery hosts that don't
 set their own. The server needs a ClientQuery API that supports
 `UseClientContext` (it is in the BESAPI 11.0.7.61 schema); left unset, the
 request is exactly what it was before the option existed, so older servers
-keep working. Each Fast Query result records the setting in
-`use_client_context` (`null` when it wasn't sent), since the same
-expression can answer differently in the two contexts.
+keep working. Each Fast Query result records the requested setting in
+`use_client_context` (`null` when none was requested), failures included,
+since the same expression can answer differently in the two contexts.
 
 Requirements and limits:
 

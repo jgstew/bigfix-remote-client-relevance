@@ -521,6 +521,10 @@ async def _evaluate_stream_indexed(
             client_relevance=client_relevance,
             error=message,
             error_kind=kind,
+            # What was requested for the target, as on the transport's own
+            # failures: a host that failed before submitting still says
+            # which context it asked for.
+            use_client_context=target.use_client_context if target.kind == "fastquery" else None,
         )
 
     def _group_failure(target: Target, kind: str, message: str) -> list[ClientRelevanceResult]:

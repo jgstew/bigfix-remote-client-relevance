@@ -245,11 +245,12 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
         "use_client_context": {
             "type": ["boolean", "null"],
             "description": (
-                "fastquery only: the UseClientContext the query was sent with. true = the "
-                "agent's client context (fixlet and site inspectors available), false = "
-                "explicitly not; null = not sent (the server's default, qna-like context) "
-                "or not a fastquery result. The same client relevance can answer "
-                "differently in the two contexts."
+                "fastquery only: the UseClientContext requested for the target, also on "
+                "failures before anything was submitted. true = the agent's client context "
+                "(fixlet inspectors available), false = explicitly not; null = none "
+                "requested (left out, so the server's default, qna-like context) or not a "
+                "fastquery result. The same client relevance can answer differently in "
+                "the two contexts."
             ),
         },
         "elapsed_ms": {

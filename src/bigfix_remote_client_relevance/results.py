@@ -134,12 +134,14 @@ class ClientRelevanceResult:
     alongside ``platform``."""
 
     use_client_context: bool | None = None
-    """``fastquery`` only: the ``UseClientContext`` this query was sent with.
+    """``fastquery`` only: the ``UseClientContext`` requested for this target.
     ``True`` asks endpoints to evaluate in the agent's client context (fixlet
-    and site inspectors available), ``False`` explicitly not; ``None`` means
-    it was not sent, so the server's default, qna-like context applied. Kept
-    on the result because the same client relevance can answer differently
-    in the two contexts. Always ``None`` for every other transport."""
+    inspectors available), ``False`` explicitly not; ``None`` means none was
+    requested, so the element is left out and the server's default,
+    qna-like context applies. Set on every result for the target, including
+    a failure before anything was submitted. Kept on the result because the
+    same client relevance can answer differently in the two contexts.
+    Always ``None`` for every other transport."""
 
     @property
     def ok(self) -> bool:

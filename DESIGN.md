@@ -461,8 +461,9 @@ Five concrete transports, all class-named `Transport<Kind>`:
   Ubuntu/Debian/RHEL/Amazon-Linux/etc. right now, no reservation required."
   Design notes below.
 - `TransportFastQuery(backend, *, computer_ids=(), computer_query=None,
-  use_client_context=None, host="fastquery")` — BigFix Fast Query: the server sends client relevance
-  to managed endpoints, which answer with their installed agent. `backend`
+  use_client_context=None, host="fastquery")` — BigFix Fast Query: the
+  server sends client relevance to managed endpoints, which answer with
+  their installed agent. `backend`
   is a bigfix-remote-session-relevance `RestBackend` (typed as its
   `ClientQueryExtras` protocol plus `evaluate`); that package owns config,
   credentials, certificate pinning and the two wire calls (`POST
@@ -503,9 +504,11 @@ Five concrete transports, all class-named `Transport<Kind>`:
   schema) so the agent evaluates in its client context instead; `False`
   sends it explicitly off. The default, `None`, leaves the element out, so
   servers that predate it see the same request as before. Every result
-  this transport returns, answered or not, carries the value in
-  `ClientRelevanceResult.use_client_context` (schema 1.3), since the same
-  expression can answer differently in the two contexts. **Observed
+  for the target carries the requested value in
+  `ClientRelevanceResult.use_client_context` (schema 1.3), answered or
+  not, including failures before anything was submitted (the transport's
+  own and the orchestrator's, such as an unusable connection), since the
+  same expression can answer differently in the two contexts. **Observed
   (through BigFix SaaS, which sends the same XML to its root server):**
   with it, `values of headers "X-Fixlet-Source-Release-Date" of relevant
   fixlets of sites` answered 135 rows; without it, one failure row
@@ -862,7 +865,8 @@ bigfix-remote-client-relevance --setup-fastquery
   inventory fastquery hosts that do not set their own (a host's own value
   wins). Given when the run has no Fast Query target at all, it is a usage
   error rather than a no-op, checked once the targets are known so an
-  implied inventory counts.
+  implied inventory counts, and also up front when no inventory exists
+  anywhere, so first-run discovery never runs for a run that would fail.
   `--setup-fastquery` runs session-relevance's `run_setup(backends=("rest",))`,
   because `uvx` only puts this package's own commands on PATH.
   bigfix-remote-session-relevance is a hard dependency, not an extra, so a

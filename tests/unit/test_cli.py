@@ -1765,3 +1765,23 @@ def test_client_context_flag_fills_in_inventory_fastquery_hosts(captured, tmp_pa
     assert result.exit_code == 0, result.output
     by_name = {t.name: t.use_client_context for t in captured["targets"]}
     assert by_name == {"fleet": True, "own": False, "box": None}
+
+
+def test_client_context_flag_alone_fails_before_first_run_discovery(
+    captured, tmp_path, monkeypatch
+):
+    """With no inventory anywhere nothing could supply a Fast Query target, so
+    the flag is refused before first-run discovery probes and writes anything."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    calls: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, calls)
+
+    result = invoke("--use-client-context", "true")
+
+    assert result.exit_code == USAGE_EXIT_CODE
+    assert "--use-client-context" in result.stderr
+    assert calls == []
+    assert not user_inventory.exists()

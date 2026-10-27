@@ -150,9 +150,12 @@ def _target_from_entry(
         # A TOML boolean only: `"true"` the string is a typo, and coercing it
         # (or 1) would guess which context the author meant.
         if raw_context is not None and not isinstance(raw_context, bool):
+            # Point at the table to edit: a [defaults] typo is reported by
+            # the first fastquery host it reaches, but fixed in [defaults].
+            where = "" if "use_client_context" in config else " (from [defaults])"
             raise InventoryError(
                 f"fastquery host {name!r} in {path} has `use_client_context` = "
-                f"{raw_context!r}; it must be true or false"
+                f"{raw_context!r}{where}; it must be true or false"
             )
         use_client_context = raw_context
 

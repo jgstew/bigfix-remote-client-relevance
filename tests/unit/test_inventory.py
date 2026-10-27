@@ -449,6 +449,12 @@ def test_use_client_context_must_be_a_boolean(tmp_path, body):
     assert "true or false" in str(excinfo.value)
 
 
+def test_a_bad_defaults_use_client_context_names_defaults(tmp_path):
+    """The value to fix is in [defaults], not on the host that tripped over it."""
+    with pytest.raises(InventoryError, match=r"\[defaults\]"):
+        _load_one(tmp_path, '[defaults]\nuse_client_context = "yes"\n\n' + _FLEET)
+
+
 @pytest.mark.parametrize(
     "host",
     [
