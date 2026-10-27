@@ -2364,3 +2364,28 @@ def test_default_factory_names_a_malformed_connection_config():
         default_transport_factory(
             Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1,))
         )
+
+
+@pytest.mark.parametrize("use_client_context", [None, True, False])
+def test_default_factory_passes_the_client_context(use_client_context):
+    from bigfix_remote_client_relevance.orchestrate import default_transport_factory
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
+
+    _write_connections(
+        "[[connections]]\n"
+        'name = "lab"\nbackend = "rest"\nserver = "bigfix.example"\n'
+        'username = "op"\npassword = "<PASSWORD>"\n'
+    )
+
+    transport = default_transport_factory(
+        Target(
+            kind="fastquery",
+            name="lab",
+            connection="lab",
+            computer_ids=(1,),
+            use_client_context=use_client_context,
+        )
+    )
+
+    assert isinstance(transport, TransportFastQuery)
+    assert transport._use_client_context is use_client_context

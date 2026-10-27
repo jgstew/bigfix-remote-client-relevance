@@ -71,7 +71,7 @@ prerequisite and auto-skip without it (see `tests/conftest.py`).
   store; don't redirect HOME wholesale, or the container tests lose the
   Docker socket and try to start Docker Desktop.
 - **Fast Query sits on bigfix-remote-session-relevance**, a hard dependency
-  (`>=1.1.0,<2`) that owns config, auth, pinning and the ClientQuery wire
+  (`>=1.3.0,<2`) that owns config, auth, pinning and the ClientQuery wire
   calls. This repo owns targeting, polling and mapping rows to results;
   don't reimplement REST calls here. Its fake in
   `tests/unit/test_transport_fastquery.py` implements only `evaluate`,

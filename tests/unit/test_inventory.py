@@ -415,3 +415,71 @@ def test_fastquery_host_keeps_its_own_qna_version(tmp_path):
     )
 
     assert target.qna_version == "11.0"
+
+
+# --- use_client_context (fastquery only) -------------------------------------
+
+_FLEET = '[hosts.lab-fleet]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [1]\n'
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [("", None), ("use_client_context = true\n", True), ("use_client_context = false\n", False)],
+)
+def test_fastquery_host_use_client_context(tmp_path, line, expected):
+    [target] = _load_one(tmp_path, _FLEET + line)
+
+    assert target.use_client_context is expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _FLEET + 'use_client_context = "true"\n',
+        _FLEET + "use_client_context = 1\n",
+        '[defaults]\nuse_client_context = "yes"\n\n' + _FLEET,
+    ],
+)
+def test_use_client_context_must_be_a_boolean(tmp_path, body):
+    """`"true"` the string is a typo; it must not silently mean true or false."""
+    with pytest.raises(InventoryError, match="lab-fleet") as excinfo:
+        _load_one(tmp_path, body)
+
+    assert "`use_client_context`" in str(excinfo.value)
+    assert "true or false" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        'transport = "ssh"\n',
+        'transport = "local"\n',
+        'transport = "container"\nimage = "debian:12"\n',
+        'transport = "online_evaluator"\nbase_url = "https://example.invalid"\n',
+    ],
+)
+def test_use_client_context_on_a_qna_host_is_an_error(tmp_path, host):
+    """These run qna (or a fixed evaluator), which has no client context to switch to."""
+    with pytest.raises(InventoryError, match="other") as excinfo:
+        _load_one(tmp_path, f"[hosts.other]\n{host}use_client_context = true\n")
+
+    assert "`use_client_context`" in str(excinfo.value)
+    assert "fastquery" in str(excinfo.value)
+
+
+def test_defaults_use_client_context_applies_only_to_fastquery_hosts(tmp_path):
+    """Like a [defaults] qna_version on an unpinnable host: a fleet-wide
+    default must not make every ssh or container host fail to load."""
+    targets = _load_one(
+        tmp_path,
+        "[defaults]\nuse_client_context = true\n\n"
+        + _FLEET
+        + '\n[hosts.mac]\ntransport = "ssh"\n'
+        + '\n[hosts.own]\ntransport = "fastquery"\nconnection = "lab"\ncomputer_ids = [2]\n'
+        + "use_client_context = false\n",
+    )
+
+    by_name = {target.name: target for target in targets}
+    assert by_name["lab-fleet"].use_client_context is True
+    assert by_name["mac"].use_client_context is None
+    assert by_name["own"].use_client_context is False

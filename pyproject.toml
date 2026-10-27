@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-remote-client-relevance"
-version = "1.6.2"
+version = "1.7.0"
 description = "Evaluate BigFix client relevance on remote endpoints and inside containers via qna, without a full BES install."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
   "asyncssh>=2.14",
   "beautifulsoup4>=4.12",
-  "bigfix-remote-session-relevance>=1.1.0,<2",
+  "bigfix-remote-session-relevance>=1.3.0,<2",
   "docker>=7.0",
   "filelock>=3.32.3",
   "platformdirs>=4",
@@ -84,14 +84,12 @@ python-preference = "managed"
 # package (`--exclude-newer-package`) when a fresh release must be taken
 # early; see DESIGN.md § Packaging & Python versions.
 exclude-newer = "-P7D"
-# Fast Query needs bigfix-remote-session-relevance 1.1.0 (uploaded
-# 2026-10-20), a sibling package by the same maintainer, inside the window.
-# The fixed date lifts the quarantine for that one release only; remove this
-# once the rolling window has passed it (after 2026-10-27), or it would hold
-# the package back from then on.
-# certifi 2026.10.19 (uploaded 2026-10-20) fixes GHSA-6q48-6c7w-9gw2, which
-# fails the uv-audit hook; same lift, remove after 2026-10-27.
-exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-21T00:00:00Z", certifi = "2026-10-21T00:00:00Z" }
+# Fast Query's client context needs bigfix-remote-session-relevance 1.3.0
+# (uploaded 2026-10-27), a sibling package by the same maintainer, inside the
+# window. The fixed date lifts the quarantine for that one release only;
+# remove this once the rolling window has passed it (after 2026-11-03), or it
+# would hold the package back from then on.
+exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-28T00:00:00Z" }
 
 # --- Tooling ---------------------------------------------------------------
 

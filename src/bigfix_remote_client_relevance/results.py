@@ -133,6 +133,14 @@ class ClientRelevanceResult:
     CLI's ``--update-inventory`` writes back to ``remote_clients.toml``,
     alongside ``platform``."""
 
+    use_client_context: bool | None = None
+    """``fastquery`` only: the ``UseClientContext`` this query was sent with.
+    ``True`` asks endpoints to evaluate in the agent's client context (fixlet
+    and site inspectors available), ``False`` explicitly not; ``None`` means
+    it was not sent, so the server's default, qna-like context applied. Kept
+    on the result because the same client relevance can answer differently
+    in the two contexts. Always ``None`` for every other transport."""
+
     @property
     def ok(self) -> bool:
         return self.error_kind is None

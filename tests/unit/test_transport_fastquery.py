@@ -80,11 +80,15 @@ class FakeClientQueryBackend:
         self._submit = submit or _response(query_id=7)
         self._ids = ids
         self.submitted: list[tuple[str, list[int]]] = []
+        self.contexts: list[bool | None] = []
         self.polled: list[int] = []
         self.evaluated: list[str] = []
 
-    async def submit_client_query(self, client_relevance, computer_ids):
+    async def submit_client_query(self, client_relevance, computer_ids, *, use_client_context):
+        # Keyword required, no default: a transport that stops passing it
+        # (and so silently drops a requested client context) fails loudly.
         self.submitted.append((client_relevance, list(computer_ids)))
+        self.contexts.append(use_client_context)
         return self._submit
 
     async def client_query_results(self, query_id):
@@ -338,7 +342,7 @@ async def test_no_exception_escapes():
     """Like every transport, failures come back as results."""
 
     class ExplodingBackend(FakeClientQueryBackend):
-        async def submit_client_query(self, client_relevance, computer_ids):
+        async def submit_client_query(self, client_relevance, computer_ids, **kwargs):
             raise RuntimeError("socket closed")
 
     results = await make(ExplodingBackend(), computer_ids=[11]).evaluate_client_relevance_fanout(
@@ -385,9 +389,9 @@ async def test_results_are_checked_once_even_when_setup_used_the_whole_timeout()
     clock = FakeClock()
 
     class SlowSubmit(FakeClientQueryBackend):
-        async def submit_client_query(self, client_relevance, computer_ids):
+        async def submit_client_query(self, client_relevance, computer_ids, **kwargs):
             clock.now += 5.0
-            return await super().submit_client_query(client_relevance, computer_ids)
+            return await super().submit_client_query(client_relevance, computer_ids, **kwargs)
 
     backend = SlowSubmit(polls=_polls_answering([row(11, "a", name="alpha")]))
 
@@ -448,3 +452,45 @@ async def test_an_empty_plural_answer_is_one_empty_string():
 
     assert result.answers == [""]
     assert result.error_kind is None
+
+
+# --- client context (UseClientContext) ---------------------------------------
+
+
+async def test_client_context_is_left_unset_by_default():
+    """None leaves <UseClientContext> out of the request, exactly as before
+    the option existed, so servers that predate it keep working."""
+    backend = FakeClientQueryBackend(polls=_polls_answering([row(11, "a")]))
+
+    [result] = await make(backend, computer_ids=[11]).evaluate_client_relevance_fanout(
+        "true", timeout_s=30
+    )
+
+    assert backend.contexts == [None]
+    assert result.use_client_context is None
+
+
+@pytest.mark.parametrize("use_client_context", [True, False])
+async def test_client_context_is_forwarded_and_recorded_on_every_result(use_client_context):
+    """The same client relevance can answer differently in the two contexts,
+    so every result, answered or not, says which one was asked for."""
+    backend = FakeClientQueryBackend(polls=_polls_answering([row(11, "a", name="alpha")]))
+
+    results = await make(
+        backend, computer_ids=[11, 99], use_client_context=use_client_context
+    ).evaluate_client_relevance_fanout("true", timeout_s=20)
+
+    assert backend.contexts == [use_client_context]
+    assert {r.host for r in results} == {"alpha", "99"}
+    assert all(r.use_client_context is use_client_context for r in results)
+
+
+async def test_client_context_is_recorded_on_a_failure_before_submitting():
+    backend = FakeClientQueryBackend(ids=[])
+
+    [result] = await make(
+        backend, computer_query="bes computers whose (false)", use_client_context=True
+    ).evaluate_client_relevance_fanout("true", timeout_s=30)
+
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.use_client_context is True

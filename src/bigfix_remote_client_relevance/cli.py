@@ -432,6 +432,19 @@ def evaluate(
             ),
         ),
     ] = None,
+    use_client_context: Annotated[
+        bool | None,
+        typer.Option(
+            "--use-client-context/--no-use-client-context",
+            help=(
+                "Evaluate Fast Query in the agent's client context (fixlet and "
+                "site inspectors available) instead of the default qna-like "
+                "context. Needs a server whose ClientQuery API supports "
+                "UseClientContext (BESAPI 11.0.7.61 has it). With --inventory, "
+                "sets the fastquery hosts that don't set their own."
+            ),
+        ),
+    ] = None,
     setup_fastquery: Annotated[
         bool,
         typer.Option(
@@ -781,6 +794,15 @@ def evaluate(
             _fail(message)
         except InventoryError as exc:
             _fail(str(exc))
+        if use_client_context is not None:
+            # Fills in, never overrides: a host that set its own value
+            # (true or false) said so on purpose.
+            inventory_targets = [
+                dataclasses.replace(target, use_client_context=use_client_context)
+                if target.kind == "fastquery" and target.use_client_context is None
+                else target
+                for target in inventory_targets
+            ]
         if update_inventory:
             # Only an updatable inventory host is worth online_evaluator's
             # arch probe -- a real network round trip whose only
@@ -821,6 +843,7 @@ def evaluate(
                 connection=fastquery,
                 computer_ids=tuple(computer_id or ()),
                 computer_query=computer_query,
+                use_client_context=use_client_context,
             )
         )
     # Only the ad hoc --fastquery target is checked up front: it is the whole
@@ -849,6 +872,17 @@ def evaluate(
                 verify_host_key=not insecure_skip_host_key_check,
             )
         ]
+
+    # Checked once the targets are known rather than with the --computer-*
+    # flags above: an implied inventory is only found by now, and one with no
+    # fastquery host could not use the flag either. A no-op flag would let
+    # someone believe they compared the two contexts when they did not.
+    if use_client_context is not None and not any(t.kind == "fastquery" for t in targets):
+        flag = "--use-client-context" if use_client_context else "--no-use-client-context"
+        _fail(
+            f"{flag} only applies to Fast Query targets: --fastquery, or a "
+            "fastquery host in --inventory"
+        )
 
     # --json and --diff are the whole-set views -- one array, and a grouping
     # that only exists once every answer is in -- so they alone wait for the
