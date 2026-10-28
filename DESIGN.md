@@ -673,7 +673,16 @@ transport, so across the expressions `evaluate_many` runs side by side too)
      client-relevance string on stdin. Capture stdout/stderr + exit code.
   4. `keep_alive=True` reuses a long-lived container (via `docker exec`)
      for hot repeat evals against the same image; default is one-shot for
-     hermetic answers.
+     hermetic answers. An evaluation is **one** `sh -c` exec,
+     `printf '%s' <quoted stdin> | LANG="${LANG:-C.UTF-8}" <qna> -t -showtypes`
+     (issue #79). It used to be two `sh -lc` execs, one staging stdin to a
+     file and one running qna on it. Under amd64 emulation the login shell
+     alone doubled each exec, and it resolved every tool this transport runs
+     the same as plain `sh -c` across twelve images. The one thing the
+     profile did supply was a UTF-8 `LANG` on RHEL-family images; Debian,
+     Ubuntu, openSUSE and Oracle Linux set none, and there qna answered any
+     non-ASCII string with `Transcoding Failure of result`. So the eval
+     command sets `LANG` itself, keeping one the image sets via `ENV`.
   5. **Every** container carries its own deadline (`DEFAULT_IDLE_TTL_S`,
      120s, always widened to cover the evaluation about to run): PID 1 is a
      POSIX-sh loop watching a deadline file rather than `sleep infinity`, and
@@ -858,12 +867,13 @@ saves nothing; the container is stopped when the batch is. `evaluate_client_rele
 one-element expression list, so the two can never drift.
 
 **qna stdin batching (issue #9).** Sharing the transport still left one qna
-process per expression — for a container, a stdin-staging exec plus an
-eval exec each, about 190 ms per expression on a native container, while
+process per expression — for a container at the time, a stdin-staging exec
+plus an eval exec each (one exec since #79), about 190 ms per expression on a
+native container, while
 368 expressions on one qna stdin took 70 ms in total. So with `batch=True`
 (the default) a group's expressions after the first go through one qna
 process per `batch_size` chunk (default 100, and at most
-`MAX_BATCH_BYTES` = 64 KiB of stdin, because the container transport stages
+`MAX_BATCH_BYTES` = 64 KiB of stdin, because the container transport passes
 stdin as one `printf` argument and Linux caps one argument at 128 KiB). The
 optional `BatchTransport` protocol (`transports/__init__.py`) is the seam;
 local, ssh and container implement it, through the helpers in

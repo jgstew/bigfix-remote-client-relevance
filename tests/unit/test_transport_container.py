@@ -8,8 +8,10 @@ driven here without a daemon.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import shlex
 from dataclasses import dataclass, field
 
 import pytest
@@ -305,6 +307,43 @@ async def test_eval_command_uses_t_and_showtypes():
 
     assert "-t" in str(engine.one_shots[0]["command"])
     assert "-showtypes" in str(engine.one_shots[0]["command"])
+
+
+QNA_WITH_UTF8 = 'LANG="${LANG:-C.UTF-8}" '
+
+
+async def test_qna_runs_with_a_utf8_locale():
+    """Issue #79: Debian, Ubuntu, openSUSE and Oracle Linux images set no
+    LANG, and qna answers anything non-ASCII there with "Transcoding Failure
+    of result". A LANG the image sets itself (via ENV) is kept."""
+    engine = FakeEngine(responses=[EVAL_OK])
+
+    await TransportContainer("ubuntu:22.04", engine=engine).evaluate_client_relevance('"café"')
+
+    assert engine.one_shots[0]["command"] == f"{QNA_WITH_UTF8}qna -t -showtypes"
+
+
+async def test_a_provisioned_qna_runs_with_a_utf8_locale(resolved, extracted):
+    engine = FakeEngine(responses=[PROBE_UBUNTU, EVAL_OK])
+    transport = TransportContainer(
+        "ubuntu:22.04", engine=engine, keep_alive=True, extractor=extracted
+    )
+
+    await transport.evaluate_client_relevance('"café"', qna=resolved)
+    await transport.aclose()
+
+    evals = [c.command for c in engine.execs if c.input is not None]
+    assert evals == [f"{QNA_WITH_UTF8}/opt/bigfix_qna/opt/BESClient/bin/qna -t -showtypes"]
+
+
+def test_the_qna_path_stays_one_shell_word_after_the_locale():
+    from bigfix_remote_client_relevance.bootstrap.targets import spec_for
+
+    command = TransportContainer("ubuntu:22.04", engine=FakeEngine())._eval_command(
+        spec_for("ubuntu"), "/opt/my qna/qna"
+    )
+
+    assert shlex.split(command) == ["LANG=${LANG:-C.UTF-8}", "/opt/my qna/qna", "-t", "-showtypes"]
 
 
 async def test_relevance_error_maps_to_relevance(qna_output):
@@ -2108,7 +2147,7 @@ def test_podman_engine_setup_defaults_to_podman_engine_setup():
     assert isinstance(engine._setup, PodmanEngineSetup)
 
 
-# --- stdin staging must not collide between concurrent execs ----------------
+# --- stdin rides in the one exec that runs the command ----------------------
 
 
 class FakeExecResult:
@@ -2118,14 +2157,19 @@ class FakeExecResult:
 
 
 class FakeExecContainer:
-    """Records every exec_run command, so staging paths can be inspected."""
+    """Records every exec_run argv, so the shell and its script can be inspected."""
 
-    def __init__(self) -> None:
-        self.commands: list[str] = []
+    def __init__(self, result: FakeExecResult | None = None) -> None:
+        self.argvs: list[list[str]] = []
+        self._result = result or FakeExecResult()
+
+    @property
+    def commands(self) -> list[str]:
+        return [argv[-1] for argv in self.argvs]
 
     def exec_run(self, argv: list[str], demux: bool = False) -> FakeExecResult:
-        self.commands.append(argv[-1])
-        return FakeExecResult()
+        self.argvs.append(list(argv))
+        return self._result
 
 
 class FakeExecClient:
@@ -2140,39 +2184,92 @@ class FakeExecClient:
         return True
 
 
-def _staging_paths(commands: list[str]) -> list[str]:
-    """The `/tmp/.bfrcr-stdin-...` handle each staging command wrote to."""
-    return [
-        match.group(0)
-        for command in commands
-        if (match := re.search(r"/tmp/\.bfrcr-stdin-\S+", command)) and command.startswith("printf")
-    ]
-
-
-async def test_stdin_staging_paths_are_unique_per_exec():
-    """Two evaluations sharing one container must not stage stdin to the same
-    path: a batch runs many through one container, and colliding handles would
-    have one evaluation answer another expression's input."""
+async def test_an_exec_with_input_is_one_plain_shell_exec():
+    """Issue #79: staging stdin to a file was a second exec per evaluation,
+    and under amd64 emulation every exec costs ~70 ms before qna even starts."""
+    payload = "version of client\n"
     container = FakeExecContainer()
     engine = engine_with(FakeExecClient(container))
 
-    await engine.exec_in("abc123456789", "qna -t", input="first")
-    await engine.exec_in("abc123456789", "qna -t", input="second")
+    await engine.exec_in("abc123456789", "qna -t", input=payload)
 
-    paths = _staging_paths(container.commands)
-    assert len(paths) == 2
-    assert paths[0] != paths[1], f"both execs staged stdin to {paths[0]}"
+    assert container.argvs == [["sh", "-c", f"printf '%s' {shlex.quote(payload)} | qna -t"]]
 
 
-async def test_stdin_staging_file_is_removed_after_the_exec():
-    """Nothing accumulates in a long-lived container's /tmp."""
+async def test_stdin_survives_the_shell_intact():
+    """`printf '%s'` keeps the data out of the format string, and shlex
+    quoting keeps it out of the shell's hands."""
+    awkward = "\"%25 percent\" and \\\\ backslash\n'quoted' $HOME `x`\nsecond line\n"
     container = FakeExecContainer()
     engine = engine_with(FakeExecClient(container))
 
-    await engine.exec_in("abc123456789", "qna -t", input="hello")
+    await engine.exec_in("abc123456789", "qna -t", input=awkward)
 
-    handle = _staging_paths(container.commands)[0]
-    assert any(f"rm -f {handle}" in command for command in container.commands)
+    assert shlex.split(container.commands[0]) == ["printf", "%s", awkward, "|", "qna", "-t"]
+
+
+async def test_no_exec_uses_a_login_shell():
+    """A login shell doubled every exec under emulation, and the only thing
+    its profile gave qna -- a UTF-8 LANG on RHEL-family images -- is now
+    explicit in the eval command."""
+    container = FakeExecContainer()
+    engine = engine_with(FakeExecClient(container))
+
+    await engine.exec_in("abc123456789", "uname -s")
+    await engine.exec_in("abc123456789", "qna -t", input="true\n")
+    await engine.renew("abc123456789", ttl_s=300)
+
+    assert [argv[:2] for argv in container.argvs] == [["sh", "-c"]] * 3
+
+
+async def test_concurrent_execs_each_pipe_their_own_input():
+    """A batch shares one container across many evaluations; each must
+    answer its own expression, never another's."""
+    container = FakeExecContainer()
+    engine = engine_with(FakeExecClient(container))
+
+    await asyncio.gather(
+        engine.exec_in("abc123456789", "qna -t", input="first\n"),
+        engine.exec_in("abc123456789", "qna -t", input="second\n"),
+    )
+
+    piped = sorted(shlex.split(command)[2] for command in container.commands)
+    assert piped == ["first\n", "second\n"]
+
+
+async def test_stdin_too_large_for_one_argument_is_an_engine_error():
+    """The runtime refuses the exec itself, with a 126 that would otherwise
+    read as "no qna in this image"."""
+    container = FakeExecContainer(
+        FakeExecResult(
+            exit_code=126,
+            output=(
+                (
+                    b"OCI runtime exec failed: exec failed: unable to start container "
+                    b'process: exec: "sh": argument list too long: unknown\r\n'
+                ),
+                b"",
+            ),
+        )
+    )
+    engine = engine_with(FakeExecClient(container))
+
+    with pytest.raises(ContainerEngineError, match="argument list too long"):
+        await engine.exec_in("abc123456789", "qna -t", input="x" * 200_000)
+
+
+async def test_an_answer_that_mentions_the_phrase_is_still_qna_output():
+    """stdout is qna's answers; only the runtime's own refusal (126) counts."""
+    container = FakeExecContainer(
+        FakeExecResult(exit_code=1, output=(b"A: argument list too long\n", b""))
+    )
+    engine = engine_with(FakeExecClient(container))
+
+    stdout, _stderr, code = await engine.exec_in(
+        "abc123456789", "qna -t", input='"argument list too long"\n'
+    )
+
+    assert (stdout, code) == ("A: argument list too long\n", 1)
 
 
 # --- every container carries its own deadline -------------------------------
@@ -2445,6 +2542,7 @@ async def test_a_batch_without_keep_alive_is_one_one_shot(qna_output, fixed_sent
 
     assert results is not None
     assert [s["input"] for s in engine.one_shots] == [BATCH_PAYLOAD]
+    assert [s["command"] for s in engine.one_shots] == [f"{QNA_WITH_UTF8}qna -t -showtypes"]
     assert results[0].qna_path == "qna"
 
 

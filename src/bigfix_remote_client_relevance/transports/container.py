@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import itertools
 import logging
 import os
 import posixpath
@@ -151,6 +150,18 @@ def deadline_command(ttl_s: float) -> list[str]:
         f"do sleep {_DEADLINE_POLL_S}; done"
     )
     return ["sh", "-c", script]
+
+
+# qna answers any non-ASCII string with "Transcoding Failure of result" unless
+# its locale is UTF-8, and Debian, Ubuntu, openSUSE and Oracle Linux images set
+# no LANG at all (issue #79). C.UTF-8 is the one locale every tested image
+# carries; a LANG the image sets itself, via ENV, is kept. So is a non-UTF-8
+# one (LANG=C, or an LC_ALL / LC_CTYPE that outranks it), which still fails
+# the same way -- such an image chose that locale.
+_QNA_LOCALE = 'LANG="${LANG:-C.UTF-8}"'
+
+# How the runtime words an exec whose argv is over the kernel's limit.
+_ARG_TOO_LONG = "argument list too long"
 
 
 def renew_command(ttl_s: float) -> str:
@@ -785,39 +796,35 @@ class DockerEngine:
         def _exec() -> RunResult:
             client = self._get_client()
             container = client.containers.get(container_id)  # type: ignore[attr-defined]
-            if input is None:
-                result = container.exec_run(["sh", "-lc", command], demux=True)
-                stdout, stderr = result.output
-                return (
-                    (stdout or b"").decode("utf-8", errors="replace"),
-                    (stderr or b"").decode("utf-8", errors="replace"),
-                    int(result.exit_code or 0),
-                )
-            # Feeding stdin through the SDK means driving the raw exec socket,
-            # which is brittle. Writing the payload to a file and redirecting it
-            # in achieves the same thing with plain shell. `printf '%s'` keeps
-            # the format string separate from the data, so a client relevance
-            # containing % or backslashes is passed through untouched.
-            handle = _stdin_path(container_id)
-            stage = container.exec_run(
-                ["sh", "-lc", f"printf '%s' {shlex.quote(input)} > {handle}"], demux=True
-            )
-            if stage.exit_code not in (0, None):
-                raise ContainerEngineError("could not stage stdin inside the container")
-            # The handle is removed by the same shell that consumed it, so a
-            # long-lived container's /tmp does not grow one file per
-            # evaluation. `$?` is captured first so the removal cannot mask
-            # the command's own exit code.
-            result = container.exec_run(
-                ["sh", "-lc", f"{command} < {handle}; __rc=$?; rm -f {handle}; exit $__rc"],
-                demux=True,
-            )
+            script = command
+            if input is not None:
+                # Feeding stdin through the SDK means driving the raw exec
+                # socket, which is brittle; piping it in from the same shell
+                # needs no second exec and no file to clean up. `printf '%s'`
+                # keeps the format string separate from the data, so a client
+                # relevance containing % or backslashes is passed through
+                # untouched, and the pipeline's exit status is the command's.
+                script = f"printf '%s' {shlex.quote(input)} | {command}"
+            # Plain `sh -c`, not a login shell: under amd64 emulation reading
+            # the profile doubled every exec (issue #79), and across twelve
+            # images every tool this transport runs resolved the same either
+            # way. The one thing a profile did give qna -- a UTF-8 LANG on
+            # RHEL-family images -- the eval command now sets itself.
+            result = container.exec_run(["sh", "-c", script], demux=True)
             stdout, stderr = result.output
-            return (
-                (stdout or b"").decode("utf-8", errors="replace"),
-                (stderr or b"").decode("utf-8", errors="replace"),
-                int(result.exit_code or 0),
-            )
+            out = (stdout or b"").decode("utf-8", errors="replace")
+            err = (stderr or b"").decode("utf-8", errors="replace")
+            code = int(result.exit_code or 0)
+            # Too large a payload fails the exec itself (one argv string is
+            # capped at 128 KiB), with a 126 that would otherwise read as "no
+            # qna in this image". MAX_BATCH_BYTES keeps batches well under it.
+            # Only a 126 counts: stdout is qna's answers, and an answer may
+            # contain the phrase.
+            if input is not None and code == 126 and _ARG_TOO_LONG in f"{out}{err}".lower():
+                raise ContainerEngineError(
+                    f"could not pass stdin to the container: {(out or err).strip()}"
+                )
+            return out, err, code
 
         # Retryable: every command this transport execs is idempotent (a
         # uname/os-release probe, a `cp -a`, a package install, a qna
@@ -947,18 +954,6 @@ def _to_volumes(mounts: dict[str, str]) -> dict[str, dict[str, str]]:
         bind, _, mode = target.partition(":")
         volumes[source] = {"bind": bind, "mode": mode or "rw"}
     return volumes
-
-
-# Every exec stages its stdin to its own file. Keying on the container alone
-# was enough while one process owned one container for one evaluation at a
-# time; a container kept alive for a batch runs many, and two of them staging
-# to one path would have an evaluation answer another expression's input.
-_stdin_serial = itertools.count()
-
-
-def _stdin_path(container_id: str) -> str:
-    unique = f"{os.getpid():x}-{next(_stdin_serial):x}"
-    return f"/tmp/.bfrcr-stdin-{container_id[:12]}-{unique}"
 
 
 def _package_version() -> str:
@@ -1625,7 +1620,7 @@ class TransportContainer:
         # API boundary: qna's CLI vocabulary uses "relevance"; internal name
         # stays `client_relevance`.
         binary = qna_path or DEFAULT_QNA_COMMAND
-        return " ".join([shlex.quote(binary), *QNA_EVAL_FLAGS])
+        return " ".join([_QNA_LOCALE, shlex.quote(binary), *QNA_EVAL_FLAGS])
 
     def resolved_qna_path(self, version: str) -> str:
         """Where a provisioned version lands inside the container."""
