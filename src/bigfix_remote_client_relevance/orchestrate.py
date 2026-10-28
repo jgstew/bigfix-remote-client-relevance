@@ -513,6 +513,9 @@ async def _evaluate_stream_indexed(
     expression-then-host order with nothing overwritten. Every failure mode
     is reported inside a result rather than raised.
     """
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
         # work with each other and with nothing else.
@@ -768,7 +771,9 @@ async def _evaluate_stream_indexed(
                 # Batching them is running a few at once; waiting for a lane
                 # happens before the transport starts its clock, so a queued
                 # expression does not spend its timeout in the queue.
-                lanes = asyncio.Semaphore(FANOUT_PARALLEL_EXPRESSIONS if batch else 1)
+                # A transport can ask for fewer (see FanOutTransport).
+                parallel = getattr(transport, "parallel_expressions", None)
+                lanes = asyncio.Semaphore((parallel or FANOUT_PARALLEL_EXPRESSIONS) if batch else 1)
 
                 async def _cell(index: int, expression: str) -> None:
                     async with lanes:
@@ -826,16 +831,21 @@ async def _evaluate_stream_indexed(
             # The first expression ran alone: it is what found out whether
             # the build starts here at all. The rest share qna processes, a
             # chunk at a time, when the transport can.
-            can_batch = batch and isinstance(transport, BatchTransport)
+            batcher = transport if batch and isinstance(transport, BatchTransport) else None
             index = 1
             for chunk in chunk_expressions(
-                expressions[1:], max_count=max(batch_size, 1) if can_batch else 1
+                expressions[1:], max_count=batch_size if batcher is not None else 1
             ):
-                batched = (
-                    await _evaluate_batch(transport, target, chunk, resolved)  # type: ignore[arg-type]
-                    if len(chunk) > 1
-                    else None
-                )
+                batched = None
+                if batcher is not None and len(chunk) > 1:
+                    batched = await _evaluate_batch(batcher, target, chunk, resolved)
+                    if batched is None:
+                        # Whatever stopped this chunk -- expressions too slow
+                        # for one timeout_s, a qna that cannot run here --
+                        # would most likely stop the next one too, at the
+                        # cost of another timeout every run. One failed chunk
+                        # per group is the most batching may cost.
+                        batcher = None
                 if batched is not None:
                     for result in batched:
                         emit(index, _tagged(result))
@@ -1233,8 +1243,8 @@ async def evaluate_many(
     chunk, on transports that support it (local, ssh, container). A chunk
     that does not run cleanly -- a timeout within ``timeout_s`` for the whole
     chunk, a crash, output that does not line up -- is evaluated again one
-    expression at a time, so batching changes how fast results arrive, never
-    what they say. Batched results carry ``qna_batch_size``, and their
+    expression at a time, and so is the rest of that target's work, so
+    batching changes how fast results arrive, never what they say. Batched results carry ``qna_batch_size``, and their
     ``elapsed_ms`` is the whole qna run's. A fan-out target (Fast Query)
     instead runs up to :data:`FANOUT_PARALLEL_EXPRESSIONS` expressions at
     once, each still its own query. ``batch=False`` evaluates everything one

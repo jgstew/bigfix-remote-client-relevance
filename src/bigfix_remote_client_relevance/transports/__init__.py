@@ -60,6 +60,11 @@ class FanOutTransport(Protocol):
     So for a fan-out target the number of results is not known up front:
     :func:`~..orchestrate.count_work` counts one per cell, a floor rather
     than the exact total it is for every other transport.
+
+    ``evaluate_many`` runs a fan-out target's expressions a few at once
+    (:data:`~..orchestrate.FANOUT_PARALLEL_EXPRESSIONS`). A transport can set
+    an optional ``parallel_expressions`` attribute to ask for fewer, or
+    leave it ``None`` (or unset) for that default.
     """
 
     async def evaluate_client_relevance_fanout(

@@ -2812,3 +2812,52 @@ async def test_fanout_expressions_run_one_at_a_time_without_batching():
     )
 
     assert tracker["peak"] == 1
+
+
+async def test_after_a_chunk_falls_back_the_rest_run_one_at_a_time():
+    """A chunk that times out because its expressions are slow would time out
+    again in the next chunk, paying timeout_s per chunk on every run."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u", refuse=True)
+    expressions = [f"e{i}" for i in range(7)]
+
+    results = await evaluate_many(
+        expressions, [CONTAINER], batch_size=2, transport_factory=lambda t: transport
+    )
+
+    assert transport.batches == [["e1", "e2"]], "one failed chunk, then no more attempts"
+    assert transport.singles == expressions
+    assert [r.client_relevance for r in results] == expressions
+
+
+@pytest.mark.parametrize("batch_size", [0, -3])
+async def test_a_batch_size_below_one_is_rejected(batch_size):
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    with pytest.raises(ValueError, match="batch_size"):
+        await evaluate_many(
+            EXPRESSIONS,
+            [CONTAINER],
+            batch_size=batch_size,
+            transport_factory=lambda t: FakeBatchTransport("u"),
+        )
+
+
+async def test_a_fanout_transport_can_ask_for_fewer_expressions_at_once():
+    """Fast Query over SaaS sends one query per computer: expressions side by
+    side would split one call budget and starve each other's deadlines."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class OneAtATime(SlowFanOutTransport):
+        parallel_expressions = 1
+
+    tracker = {"live": 0, "peak": 0}
+
+    await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: OneAtATime(["alpha"], tracker),
+    )
+
+    assert tracker["peak"] == 1

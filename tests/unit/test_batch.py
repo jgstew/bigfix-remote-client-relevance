@@ -261,6 +261,16 @@ def test_an_oversize_expression_gets_a_chunk_of_its_own():
     ]
 
 
+def test_chunks_count_single_quotes_as_the_shell_quoting_they_become():
+    """The container stages stdin through shlex.quote, which turns each ' into
+    five characters; Linux caps one argument at 128 KiB."""
+    quoted = '"' + "'" * 20 + '"'
+
+    chunks = chunk_expressions([quoted, quoted], max_count=100, max_bytes=120)
+
+    assert chunks == [[quoted], [quoted]]
+
+
 def test_no_expressions_means_no_chunks():
     assert chunk_expressions([], max_count=10) == []
 

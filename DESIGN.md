@@ -891,7 +891,11 @@ local, ssh and container implement it, through the helpers in
   transport return `None`. The orchestrator then evaluates that chunk one
   expression at a time, and the single path reports the failure in its
   own words (a missing library, sudo, macOS root, an old qna without
-  `-showtypes`) and learns from it. Logged at DEBUG, since it can repeat
+  `-showtypes`) and learns from it. So does the rest of that group. Whatever
+  stopped one chunk would most likely stop the next: expressions too slow
+  for one `timeout_s`, or a qna that cannot start. Without this, each
+  chunk would cost another timeout on every run, so one failed chunk per
+  group is the most batching can cost. Logged at DEBUG, since it can repeat
   every run. So batching changes how fast results arrive, never what they
   say.
 - *Timeout.* `timeout_s` bounds the whole chunk. A hang is noticed within
@@ -916,8 +920,13 @@ local, ssh and container implement it, through the helpers in
   target runs up to `FANOUT_PARALLEL_EXPRESSIONS` (5) expressions at once,
   each still its own query. That limit is waited on before the transport
   starts an expression's clock, so a queued expression does not spend its
-  timeout in the queue. The SaaS `MAX_CONCURRENT_CALLS` cap is per transport,
-  so it holds across expressions too. Six expressions: 12.8 s → 5.6 s.
+  timeout in the queue. A fan-out transport can ask for fewer through an
+  optional `parallel_expressions` attribute. `TransportFastQuery` asks for
+  one when it sends one query per computer (SaaS). Its `MAX_CONCURRENT_CALLS`
+  budget is per transport, and expressions side by side would split it while
+  each one's deadline runs. A 100-computer target would then leave most
+  computers "not submitted" rather than answered. Six expressions over REST:
+  12.8 s → 5.6 s.
   Online evaluator does not batch: the endpoint is undocumented, and it
   should not be hammered.
 - `batch=False` restores one expression at a time for everything.

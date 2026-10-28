@@ -771,6 +771,15 @@ async def test_one_target_concurrency_is_capped():
     assert all(r.answers == ["x"] for r in results)
 
 
+def test_one_query_per_computer_takes_one_expression_at_a_time():
+    """Side by side they would share one call cap while each deadline runs."""
+    assert make_one_target(FakeOneTargetBackend()).parallel_expressions == 1
+
+
+def test_one_query_for_all_computers_leaves_the_orchestrators_default():
+    assert make(FakeClientQueryBackend()).parallel_expressions is None
+
+
 async def test_one_target_cap_is_shared_by_expressions_run_side_by_side():
     """evaluate_many runs a few expressions at once; four each would be 20 calls."""
     import asyncio

@@ -394,14 +394,15 @@ both ways:
 | macOS over SSH (`become`) | 40 | 11.6s | 5.1s |
 
 If anything goes wrong with a chunk as a whole, it is evaluated again one
-expression at a time, and each failure is reported as a single run reports
-it. That covers a timeout (`timeout_s` bounds the whole chunk), a crash,
+expression at a time, and so is the rest of that target's work. Each failure
+is reported as a single run reports it. That covers a timeout (`timeout_s` bounds the whole chunk), a crash,
 and output that doesn't line up. So batching changes how fast results
 arrive, not what they say. Batched results carry `qna_batch_size`, and
 their `elapsed_ms` is the whole qna run's (`qna_time` is still their own).
 
 A Fast Query target batches by running up to five expressions at once,
-each still its own query. Online evaluator targets run one at a time.
+each still its own query. BigFix SaaS, which takes one query per computer,
+runs them one at a time. Online evaluator targets also run one at a time.
 `batch=False` turns all of this off:
 
 ```python

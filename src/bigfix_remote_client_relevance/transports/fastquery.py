@@ -158,6 +158,18 @@ class TransportFastQuery:
         self._calls = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
         self._told_per_computer = False
 
+    @property
+    def parallel_expressions(self) -> int | None:
+        """How many expressions evaluate_many may run side by side here.
+
+        One when sending one query per computer: side by side, expressions
+        would split the one MAX_CONCURRENT_CALLS budget while each one's
+        deadline runs, so a 100-computer target would leave most computers
+        "not submitted" instead of answered. ``None`` keeps the
+        orchestrator's default for one query per expression.
+        """
+        return 1 if self._one_computer_per_query else None
+
     async def aclose(self) -> None:
         closer = getattr(self._backend, "aclose", None)
         if closer is not None:

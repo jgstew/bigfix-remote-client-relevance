@@ -41,7 +41,8 @@ SENTINEL_PREFIX = "bfrcr-batch-"
 MAX_BATCH_BYTES = 64 * 1024
 """Upper bound on one batch's stdin payload. The container transport stages
 stdin as a single ``printf`` argument, and Linux caps one argument at 128 KiB
-(``MAX_ARG_STRLEN``); half that leaves room for shell quoting."""
+(``MAX_ARG_STRLEN``); half that leaves room for the shell quoting around it,
+and :func:`chunk_expressions` counts what quoting adds to each ``'``."""
 
 _SENTINEL_BYTES = len(f'"{SENTINEL_PREFIX}{"0" * 16}"\n')
 
@@ -144,7 +145,9 @@ def chunk_expressions(
     chunks: list[list[str]] = []
     size = 0
     for expression in expressions:
-        cost = len(normalize_stdin_payload(expression).encode("utf-8")) + _SENTINEL_BYTES
+        line = normalize_stdin_payload(expression)
+        # shlex.quote turns each ' into '"'"', four bytes more on the wire.
+        cost = len(line.encode("utf-8")) + 4 * line.count("'") + _SENTINEL_BYTES
         if not chunks or len(chunks[-1]) >= max_count or size + cost > max_bytes:
             chunks.append([])
             size = 0
