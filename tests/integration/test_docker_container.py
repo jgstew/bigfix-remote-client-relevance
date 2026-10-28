@@ -346,3 +346,47 @@ async def test_use_keeps_a_container_past_its_original_deadline(stub_qna_image):
         )
     finally:
         await engine.stop(container_id)
+
+
+@pytest.mark.skipif(
+    os.environ.get("BFRCR_NETWORK_TESTS") != "1",
+    reason="needs a real qna artifact; set BFRCR_NETWORK_TESTS=1 to download one",
+)
+async def test_a_batch_answers_exactly_as_one_expression_at_a_time(tmp_path):
+    """Issue #9: one real qna stdin for many expressions, split back by position."""
+    from functools import partial
+
+    from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        artifact_for,
+        resolve_version_spec,
+    )
+
+    version = resolve_version_spec("11.0")
+    ref = artifact_for(version, platform="ubuntu", arch="x86_64")
+    resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
+    transport = TransportContainer(
+        IMAGE,
+        engine=DockerEngine(),
+        target="ubuntu",
+        keep_alive=True,
+        extractor=partial(ensure_extracted, cache_dir=tmp_path / "cache"),
+    )
+    expressions = ["name of operating system", "(1;2)", "this", "", "(1;2) whose (it > 5)"]
+
+    try:
+        singles = [
+            await transport.evaluate_client_relevance(e, qna=resolved, timeout_s=300.0)
+            for e in expressions
+        ]
+        batched = await transport.evaluate_client_relevance_batch(
+            expressions, qna=resolved, timeout_s=300.0
+        )
+    finally:
+        await transport.aclose()
+
+    assert batched is not None, "a clean run must not fall back"
+    assert [(r.answers, r.error, r.error_kind) for r in batched] == [
+        (r.answers, r.error, r.error_kind) for r in singles
+    ]

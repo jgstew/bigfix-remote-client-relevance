@@ -58,11 +58,12 @@ class ResultPayload(TypedDict):
     qna_path: str
     qna_time: str | None
     use_client_context: bool | None
+    qna_batch_size: int | None
     elapsed_ms: int
     raw_qna_output: str
 
 
-SCHEMA_VERSION = "1.3"
+SCHEMA_VERSION = "1.4"
 """Bumped on any additive change to the result payload. See the module docstring."""
 
 SCHEMA_ID = (
@@ -89,6 +90,7 @@ _KEY_ORDER = (
     "qna_path",
     "qna_time",
     "use_client_context",
+    "qna_batch_size",
     "elapsed_ms",
     "raw_qna_output",
 )
@@ -143,6 +145,7 @@ def result_to_dict(
         "qna_path": result.qna_path,
         "qna_time": result.qna_time,
         "use_client_context": result.use_client_context,
+        "qna_batch_size": result.qna_batch_size,
         "elapsed_ms": result.elapsed_ms,
         "raw_qna_output": raw,
     }
@@ -251,6 +254,13 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
                 "requested (left out, so the server's default, qna-like context) or not a "
                 "fastquery result. The same client relevance can answer differently in "
                 "the two contexts."
+            ),
+        },
+        "qna_batch_size": {
+            "type": ["integer", "null"],
+            "description": (
+                "How many expressions shared the one qna process that answered this one; "
+                "null when it ran alone. A batched result's elapsed_ms is that whole run's."
             ),
         },
         "elapsed_ms": {

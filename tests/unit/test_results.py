@@ -140,6 +140,7 @@ def test_result_has_every_designed_field():
         "platform",
         "arch",
         "use_client_context",
+        "qna_batch_size",
     }
 
 

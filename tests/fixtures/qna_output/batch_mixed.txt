@@ -1,0 +1,47 @@
+Q: A: 11.0.7.61
+T: 10650
+I: version
+
+Q: A: bfrcr-batch-test
+T: 12
+I: string
+
+Q: A: 1
+A: 2
+T: 127
+I: integer
+
+Q: A: bfrcr-batch-test
+T: 22
+I: string
+
+Q: T: 191
+I: integer
+
+Q: A: bfrcr-batch-test
+T: 4
+I: string
+
+Q: E: Singular expression refers to nonexistent object.
+T: 85
+I: integer
+
+Q: A: bfrcr-batch-test
+T: 4
+I: string
+
+Q: E: The operator "this" is not defined.
+
+Q: A: bfrcr-batch-test
+T: 3
+I: string
+
+Q: A: line1%0aQ: A: fake
+T: 12
+I: string
+
+Q: A: bfrcr-batch-test
+T: 3
+I: string
+
+Q:

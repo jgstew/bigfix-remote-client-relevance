@@ -771,6 +771,25 @@ async def test_one_target_concurrency_is_capped():
     assert all(r.answers == ["x"] for r in results)
 
 
+async def test_one_target_cap_is_shared_by_expressions_run_side_by_side():
+    """evaluate_many runs a few expressions at once; four each would be 20 calls."""
+    import asyncio
+
+    from bigfix_remote_client_relevance.transports.fastquery import MAX_CONCURRENT_CALLS
+
+    ids = list(range(1, 2 * MAX_CONCURRENT_CALLS + 1))
+    backend = FakeOneTargetBackend(answers={i: [row(i, "x")] for i in ids}, answer_after=2)
+    transport = make_one_target(backend, computer_ids=ids)
+
+    cells = await asyncio.gather(
+        *(transport.evaluate_client_relevance_fanout(f"e{n}", timeout_s=30) for n in range(5))
+    )
+
+    assert len(backend.submitted) == 5 * len(ids)
+    assert backend.most_in_flight == MAX_CONCURRENT_CALLS
+    assert all(r.answers == ["x"] for cell in cells for r in cell)
+
+
 @pytest.mark.parametrize("use_client_context", [True, False, None])
 async def test_one_target_client_context_goes_on_every_submit(use_client_context):
     backend = FakeOneTargetBackend(answers={11: [row(11, "a", name="alpha")]})

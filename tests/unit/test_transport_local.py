@@ -882,3 +882,102 @@ def test_classify_reports_a_too_new_binary_as_a_bootstrap_problem():
     assert error is not None
     assert "too new" in error
     assert "GLIBC_2.34" in error
+
+
+# --- batches: many expressions, one qna process ------------------------------
+
+BATCH_SENTINEL = "bfrcr-batch-test"
+BATCH_MIXED = [
+    "version of client",
+    "(1;2)",
+    "(1;2) whose (it > 5)",
+    'size of file "/nonexistent"',
+    "this",
+    '"line1%0aQ: A: fake"',
+]
+
+
+@pytest.fixture
+def fixed_sentinel(monkeypatch):
+    from bigfix_remote_client_relevance.transports import batch
+
+    monkeypatch.setattr(batch, "new_sentinel", lambda: BATCH_SENTINEL)
+
+
+async def test_a_batch_is_one_qna_process(fake_qna, qna_output, fixed_sentinel):
+    stub = fake_qna(stdout=qna_output("batch_mixed"))
+
+    results = await TransportLocal(qna_path=stub.path).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is not None
+    assert stub.stdin_text == "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)
+    assert stub.argv == ["-t", "-showtypes"]
+    assert [r.client_relevance for r in results] == BATCH_MIXED
+    assert results[0].answers == ["11.0.7.61"]
+    assert results[4].error_kind == ERROR_KIND_RELEVANCE
+    assert {(r.transport, r.qna_path, r.qna_batch_size) for r in results} == {
+        ("local", stub.path, len(BATCH_MIXED))
+    }
+
+
+async def test_a_batch_that_exits_nonzero_is_refused(fake_qna, qna_output, fixed_sentinel):
+    stub = fake_qna(stdout=qna_output("batch_mixed"), stderr="boom", exit_code=1)
+
+    assert (
+        await TransportLocal(qna_path=stub.path).evaluate_client_relevance_batch(BATCH_MIXED)
+        is None
+    )
+
+
+async def test_a_batch_that_does_not_line_up_is_refused(fake_qna, qna_output, fixed_sentinel):
+    stub = fake_qna(stdout=qna_output("batch_mixed"))
+
+    transport = TransportLocal(qna_path=stub.path)
+
+    assert await transport.evaluate_client_relevance_batch([*BATCH_MIXED, "one more"]) is None
+
+
+async def test_a_batch_that_times_out_is_refused_and_killed(fake_qna, qna_output, fixed_sentinel):
+    stub = fake_qna(stdout=qna_output("batch_mixed"), sleep=5.0)
+
+    results = await TransportLocal(qna_path=stub.path).evaluate_client_relevance_batch(
+        BATCH_MIXED, timeout_s=0.3
+    )
+
+    assert results is None
+    if sys.platform != "win32":  # see test_timeout_maps_to_transport_and_kills_process
+        assert not stub.ran_to_completion, "process outlived the timeout"
+
+
+async def test_a_batch_with_no_qna_is_refused_without_running_anything(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    transport = TransportLocal(candidates=["/nonexistent/qna"])
+
+    assert await transport.evaluate_client_relevance_batch(["true", "false"]) is None
+
+
+async def test_a_batch_on_macos_without_root_is_refused(fake_qna, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout="A: yes\n")
+
+    results = await TransportLocal(qna_path=stub.path).evaluate_client_relevance_batch(["a", "b"])
+
+    assert results is None
+    assert not stub.was_invoked
+
+
+@posix_only
+async def test_a_batch_runs_through_sudo_with_become(
+    fake_qna, fake_sudo, qna_output, fixed_sentinel, monkeypatch
+):
+    monkeypatch.setattr(os, "geteuid", lambda: 501, raising=False)
+    stub = fake_qna(stdout=qna_output("batch_mixed"))
+    sudo = fake_sudo()
+
+    results = await TransportLocal(become=True, qna_path=stub.path).evaluate_client_relevance_batch(
+        BATCH_MIXED
+    )
+
+    assert results is not None
+    assert sudo.argv == ["-n", stub.path, "-t", "-showtypes"]

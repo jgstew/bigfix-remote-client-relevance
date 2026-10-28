@@ -26,7 +26,7 @@ import posixpath
 import shlex
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 from pathlib import Path
@@ -1159,66 +1159,10 @@ class TransportContainer:
             base.update(overrides)
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
-        mounts: dict[str, str] = {}
-        image_to_run = self.image
-
-        transient_container: str | None = None
         try:
-            self._note_emulation()
-            await self._ensure_image_once()
-            # _ensure_image_once may have just resolved self._resolved_image
-            # for the first time -- recompute now that it can reflect that,
-            # not the pre-resolution default above.
-            image_to_run = self._run_image
-
-            # Provisioning needs the real platform (deb vs rpm agent); without
-            # provisioning the spec is cosmetic, so the cheap path never probes.
-            if qna is not None:
-                spec = spec_for(await self.resolve_platform(timeout_s=timeout_s))
-            else:
-                spec = spec_for(self._target or "ubuntu")
-
-            if qna is not None:
-                if self._prepared is not None and self._prepared[0] == qna.version:
-                    image_to_run, mounts = self._prepared[1]
-                    mounts = dict(mounts)
-                else:
-                    image_to_run, mounts = await self._prepare_qna_image(
-                        qna, spec, timeout_s=timeout_s
-                    )
-                qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
-
-            # A probed platform came from the image itself; only a
-            # human-supplied one can contradict what the image carries, so
-            # only that case pays for the sanity check.
-            needs_sanity = (
-                qna is not None and self._target is not None and spec.name in _SPEC_FAMILIES
+            stdout, stderr, exit_code, qna_path = await self._run_qna(
+                normalize_stdin_payload(client_relevance), qna, qna_path, timeout_s
             )
-            needs_container = self._keep_alive or needs_sanity
-
-            if needs_container:
-                container_id = await self._acquire_container(
-                    mounts, image=image_to_run, timeout_s=timeout_s
-                )
-                if not self._keep_alive:
-                    transient_container = container_id
-                if needs_sanity:
-                    await self._check_family(container_id, spec)
-                stdout, stderr, exit_code = await self._engine.exec_in(
-                    container_id,
-                    self._eval_command(spec, qna_path),
-                    input=normalize_stdin_payload(client_relevance),
-                    timeout=timeout_s,
-                )
-            else:
-                stdout, stderr, exit_code = await self._engine.run_one_shot(
-                    image_to_run,
-                    self._eval_command(spec, qna_path),
-                    input=normalize_stdin_payload(client_relevance),
-                    mounts=mounts,
-                    platform=self.platform,
-                    timeout=timeout_s,
-                )
         except (UnknownTargetError, BootstrapFailure, LocalExtractionError) as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
         except (ContainerEngineError, OSError, TimeoutError) as exc:
@@ -1226,9 +1170,6 @@ class TransportContainer:
         except Exception as exc:
             logger.exception("unexpected failure evaluating in %s", self.image)
             return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
-        finally:
-            if transient_container is not None:
-                await self._engine.stop(transient_container)
 
         parsed = parse_qna_output(stdout)
         error, error_kind = classify_qna_outcome(parsed, exit_code, stderr)
@@ -1283,6 +1224,121 @@ class TransportContainer:
             qna_time=parsed.qna_time,
             exit_code=exit_code,
         )
+
+    async def evaluate_client_relevance_batch(
+        self,
+        expressions: Sequence[str],
+        *,
+        qna: ResolvedQna | None = None,
+        timeout_s: float = 30.0,
+    ) -> list[ClientRelevanceResult] | None:
+        """Every expression on one qna's stdin, in one exec; ``None`` to go singly.
+
+        In a kept-alive container that is one renew and one exec for the
+        whole chunk instead of one each per expression. Anything wrong with
+        the run as a whole is ``None``: the single path names the missing
+        library or the too-new build in its own words.
+        """
+        from bigfix_remote_client_relevance.transports import batch
+
+        started = time.monotonic()
+        sentinel = batch.new_sentinel()
+        try:
+            stdout, _stderr, exit_code, qna_path = await self._run_qna(
+                batch.build_batch_payload(expressions, sentinel), qna, None, timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - the single path will report it
+            logger.debug("qna batch in %s failed: %s", self.image, exc)
+            return None
+        if exit_code != 0:
+            return None
+        return batch.parse_batch_output(
+            stdout,
+            expressions,
+            sentinel,
+            host=self.host,
+            transport=TRANSPORT_NAME,
+            qna_path=qna_path or DEFAULT_QNA_COMMAND,
+            qna_version=qna.version if qna else None,
+            exit_code=0,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    async def _run_qna(
+        self,
+        payload: str,
+        qna: ResolvedQna | None,
+        qna_path: str | None,
+        timeout_s: float,
+    ) -> tuple[str, str, int, str | None]:
+        """Run qna on ``payload`` in this image: ``(stdout, stderr, exit_code, qna_path)``.
+
+        Raises what pulling, provisioning and the engine raise; callers map it.
+        """
+        mounts: dict[str, str] = {}
+        image_to_run = self.image
+
+        transient_container: str | None = None
+        try:
+            self._note_emulation()
+            await self._ensure_image_once()
+            # _ensure_image_once may have just resolved self._resolved_image
+            # for the first time -- recompute now that it can reflect that,
+            # not the pre-resolution default above.
+            image_to_run = self._run_image
+
+            # Provisioning needs the real platform (deb vs rpm agent); without
+            # provisioning the spec is cosmetic, so the cheap path never probes.
+            if qna is not None:
+                spec = spec_for(await self.resolve_platform(timeout_s=timeout_s))
+            else:
+                spec = spec_for(self._target or "ubuntu")
+
+            if qna is not None:
+                if self._prepared is not None and self._prepared[0] == qna.version:
+                    image_to_run, mounts = self._prepared[1]
+                    mounts = dict(mounts)
+                else:
+                    image_to_run, mounts = await self._prepare_qna_image(
+                        qna, spec, timeout_s=timeout_s
+                    )
+                qna_path = posixpath.join(QNA_MOUNT, spec.qna_relative_path)
+
+            # A probed platform came from the image itself; only a
+            # human-supplied one can contradict what the image carries, so
+            # only that case pays for the sanity check.
+            needs_sanity = (
+                qna is not None and self._target is not None and spec.name in _SPEC_FAMILIES
+            )
+            needs_container = self._keep_alive or needs_sanity
+
+            if needs_container:
+                container_id = await self._acquire_container(
+                    mounts, image=image_to_run, timeout_s=timeout_s
+                )
+                if not self._keep_alive:
+                    transient_container = container_id
+                if needs_sanity:
+                    await self._check_family(container_id, spec)
+                stdout, stderr, exit_code = await self._engine.exec_in(
+                    container_id,
+                    self._eval_command(spec, qna_path),
+                    input=payload,
+                    timeout=timeout_s,
+                )
+            else:
+                stdout, stderr, exit_code = await self._engine.run_one_shot(
+                    image_to_run,
+                    self._eval_command(spec, qna_path),
+                    input=payload,
+                    mounts=mounts,
+                    platform=self.platform,
+                    timeout=timeout_s,
+                )
+            return stdout, stderr, exit_code, qna_path
+        finally:
+            if transient_container is not None:
+                await self._engine.stop(transient_container)
 
     async def _check_family(self, container_id: str, spec: TargetSpec) -> None:
         family = _SPEC_FAMILIES[spec.name]

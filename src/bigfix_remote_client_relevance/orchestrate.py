@@ -44,7 +44,8 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
-from bigfix_remote_client_relevance.transports import FanOutTransport, Transport
+from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport, Transport
+from bigfix_remote_client_relevance.transports.batch import chunk_expressions
 
 if TYPE_CHECKING:
     from bigfix_remote_session_relevance import ConnectionConfig
@@ -74,6 +75,16 @@ DEFAULT_MAX_PARALLEL = 8
 # simultaneous multi-hundred-MB pulls will saturate a laptop's link while eight
 # evaluations barely register. So they get separate budgets.
 DEFAULT_PULL_PARALLEL = 2
+
+DEFAULT_BATCH_SIZE = 100
+"""Most expressions one qna process answers in a batch. 368 took 70 ms on
+one stdin (issue #9), so this bounds how much a failed batch has to redo
+one at a time, not how fast a good one is."""
+
+FANOUT_PARALLEL_EXPRESSIONS = 5
+"""Most expressions a fan-out (Fast Query) target has in flight at once. Each
+is its own query to a BigFix server shared by everyone, so a batch is run a
+few at a time, not all at once."""
 
 
 @dataclass
@@ -481,6 +492,8 @@ async def _evaluate_stream_indexed(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
+    batch: bool = True,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> AsyncIterator[tuple[tuple[int, int], ClientRelevanceResult]]:
     """Shared core: yield ``((work_index, sub), result)`` as each result lands.
 
@@ -752,10 +765,18 @@ async def _evaluate_stream_indexed(
             if isinstance(transport, FanOutTransport):
                 # One cell, many endpoints. Nothing to fall back through:
                 # fan-out transports evaluate with whatever each endpoint has.
-                for index, expression in enumerate(expressions):
-                    cell = await _evaluate_fanout(transport, target, expression)
+                # Batching them is running a few at once; waiting for a lane
+                # happens before the transport starts its clock, so a queued
+                # expression does not spend its timeout in the queue.
+                lanes = asyncio.Semaphore(FANOUT_PARALLEL_EXPRESSIONS if batch else 1)
+
+                async def _cell(index: int, expression: str) -> None:
+                    async with lanes:
+                        cell = await _evaluate_fanout(transport, target, expression)
                     for sub, result in enumerate(cell):
                         emit(index, result, sub)
+
+                await asyncio.gather(*(_cell(i, e) for i, e in enumerate(expressions)))
                 return
 
             # A build already known to be too new here is skipped outright, so
@@ -802,8 +823,27 @@ async def _evaluate_stream_indexed(
                 return result
 
             emit(0, _tagged(first))
-            for index, expression in enumerate(expressions[1:], start=1):
-                emit(index, _tagged(await _evaluate(expression, resolved)))
+            # The first expression ran alone: it is what found out whether
+            # the build starts here at all. The rest share qna processes, a
+            # chunk at a time, when the transport can.
+            can_batch = batch and isinstance(transport, BatchTransport)
+            index = 1
+            for chunk in chunk_expressions(
+                expressions[1:], max_count=max(batch_size, 1) if can_batch else 1
+            ):
+                batched = (
+                    await _evaluate_batch(transport, target, chunk, resolved)  # type: ignore[arg-type]
+                    if len(chunk) > 1
+                    else None
+                )
+                if batched is not None:
+                    for result in batched:
+                        emit(index, _tagged(result))
+                        index += 1
+                    continue
+                for expression in chunk:
+                    emit(index, _tagged(await _evaluate(expression, resolved)))
+                    index += 1
         finally:
             # Nothing else in the process holds this transport, so an
             # unreleased one leaks whatever it opened -- an SSH connection,
@@ -885,6 +925,64 @@ async def _evaluate_stream_indexed(
                 result.elapsed_ms = elapsed_ms
         return results
 
+    def _stamp(
+        result: ClientRelevanceResult,
+        target: Target,
+        resolved: ResolvedQna | None,
+        started: float,
+    ) -> ClientRelevanceResult:
+        """What every qna result gets from the run that produced it."""
+        # Whatever platform/arch this run actually used -- explicit, freshly
+        # probed, or (platform only, in _evaluate_one) corrected -- so the CLI
+        # can write them back.
+        result.platform = target.platform
+        # Local/ssh/container always have a concrete target.arch by this point
+        # (an explicit value, or a fresh probe above); online_evaluator and
+        # fastquery have neither, so overwriting with an unset target.arch
+        # would clobber a transport-reported label for no reason -- e.g.
+        # online_evaluator's own fixed, decorative "x86_64" (see
+        # TransportOnlineEvaluator). Trust the transport's own arch whenever
+        # the target never had one to begin with.
+        if target.arch is not None:
+            result.arch = target.arch
+        # Transports that are version-agnostic still report which one ran.
+        if resolved is not None and result.qna_version is None:
+            result.qna_version = resolved.version
+        if not result.elapsed_ms:
+            result.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return result
+
+    async def _evaluate_batch(
+        transport: BatchTransport,
+        target: Target,
+        chunk: list[str],
+        resolved: ResolvedQna | None,
+    ) -> list[ClientRelevanceResult] | None:
+        """A chunk through one qna process; ``None`` to evaluate it one at a time.
+
+        One semaphore slot for the whole chunk: it is one process. Anything
+        short of exactly one result per expression is not trusted -- the
+        serial path reports every failure in its own words anyway.
+        """
+        started = time.monotonic()
+        async with semaphore:
+            try:
+                results = await transport.evaluate_client_relevance_batch(
+                    chunk, qna=resolved, timeout_s=timeout_s
+                )
+            except Exception as exc:  # noqa: BLE001 - the serial path will report it
+                logger.debug("batch failed for %s: %s", target.label, exc)
+                results = None
+        if results is None or len(results) != len(chunk):
+            # DEBUG: a target that cannot batch will say so on every run.
+            logger.debug(
+                "%s: a batch of %d did not run cleanly; evaluating one at a time",
+                target.label,
+                len(chunk),
+            )
+            return None
+        return [_stamp(result, target, resolved, started) for result in results]
+
     async def _evaluate_one(
         transport: Transport,
         target: Target,
@@ -912,19 +1010,7 @@ async def _evaluate_stream_indexed(
                     target, ERROR_KIND_TRANSPORT, f"{target.label}: {exc}", client_relevance
                 )
 
-        # Whatever platform/arch this run actually used -- explicit, freshly
-        # probed, or (platform only, below) corrected -- so the CLI can write
-        # them back.
-        result.platform = target.platform
-        # Local/ssh/container always have a concrete target.arch by this point
-        # (an explicit value, or a fresh probe above); online_evaluator and
-        # fastquery have neither, so overwriting with an unset target.arch
-        # would clobber a transport-reported label for no reason -- e.g.
-        # online_evaluator's own fixed, decorative "x86_64" (see
-        # TransportOnlineEvaluator). Trust the transport's own arch whenever
-        # the target never had one to begin with.
-        if target.arch is not None:
-            result.arch = target.arch
+        _stamp(result, target, resolved, started)
 
         if spec is not None and configured_platform is not None:
             # An explicit platform was trusted outright above and never
@@ -949,12 +1035,6 @@ async def _evaluate_stream_indexed(
                             actual,
                         )
                         result.platform = actual
-
-        # Transports that are version-agnostic still report which one ran.
-        if resolved is not None and result.qna_version is None:
-            result.qna_version = resolved.version
-        if not result.elapsed_ms:
-            result.elapsed_ms = int((time.monotonic() - started) * 1000)
         return result
 
     logger.info(
@@ -1092,6 +1172,8 @@ async def evaluate_many_stream(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
+    batch: bool = True,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate every expression on every target, for every version.
 
@@ -1109,6 +1191,8 @@ async def evaluate_many_stream(
         resolver=resolver,
         previous_version=previous_version,
         compat_memory=compat_memory,
+        batch=batch,
+        batch_size=batch_size,
     ):
         yield result
 
@@ -1125,6 +1209,8 @@ async def evaluate_many(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
+    batch: bool = True,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[ClientRelevanceResult]:
     """Evaluate several expressions across several targets in one pass.
 
@@ -1140,6 +1226,19 @@ async def evaluate_many(
     is one connection instead of N, since :class:`TransportSSH` multiplexes
     evaluations over the connection it already has. Container targets carrying
     more than one expression are kept alive for the batch automatically.
+
+    ``batch`` (on by default) also shares the qna *process*: after the first
+    expression, which runs alone because it is what detects a build too new
+    for the target, the rest go through one qna stdin per ``batch_size``
+    chunk, on transports that support it (local, ssh, container). A chunk
+    that does not run cleanly -- a timeout within ``timeout_s`` for the whole
+    chunk, a crash, output that does not line up -- is evaluated again one
+    expression at a time, so batching changes how fast results arrive, never
+    what they say. Batched results carry ``qna_batch_size``, and their
+    ``elapsed_ms`` is the whole qna run's. A fan-out target (Fast Query)
+    instead runs up to :data:`FANOUT_PARALLEL_EXPRESSIONS` expressions at
+    once, each still its own query. ``batch=False`` evaluates everything one
+    expression at a time, as before.
 
     Every failure mode is reported inside a result rather than raised, and a
     group that dies before evaluating anything still answers once per
@@ -1159,6 +1258,8 @@ async def evaluate_many(
         resolver=resolver,
         previous_version=previous_version,
         compat_memory=compat_memory,
+        batch=batch,
+        batch_size=batch_size,
     ):
         by_index[index] = result
     return [by_index[i] for i in sorted(by_index)]

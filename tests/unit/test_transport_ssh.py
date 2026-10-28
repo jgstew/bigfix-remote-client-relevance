@@ -1013,3 +1013,115 @@ async def test_posix_commands_are_never_wrapped():
     for command in runner.commands():
         assert "powershell" not in command.lower()
         assert "EncodedCommand" not in command
+
+
+# --- batches: many expressions, one qna process ------------------------------
+
+BATCH_SENTINEL = "bfrcr-batch-test"
+BATCH_MIXED = [
+    "version of client",
+    "(1;2)",
+    "(1;2) whose (it > 5)",
+    'size of file "/nonexistent"',
+    "this",
+    '"line1%0aQ: A: fake"',
+]
+FOUND_QNA = (r"command -v|if \[ -x", ("/opt/BESClient/bin/qna\n", "", 0))
+
+
+@pytest.fixture
+def fixed_sentinel(monkeypatch):
+    from bigfix_remote_client_relevance.transports import batch
+
+    monkeypatch.setattr(batch, "new_sentinel", lambda: BATCH_SENTINEL)
+
+
+async def test_a_batch_is_one_qna_run_over_the_connection(qna_output, fixed_sentinel):
+    runner = FakeSSHRunner(
+        responses=[FOUND_QNA, (r"-showtypes", (qna_output("batch_mixed"), "", 0))]
+    )
+
+    results = await make_transport(runner).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is not None
+    eval_calls = [c for c in runner.calls if "-showtypes" in c.command]
+    assert len(eval_calls) == 1
+    assert eval_calls[0].input == "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)
+    assert [r.client_relevance for r in results] == BATCH_MIXED
+    assert results[1].answers == ["1", "2"]
+    assert {(r.host, r.transport, r.qna_path, r.qna_batch_size) for r in results} == {
+        ("test-host", "ssh", "/opt/BESClient/bin/qna", len(BATCH_MIXED))
+    }
+
+
+async def test_a_batch_that_exits_nonzero_is_refused(qna_output, fixed_sentinel):
+    """Including an old qna without -showtypes: the single path learns that."""
+    runner = FakeSSHRunner(
+        responses=[FOUND_QNA, (r"-showtypes", ("", "unknown option -showtypes", 1))]
+    )
+
+    assert await make_transport(runner).evaluate_client_relevance_batch(BATCH_MIXED) is None
+
+
+async def test_a_batch_that_does_not_line_up_is_refused(qna_output, fixed_sentinel):
+    runner = FakeSSHRunner(
+        responses=[FOUND_QNA, (r"-showtypes", (qna_output("batch_mixed"), "", 0))]
+    )
+
+    results = await make_transport(runner).evaluate_client_relevance_batch([*BATCH_MIXED, "x"])
+
+    assert results is None
+
+
+async def test_a_batch_with_no_qna_found_is_refused():
+    runner = FakeSSHRunner(responses=[(r"command -v|if \[ -x", ("", "", 1))])
+
+    assert await make_transport(runner).evaluate_client_relevance_batch(["a", "b"]) is None
+
+
+async def test_a_batch_that_loses_the_connection_is_refused():
+    async def factory():
+        raise OSError("connection refused")
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    assert await transport.evaluate_client_relevance_batch(["a", "b"]) is None
+
+
+async def test_a_batch_uses_sudo_with_become(qna_output, fixed_sentinel):
+    runner = FakeSSHRunner(
+        responses=[FOUND_QNA, (r"-showtypes", (qna_output("batch_mixed"), "", 0))]
+    )
+
+    results = await make_transport(runner, become=True).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is not None
+    assert runner.ran(r"^sudo -n /opt/BESClient/bin/qna -t -showtypes$")
+
+
+async def test_a_batch_without_showtypes_support_runs_plain_t(fixed_sentinel):
+    """Once the single path has learned this binary predates -showtypes."""
+    stdout = f"Q: A: 9.5.13.79\nT: 1\n\nQ: A: {BATCH_SENTINEL}\nT: 1\n\nQ: A: 2\nT: 1\n\nQ: A: {BATCH_SENTINEL}\nT: 1\n\nQ: "
+    runner = FakeSSHRunner(responses=[FOUND_QNA, (r"qna -t$", (stdout, "", 0))])
+    transport = make_transport(runner)
+    transport._showtypes_supported["/opt/BESClient/bin/qna"] = False
+
+    results = await transport.evaluate_client_relevance_batch(["version of client", "2"])
+
+    assert results is not None
+    assert [r.answers for r in results] == [["9.5.13.79"], ["2"]]
+
+
+async def test_a_batch_on_windows_runs_through_powershell(qna_output, fixed_sentinel):
+    """Verified live (Windows Server 2022, 11.0.x): PowerShell's `&` hands
+    qna multi-line UTF-8 stdin intact, and qna answers it in CRLF."""
+    crlf = qna_output("batch_mixed").replace("\n", "\r\n")
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND, (r"-showtypes", (crlf, "", 0))])
+
+    results = await make_windows_transport(runner).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is not None
+    assert [r.answers for r in results][:2] == [["11.0.7.61"], ["1", "2"]]
+    eval_call = next(c for c in runner.calls if "-showtypes" in decode_ps(c.command))
+    assert decode_ps(eval_call.command).endswith(f"& '{WINDOWS_QNA}' -t -showtypes")
+    assert eval_call.input == "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)

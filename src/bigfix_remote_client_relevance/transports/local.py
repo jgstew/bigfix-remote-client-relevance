@@ -221,33 +221,9 @@ class TransportLocal:
             base.update(overrides)
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
-        root_problem = self._macos_root_problem()
-        if root_problem is not None:
-            return _result(error=root_problem, error_kind=ERROR_KIND_BOOTSTRAP)
-
-        if self._sudo_broken is not None:
-            return _result(error=self._sudo_broken, error_kind=ERROR_KIND_BOOTSTRAP)
-
-        if qna is not None:
-            try:
-                qna_path = await provision_qna(
-                    LocalRunner(),
-                    spec_for(self._local_target()),
-                    qna,
-                    host_label=self._host,
-                    state_dir=self._state_dir,
-                    recheck_prereqs=self._recheck_prereqs,
-                    timeout_s=max(timeout_s, 300.0),
-                )
-            except BootstrapFailure as exc:
-                return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP)
-
-        resolved_path = qna_path or self._qna_path or find_qna_path(self._candidates)
+        resolved_path, problem = await self._qna_to_run(qna_path, qna, timeout_s)
         if resolved_path is None:
-            return _result(
-                error="no qna binary found; pass qna_path or install the BES client",
-                error_kind=ERROR_KIND_BOOTSTRAP,
-            )
+            return _result(error=problem, error_kind=ERROR_KIND_BOOTSTRAP)
 
         argv = self._eval_argv(resolved_path)
         logger.debug("running %s", " ".join(argv))
@@ -317,6 +293,93 @@ class TransportLocal:
             qna_time=parsed.qna_time,
             exit_code=exit_code,
         )
+
+    async def evaluate_client_relevance_batch(
+        self,
+        expressions: Sequence[str],
+        *,
+        qna: ResolvedQna | None = None,
+        timeout_s: float = 30.0,
+    ) -> list[ClientRelevanceResult] | None:
+        """Every expression on one qna's stdin; ``None`` to evaluate them singly.
+
+        Anything wrong with the run as a whole -- no qna, a start failure, a
+        nonzero exit, the timeout -- is ``None`` rather than a result: the
+        single path reports each of those in its own words (a sudo problem,
+        a too-new build) and remembers what it learns.
+        """
+        # Imported here: batch builds on this module's helpers.
+        from bigfix_remote_client_relevance.transports import batch
+
+        started = time.monotonic()
+        resolved_path, _problem = await self._qna_to_run(None, qna, timeout_s)
+        if resolved_path is None:
+            return None
+
+        sentinel = batch.new_sentinel()
+        payload = batch.build_batch_payload(expressions, sentinel).encode("utf-8")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *self._eval_argv(resolved_path),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            logger.debug("could not start a qna batch at %s: %s", resolved_path, exc)
+            return None
+        try:
+            stdout_bytes, _stderr = await asyncio.wait_for(
+                process.communicate(payload), timeout=timeout_s
+            )
+        except TimeoutError:
+            await _terminate(process)
+            logger.debug("a qna batch of %d timed out after %.1fs", len(expressions), timeout_s)
+            return None
+        if process.returncode:
+            return None
+
+        return batch.parse_batch_output(
+            stdout_bytes.decode("utf-8", errors="replace"),
+            expressions,
+            sentinel,
+            host=self._host,
+            transport=TRANSPORT_NAME,
+            qna_path=resolved_path,
+            qna_version=qna.version if qna else None,
+            exit_code=0,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    async def _qna_to_run(
+        self, qna_path: str | None, qna: ResolvedQna | None, timeout_s: float
+    ) -> tuple[str, None] | tuple[None, str]:
+        """The qna binary to run, or why there is none (always a bootstrap problem)."""
+        root_problem = self._macos_root_problem()
+        if root_problem is not None:
+            return None, root_problem
+
+        if self._sudo_broken is not None:
+            return None, self._sudo_broken
+
+        if qna is not None:
+            try:
+                qna_path = await provision_qna(
+                    LocalRunner(),
+                    spec_for(self._local_target()),
+                    qna,
+                    host_label=self._host,
+                    state_dir=self._state_dir,
+                    recheck_prereqs=self._recheck_prereqs,
+                    timeout_s=max(timeout_s, 300.0),
+                )
+            except BootstrapFailure as exc:
+                return None, str(exc)
+
+        resolved_path = qna_path or self._qna_path or find_qna_path(self._candidates)
+        if resolved_path is None:
+            return None, "no qna binary found; pass qna_path or install the BES client"
+        return resolved_path, None
 
     def _eval_argv(self, qna_path: str) -> list[str]:
         """Build the qna command line, elevating it when ``become`` is set.

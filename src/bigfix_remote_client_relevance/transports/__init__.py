@@ -17,7 +17,7 @@ Contract shared by all implementations:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol, runtime_checkable
 
 from bigfix_remote_client_relevance.results import ClientRelevanceResult, ResolvedQna
@@ -69,6 +69,33 @@ class FanOutTransport(Protocol):
         ...
 
 
+@runtime_checkable
+class BatchTransport(Protocol):
+    """Optional: many expressions through one qna process.
+
+    Each expression run on its own pays for a qna start and, for a
+    container, an exec; on one qna's stdin they cost almost nothing (see
+    :mod:`.batch`). Returning ``None`` -- never raising -- hands the chunk
+    back to the orchestrator to evaluate one expression at a time, which is
+    the right answer to anything wrong with the run as a whole (a timeout, a
+    nonzero exit, a build too new to start, output that does not line up):
+    the single path already reports each of those in its own words.
+    """
+
+    async def evaluate_client_relevance_batch(
+        self,
+        expressions: Sequence[str],
+        *,
+        qna: ResolvedQna | None = None,
+        timeout_s: float = 30.0,
+    ) -> list[ClientRelevanceResult] | None:
+        """One result per expression, in order; or ``None`` to fall back.
+
+        ``timeout_s`` bounds the whole run, not each expression.
+        """
+        ...
+
+
 ARCH_PROBE_RELEVANCE = "architecture of the operating system"
 """Client relevance used by :func:`probe_arch_via_relevance`."""
 
@@ -98,4 +125,10 @@ async def probe_arch_via_relevance(
     return result.answers[0]
 
 
-__all__ = ["ARCH_PROBE_RELEVANCE", "FanOutTransport", "Transport", "probe_arch_via_relevance"]
+__all__ = [
+    "ARCH_PROBE_RELEVANCE",
+    "BatchTransport",
+    "FanOutTransport",
+    "Transport",
+    "probe_arch_via_relevance",
+]

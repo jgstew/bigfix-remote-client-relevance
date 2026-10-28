@@ -143,6 +143,13 @@ class ClientRelevanceResult:
     same client relevance can answer differently in the two contexts.
     Always ``None`` for every other transport."""
 
+    qna_batch_size: int | None = None
+    """How many expressions shared the one qna process that answered this
+    one, when :func:`~..orchestrate.evaluate_many` batched them; ``None``
+    when it ran alone. A batched result's ``elapsed_ms`` is that whole run's
+    wall time, so this is what makes it readable; ``qna_time`` stays the
+    expression's own."""
+
     @property
     def ok(self) -> bool:
         return self.error_kind is None
