@@ -198,6 +198,45 @@ async def test_multiline_relevance_is_one_expression_to_a_real_qna(tmp_path):
     os.environ.get("BFRCR_NETWORK_TESTS") != "1",
     reason="needs a real qna artifact and package downloads; set BFRCR_NETWORK_TESTS=1",
 )
+@pytest.mark.parametrize(
+    ("image", "platform"),
+    [
+        # Sets no LANG at all: answered "Transcoding Failure of result" before #79.
+        ("ubuntu:22.04", "ubuntu"),
+        # Got its UTF-8 LANG from the login profile, which #79 stopped reading.
+        ("rockylinux:9", "rhel"),
+    ],
+)
+async def test_a_non_ascii_answer_comes_back_intact(tmp_path, image, platform):
+    """Issue #79: qna needs a UTF-8 locale to hand back a non-ASCII string."""
+    from functools import partial
+
+    from bigfix_remote_client_relevance.bootstrap.cache import ensure_artifact
+    from bigfix_remote_client_relevance.bootstrap.extract_local import ensure_extracted
+    from bigfix_remote_client_relevance.bootstrap.release_site import (
+        artifact_for,
+        resolve_version_spec,
+    )
+
+    version = resolve_version_spec("11.0")
+    ref = artifact_for(version, platform=platform, arch="x86_64")
+    resolved = await ensure_artifact(version, ref, cache_dir=tmp_path / "cache")
+
+    result = await TransportContainer(
+        image,
+        engine=DockerEngine(),
+        target=platform,
+        extractor=partial(ensure_extracted, cache_dir=tmp_path / "cache"),
+    ).evaluate_client_relevance('"café"', qna=resolved, timeout_s=600.0)
+
+    assert result.error is None, result.error
+    assert result.answers == ["café"]
+
+
+@pytest.mark.skipif(
+    os.environ.get("BFRCR_NETWORK_TESTS") != "1",
+    reason="needs a real qna artifact and package downloads; set BFRCR_NETWORK_TESTS=1",
+)
 async def test_a_minimal_rpm_image_gets_its_missing_library_installed(tmp_path):
     """rockylinux:9 ships no libdbus-1.so.3, so qna cannot start without help.
 
