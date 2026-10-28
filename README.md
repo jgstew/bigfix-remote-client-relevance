@@ -380,6 +380,35 @@ roughly neutral, since `docker run` on an already-prepared image is cheap; it is
 kept for the batch because starting one per expression would undo the batching,
 not because the reuse itself is where the time goes.
 
+**One qna process per chunk.** On top of that, after the first expression
+(which runs alone, because it is what detects a qna build too new for the
+target) the rest share a qna *process*. They go one per line on its stdin,
+up to `batch_size` (default 100) at a time, on local, SSH and container
+targets. Measured with `batch=False` against the default, same answers
+both ways:
+
+| target | expressions | one qna each | batched |
+| --- | ---: | ---: | ---: |
+| container `ubuntu:26.04`, arm64 native | 50 | 7.2s | 1.5s |
+| Windows Server 2022 over SSH | 40 | 27.7s | 4.9s |
+| macOS over SSH (`become`) | 40 | 11.6s | 5.1s |
+
+If anything goes wrong with a chunk as a whole, it is evaluated again one
+expression at a time, and so is the rest of that target's work. Each failure
+is reported as a single run reports it. That covers a timeout (`timeout_s` bounds the whole chunk), a crash,
+and output that doesn't line up. So batching changes how fast results
+arrive, not what they say. Batched results carry `qna_batch_size`, and
+their `elapsed_ms` is the whole qna run's (`qna_time` is still their own).
+
+A Fast Query target batches by running up to five expressions at once,
+each still its own query. BigFix SaaS, which takes one query per computer,
+runs them one at a time. Online evaluator targets also run one at a time.
+`batch=False` turns all of this off:
+
+```python
+results = await evaluate_many(expressions, targets, batch=False)
+```
+
 `evaluate_many_stream` is the completion-order form, the same way
 `evaluate_client_relevance_stream` is for the single-expression call.
 
@@ -481,9 +510,9 @@ bigfix-remote-client-relevance --schema
 ```
 
 prints the JSON Schema for a single result and exits 0 — no target needed.
-The schema is versioned (`x-schema-version`, currently `1.3`) and only ever
-grows within a major version; 1.2 added `qna_fallback_from` and 1.3
-`use_client_context`. Then
+The schema is versioned (`x-schema-version`, currently `1.4`) and only ever
+grows within a major version; 1.2 added `qna_fallback_from`, 1.3
+`use_client_context` and 1.4 `qna_batch_size`. Then
 `--jsonl` emits exactly one of those objects per line, flushed as each target
 answers, so a Node or Go server can stream progress off the pipe. `--json`
 emits the whole array once. stdout carries only the payload; logs and error

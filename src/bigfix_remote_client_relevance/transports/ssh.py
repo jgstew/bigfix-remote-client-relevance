@@ -300,41 +300,15 @@ class TransportSSH:
             return ClientRelevanceResult(**base)  # type: ignore[arg-type]
 
         try:
-            runner = await self._connection()
-            spec = await self._resolve_spec(runner, timeout_s)
-
-            if spec.family == "windows":
-                # The probe above is POSIX on purpose; everything after it is
-                # PowerShell, so it goes through powershell.exe explicitly.
-                runner = _PowerShellRunner(runner)
-                if self._become:
-                    logger.warning(
-                        "--become has no effect on %s: elevation over SSH is a "
-                        "Windows-side configuration, not a sudo call",
-                        self.host,
-                    )
-
-            if qna is not None:
-                qna_path = await provision_qna(
-                    runner,
-                    spec,
-                    qna,
-                    host_label=self.host,
-                    state_dir=self._state_dir,
-                    recheck_prereqs=self._recheck_prereqs,
-                    timeout_s=timeout_s,
-                )
-
+            runner, spec, qna_path = await self._qna_to_run(qna_path, qna, timeout_s)
             if qna_path is None:
-                qna_path = await self._discover_qna(runner, spec, timeout_s)
-                if qna_path is None:
-                    return _result(
-                        error=(
-                            f"no qna binary found on {self.host}; "
-                            "pass qna_path or a qna version to provision one"
-                        ),
-                        error_kind=ERROR_KIND_BOOTSTRAP,
-                    )
+                return _result(
+                    error=(
+                        f"no qna binary found on {self.host}; "
+                        "pass qna_path or a qna version to provision one"
+                    ),
+                    error_kind=ERROR_KIND_BOOTSTRAP,
+                )
 
             stdout, stderr, exit_code, used_types = await self._run_qna(
                 runner, spec, qna_path, client_relevance, timeout_s
@@ -381,6 +355,89 @@ class TransportSSH:
             qna_time=parsed.qna_time,
             exit_code=exit_code,
         )
+
+    async def evaluate_client_relevance_batch(
+        self,
+        expressions: Sequence[str],
+        *,
+        qna: ResolvedQna | None = None,
+        timeout_s: float = 30.0,
+    ) -> list[ClientRelevanceResult] | None:
+        """Every expression on one qna's stdin over the connection; ``None`` to go singly.
+
+        Anything wrong with the run as a whole is ``None``: the single path
+        reports it in its own words and learns from it (an old qna without
+        ``-showtypes``, a sudo problem, macOS needing root).
+        """
+        from bigfix_remote_client_relevance.transports import batch
+
+        started = time.monotonic()
+        # Windows included: PowerShell's `&` hands a native qna multi-line
+        # UTF-8 stdin intact (verified live, Windows Server 2022), and the
+        # CRLF it answers in splits like LF.
+        try:
+            runner, spec, qna_path = await self._qna_to_run(None, qna, timeout_s)
+            if qna_path is None:
+                return None
+            sentinel = batch.new_sentinel()
+            with_types = self._showtypes_supported.get(qna_path, True)
+            stdout, _stderr, code = await runner.run(
+                self._eval_command(spec, qna_path, with_types=with_types),
+                input=batch.build_batch_payload(expressions, sentinel),
+                timeout=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - the single path will report it
+            logger.debug("qna batch on %s failed: %s", self.host, exc)
+            return None
+        if code != 0:
+            return None
+        return batch.parse_batch_output(
+            stdout,
+            expressions,
+            sentinel,
+            host=self.host,
+            transport=TRANSPORT_NAME,
+            qna_path=qna_path,
+            qna_version=qna.version if qna else None,
+            exit_code=0,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    async def _qna_to_run(
+        self, qna_path: str | None, qna: ResolvedQna | None, timeout_s: float
+    ) -> tuple[SSHRunner, TargetSpec, str | None]:
+        """The runner, target and qna binary to evaluate with; ``None`` when none is found.
+
+        Raises what connecting and provisioning raise; callers map it.
+        """
+        runner = await self._connection()
+        spec = await self._resolve_spec(runner, timeout_s)
+
+        if spec.family == "windows":
+            # The probe above is POSIX on purpose; everything after it is
+            # PowerShell, so it goes through powershell.exe explicitly.
+            runner = _PowerShellRunner(runner)
+            if self._become:
+                logger.warning(
+                    "--become has no effect on %s: elevation over SSH is a "
+                    "Windows-side configuration, not a sudo call",
+                    self.host,
+                )
+
+        if qna is not None:
+            qna_path = await provision_qna(
+                runner,
+                spec,
+                qna,
+                host_label=self.host,
+                state_dir=self._state_dir,
+                recheck_prereqs=self._recheck_prereqs,
+                timeout_s=timeout_s,
+            )
+
+        if qna_path is None:
+            qna_path = await self._discover_qna(runner, spec, timeout_s)
+        return runner, spec, qna_path
 
     # -- platform -----------------------------------------------------------
 

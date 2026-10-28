@@ -1,0 +1,43 @@
+A: macOS
+T: 3850
+I: string
+
+A: bfrcr-batch-test
+T: 25
+I: string
+
+A: 1
+A: 2
+T: 905
+I: integer
+
+A: bfrcr-batch-test
+T: 27
+I: string
+
+E: The operator "this" is not defined.
+
+A: bfrcr-batch-test
+T: 26
+I: string
+
+E: This expression could not be parsed.
+
+A: bfrcr-batch-test
+T: 26
+I: string
+
+A: café
+T: 1849
+I: string
+
+A: bfrcr-batch-test
+T: 26
+I: string
+
+T: 22
+I: integer
+
+A: bfrcr-batch-test
+T: 26
+I: string

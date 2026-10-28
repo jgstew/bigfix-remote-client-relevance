@@ -1,15 +1,19 @@
 """Measure what batching client-relevance evaluations actually saves.
 
 The premise of ``evaluate_many`` is that sharing the setup is cheaper than
-repaying it per expression. This measures it rather than asserting it, three
+repaying it per expression. This measures it rather than asserting it, four
 ways against one image:
 
 1. **cold**       -- ``evaluate_client_relevance`` once per expression, a
                      fresh transport each time. What callers do today.
-2. **batched**    -- ``evaluate_many``, one-shot containers. Shares the image
-                     work and the resolution, not the container.
-3. **kept**       -- ``evaluate_many`` against a kept-alive target: one
-                     container for the whole batch, N execs.
+2. **batched**    -- ``evaluate_many(batch=False)``, one-shot containers.
+                     Shares the image work and the resolution, not the
+                     container.
+3. **kept**       -- ``evaluate_many(batch=False)`` against a kept-alive
+                     target: one container for the whole batch, N execs.
+4. **qna**        -- ``evaluate_many`` as callers get it by default: one
+                     container, and one qna process for every expression
+                     after the first.
 
 Run it against a real engine::
 
@@ -84,10 +88,19 @@ async def measure(image: str, arch: str, version: str | None, count: int) -> dic
 
     async def batched() -> list[object]:
         return list(
-            await evaluate_many(expressions, [target(image, arch, keep_alive=False)], **kwargs)
+            await evaluate_many(
+                expressions, [target(image, arch, keep_alive=False)], batch=False, **kwargs
+            )
         )
 
     async def kept() -> list[object]:
+        return list(
+            await evaluate_many(
+                expressions, [target(image, arch, keep_alive=True)], batch=False, **kwargs
+            )
+        )
+
+    async def qna() -> list[object]:
         return list(
             await evaluate_many(expressions, [target(image, arch, keep_alive=True)], **kwargs)
         )
@@ -97,6 +110,7 @@ async def measure(image: str, arch: str, version: str | None, count: int) -> dic
         "cold": await timed("cold", cold),
         "batched": await timed("batched", batched),
         "kept": await timed("kept", kept),
+        "qna": await timed("qna", qna),
     }
 
 
@@ -112,7 +126,7 @@ async def main() -> None:
     counts = [int(part) for part in args.counts.split(",")]
     print(f"# {args.image} @ {args.arch}, qna {args.qna_version or 'whatever is installed'}")  # noqa: T201
     print(f"# medians of {args.repeat} run(s), milliseconds\n")  # noqa: T201
-    header = f"{'N':>3}  {'cold':>9}  {'batched':>9}  {'kept':>9}   saving"
+    header = f"{'N':>3}  {'cold':>9}  {'batched':>9}  {'kept':>9}  {'qna':>9}   saving"
     print(header)  # noqa: T201
     print("-" * len(header))  # noqa: T201
 
@@ -122,11 +136,11 @@ async def main() -> None:
             for _ in range(args.repeat)
         ]
         median = {key: statistics.median(run[key] for run in runs) for key in runs[0]}
-        speedup = median["cold"] / median["kept"] if median["kept"] else 0
+        speedup = median["cold"] / median["qna"] if median["qna"] else 0
         print(  # noqa: T201
             f"{count:>3}  {median['cold']:>9.0f}  {median['batched']:>9.0f}  "
-            f"{median['kept']:>9.0f}   "
-            f"{median['cold'] - median['kept']:>7.0f}ms ({speedup:.1f}x)"
+            f"{median['kept']:>9.0f}  {median['qna']:>9.0f}   "
+            f"{median['cold'] - median['qna']:>7.0f}ms ({speedup:.1f}x)"
         )
 
 

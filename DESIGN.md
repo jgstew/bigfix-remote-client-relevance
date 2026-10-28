@@ -389,8 +389,11 @@ class ClientRelevanceResult:
     raw_qna_output: str  # full qna stdout, for debugging / agents
     qna_path: str  # binary used on the remote / in container
     qna_version: str | None  # parsed from `qna -version` when available
-    elapsed_ms: int  # measured caller-side
+    elapsed_ms: int  # measured caller-side; a batched result's is the
+    # whole qna run's
     exit_code: int
+    qna_batch_size: int | None  # expressions sharing this one's qna
+    # process; None when it ran alone
 ```
 
 ```python
@@ -514,7 +517,8 @@ Five concrete transports, all class-named `Transport<Kind>`:
     tests and for a future one-target backend.
   - Each computer gets its own submit and its own polling (same backoff),
     all against the one `timeout_s` deadline, so five silent computers take
-    one timeout, not five. At most `MAX_CONCURRENT_CALLS` (4) server calls
+    one timeout, not five. At most `MAX_CONCURRENT_CALLS` (4) server calls (per
+transport, so across the expressions `evaluate_many` runs side by side too)
     are in flight, submits and results calls alike; the semaphore is never
     held across a poll's sleep. A submit still waiting for its turn when
     the deadline passes is not sent ("not submitted: the N s timeout ran
@@ -852,6 +856,80 @@ targets carrying more than one expression are kept alive for the batch, since
 otherwise the second expression starts a second container and the batching
 saves nothing; the container is stopped when the batch is. `evaluate_client_relevance` is the same machinery with a
 one-element expression list, so the two can never drift.
+
+**qna stdin batching (issue #9).** Sharing the transport still left one qna
+process per expression — for a container, a stdin-staging exec plus an
+eval exec each, about 190 ms per expression on a native container, while
+368 expressions on one qna stdin took 70 ms in total. So with `batch=True`
+(the default) a group's expressions after the first go through one qna
+process per `batch_size` chunk (default 100, and at most
+`MAX_BATCH_BYTES` = 64 KiB of stdin, because the container transport stages
+stdin as one `printf` argument and Linux caps one argument at 128 KiB). The
+optional `BatchTransport` protocol (`transports/__init__.py`) is the seam;
+local, ssh and container implement it, through the helpers in
+`transports/batch.py`.
+
+- *The first expression runs alone*, because it is what detects a build too
+  new for the target. The step back to an older release, compat memory and
+  `qna_fallback_from` all work as before, and the batch runs on whichever
+  version that settled on.
+- *Matching answers to questions.* qna answers stdin questions in order, one
+  block each, without echoing the question. Linux and Windows qna start
+  every block with a `Q: ` prompt and end it with a blank line. The macOS
+  agent's QnA prints no prompts, only the blank lines. A parse error has no
+  `T:` line. A blank expression line still gets a block (a parse error).
+  qna exits 0 even when some questions error. So answers can only be
+  matched by position, which one stray line would silently shift. A
+  sentinel string-literal question (`"bfrcr-batch-<nonce>"`) goes after
+  every expression, and the split is accepted only when there are exactly
+  `2n` blocks and every other block answers exactly the sentinel. Each
+  block is classified as a single run's output would be, so an `E:` line
+  stays with its own expression.
+- *Anything wrong with the run as a whole means none of it is trusted.* A
+  nonzero exit, a timeout, an engine or connection error, a misaligned
+  split, or a batch that returns the wrong number of results makes the
+  transport return `None`. The orchestrator then evaluates that chunk one
+  expression at a time, and the single path reports the failure in its
+  own words (a missing library, sudo, macOS root, an old qna without
+  `-showtypes`) and learns from it. So does the rest of that group. Whatever
+  stopped one chunk would most likely stop the next: expressions too slow
+  for one `timeout_s`, or a qna that cannot start. Without this, each
+  chunk would cost another timeout on every run, so one failed chunk per
+  group is the most batching can cost. Logged at DEBUG, since it can repeat
+  every run. So batching changes how fast results arrive, never what they
+  say.
+- *Timeout.* `timeout_s` bounds the whole chunk. A hang is noticed within
+  one timeout, and a chunk that is merely slow costs one timeout before it
+  is re-run singly. In a kept-alive container a timed-out exec's qna keeps
+  running until the container is stopped at the end of the batch, as a
+  timed-out single exec's already did.
+- *One concurrency slot* (`max_parallel`) per chunk: it is one process.
+- *Result fields.* `qna_batch_size` (schema 1.4) is the chunk size, and
+  `None` when the expression ran alone. `elapsed_ms` is the whole qna
+  run's. `qna_time` and `raw_qna_output` are the expression's own block.
+- *Measured* (`evaluate_many`, `batch=False` vs `True`, same answers both
+  ways, 2026-10-27):
+
+  | Target | Expressions | One at a time | Batched |
+  | --- | --- | --- | --- |
+  | Container `ubuntu:26.04`, arm64 native, qna 11.0.7.61 | 50 | 7.2 s | 1.5 s |
+  | Container `debian:11`, arm64, falling back to 11.0.6.137 | 50 | 23.9 s | 3.6 s |
+  | Windows Server 2022 over SSH | 40 | 27.7 s | 4.9 s |
+  | macOS over SSH with `become` | 40 | 11.6 s | 5.1 s |
+- *Fast Query* has no qna to share; its batching is concurrency. A fan-out
+  target runs up to `FANOUT_PARALLEL_EXPRESSIONS` (5) expressions at once,
+  each still its own query. That limit is waited on before the transport
+  starts an expression's clock, so a queued expression does not spend its
+  timeout in the queue. A fan-out transport can ask for fewer through an
+  optional `parallel_expressions` attribute. `TransportFastQuery` asks for
+  one when it sends one query per computer (SaaS). Its `MAX_CONCURRENT_CALLS`
+  budget is per transport, and expressions side by side would split it while
+  each one's deadline runs. A 100-computer target would then leave most
+  computers "not submitted" rather than answered. Six expressions over REST:
+  12.8 s → 5.6 s.
+  Online evaluator does not batch: the endpoint is undocumented, and it
+  should not be hammered.
+- `batch=False` restores one expression at a time for everything.
 
 **Multi-version eval on the same target:** `qna_version` fans out —
 `orchestrate.py` takes `str | Sequence[str]` and the CLI flag is

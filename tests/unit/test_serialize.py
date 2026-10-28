@@ -192,5 +192,17 @@ def test_use_client_context_schema_is_a_nullable_boolean():
     assert RESULT_JSON_SCHEMA["properties"]["use_client_context"]["type"] == ["boolean", "null"]
 
 
-def test_schema_version_records_the_client_context_field():
-    assert SCHEMA_VERSION == "1.3"
+def test_qna_batch_size_is_emitted():
+    assert result_to_dict(make_result(qna_batch_size=50))["qna_batch_size"] == 50
+
+
+def test_qna_batch_size_defaults_to_null():
+    assert result_to_dict(make_result())["qna_batch_size"] is None
+
+
+def test_qna_batch_size_schema_is_a_nullable_integer():
+    assert RESULT_JSON_SCHEMA["properties"]["qna_batch_size"]["type"] == ["integer", "null"]
+
+
+def test_schema_version_records_the_batch_size_field():
+    assert SCHEMA_VERSION == "1.4"

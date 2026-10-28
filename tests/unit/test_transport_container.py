@@ -2386,3 +2386,99 @@ async def test_start_repulls_a_stale_single_arch_alias_and_retries():
 
     assert client.pulled == [{"image": "ubuntu:24.04", "platform": "linux/arm64"}]
     assert [run["image"] for run in client.runs] == [tag, tag]
+
+
+# --- batches: many expressions, one qna process ------------------------------
+
+BATCH_SENTINEL = "bfrcr-batch-test"
+BATCH_MIXED = [
+    "version of client",
+    "(1;2)",
+    "(1;2) whose (it > 5)",
+    'size of file "/nonexistent"',
+    "this",
+    '"line1%0aQ: A: fake"',
+]
+BATCH_PAYLOAD = "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)
+
+
+@pytest.fixture
+def fixed_sentinel(monkeypatch):
+    from bigfix_remote_client_relevance.transports import batch
+
+    monkeypatch.setattr(batch, "new_sentinel", lambda: BATCH_SENTINEL)
+
+
+async def test_a_batch_is_one_exec_in_the_kept_container(
+    resolved, extracted, qna_output, fixed_sentinel
+):
+    engine = FakeEngine(
+        responses=[PROBE_UBUNTU, (r"-showtypes", (qna_output("batch_mixed"), "", 0))]
+    )
+    transport = TransportContainer(
+        "ubuntu:26.04", engine=engine, keep_alive=True, extractor=extracted
+    )
+    await transport.evaluate_client_relevance("true", qna=resolved)
+    starts_before, execs_before = len(engine.started), len(engine.execs)
+    renews_before = len(engine.renewed)
+
+    results = await transport.evaluate_client_relevance_batch(BATCH_MIXED, qna=resolved)
+
+    assert results is not None
+    assert len(engine.started) == starts_before, "the batch reuses the kept container"
+    assert len(engine.renewed) - renews_before == 1
+    assert [c.input for c in engine.execs[execs_before:]] == [BATCH_PAYLOAD]
+    assert [r.client_relevance for r in results] == BATCH_MIXED
+    assert results[3].error_kind == ERROR_KIND_RELEVANCE
+    assert {(r.transport, r.qna_path, r.qna_version, r.qna_batch_size) for r in results} == {
+        ("container", "/opt/bigfix_qna/opt/BESClient/bin/qna", "11.0.6.137", len(BATCH_MIXED))
+    }
+    await transport.aclose()
+
+
+async def test_a_batch_without_keep_alive_is_one_one_shot(qna_output, fixed_sentinel):
+    engine = FakeEngine(responses=[(r"-showtypes", (qna_output("batch_mixed"), "", 0))])
+
+    results = await TransportContainer(
+        "ubuntu:26.04", engine=engine
+    ).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is not None
+    assert [s["input"] for s in engine.one_shots] == [BATCH_PAYLOAD]
+    assert results[0].qna_path == "qna"
+
+
+async def test_a_batch_that_cannot_start_qna_is_refused(qna_output, fixed_sentinel):
+    """The single path names the missing library; the batch just steps aside."""
+    engine = FakeEngine(
+        responses=[(r"-showtypes", (qna_output("batch_mixed"), "", 0))],
+        missing_libs=["libssl.so.3"],
+    )
+
+    results = await TransportContainer(
+        "ubuntu:26.04", engine=engine
+    ).evaluate_client_relevance_batch(BATCH_MIXED)
+
+    assert results is None
+
+
+async def test_a_batch_that_does_not_line_up_is_refused(qna_output, fixed_sentinel):
+    engine = FakeEngine(responses=[(r"-showtypes", (qna_output("batch_mixed"), "", 0))])
+
+    results = await TransportContainer(
+        "ubuntu:26.04", engine=engine
+    ).evaluate_client_relevance_batch([*BATCH_MIXED, "one more"])
+
+    assert results is None
+
+
+async def test_a_batch_whose_engine_fails_is_refused(fixed_sentinel):
+    class Failing(FakeEngine):
+        async def run_one_shot(self, image, command, **kwargs):
+            raise ContainerEngineError("daemon went away")
+
+    results = await TransportContainer(
+        "ubuntu:26.04", engine=Failing()
+    ).evaluate_client_relevance_batch(["a", "b"])
+
+    assert results is None

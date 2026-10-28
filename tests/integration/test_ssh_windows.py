@@ -88,3 +88,21 @@ async def test_stderr_stays_clean():
 
     assert result.error_kind is None, result.error
     assert "CLIXML" not in (result.raw_qna_output or "")
+
+
+async def test_a_batch_answers_exactly_as_one_expression_at_a_time():
+    """Issue #9: PowerShell's `&` must hand qna multi-line UTF-8 stdin intact."""
+    name, user = split_host(windows_host())
+    transport = TransportSSH(name, user=user, target="windows")
+    expressions = ["name of operating system", "(1;2)", "this", "", '"café"']
+
+    try:
+        singles = [
+            await transport.evaluate_client_relevance(e, timeout_s=120.0) for e in expressions
+        ]
+        batched = await transport.evaluate_client_relevance_batch(expressions, timeout_s=120.0)
+    finally:
+        await transport.aclose()
+
+    assert batched is not None, "a clean run must not fall back"
+    assert [(r.answers, r.error) for r in batched] == [(r.answers, r.error) for r in singles]

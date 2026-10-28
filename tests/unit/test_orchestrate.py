@@ -2535,3 +2535,329 @@ async def test_non_fastquery_failures_leave_the_client_context_unset():
     )
 
     assert result.use_client_context is None
+
+
+# --- qna batching: many expressions, one qna process -------------------------
+
+
+class FakeBatchTransport(FakeOldRuntimeTransport):
+    """Answers a batch in one call, recording each chunk it was handed.
+
+    ``refuse`` stands in for every reason a real transport returns ``None``
+    (a timeout, a nonzero exit, misaligned output): the orchestrator must
+    then evaluate that chunk one expression at a time.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        refuse: bool = False,
+        tracker: dict | None = None,
+        delay: float = 0.0,
+        newest_ok: tuple[int, ...] = (99,),
+    ) -> None:
+        super().__init__(host, newest_ok)
+        self.batches: list[list[str]] = []
+        self.batch_qna: list[ResolvedQna | None] = []
+        self.singles: list[str] = []
+        self._refuse = refuse
+        self._tracker = tracker if tracker is not None else {"live": 0, "peak": 0}
+        self._delay = delay
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        self.singles.append(client_relevance)
+        return await super().evaluate_client_relevance(client_relevance, qna=qna)
+
+    async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
+        self._tracker["live"] += 1
+        self._tracker["peak"] = max(self._tracker["peak"], self._tracker["live"])
+        try:
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            self.batches.append(list(expressions))
+            self.batch_qna.append(qna)
+            if self._refuse:
+                return None
+            return [
+                ClientRelevanceResult(
+                    host=self.host,
+                    transport="fake",
+                    client_relevance=expression,
+                    answers=["yes"],
+                    qna_version=None,
+                    qna_batch_size=len(expressions),
+                    elapsed_ms=5,
+                )
+                for expression in expressions
+            ]
+        finally:
+            self._tracker["live"] -= 1
+
+
+EXPRESSIONS = [f"e{i}" for i in range(5)]
+CONTAINER = Target(kind="container", name="u", image="ubuntu:26.04", arch="arm64")
+
+
+async def test_a_batch_shares_one_qna_process_after_the_first_expression():
+    """The first runs alone -- it is what detects a too-new build -- the rest together."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u")
+
+    results = await evaluate_many(EXPRESSIONS, [CONTAINER], transport_factory=lambda t: transport)
+
+    assert transport.singles == ["e0"]
+    assert transport.batches == [EXPRESSIONS[1:]]
+    assert [r.client_relevance for r in results] == EXPRESSIONS
+    assert [r.qna_batch_size for r in results] == [None, 4, 4, 4, 4]
+
+
+async def test_batches_are_chunked_by_batch_size():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u")
+    expressions = [f"e{i}" for i in range(6)]
+
+    results = await evaluate_many(
+        expressions, [CONTAINER], batch_size=2, transport_factory=lambda t: transport
+    )
+
+    # A chunk of one has nothing to share, so it runs as a single evaluation.
+    assert transport.batches == [["e1", "e2"], ["e3", "e4"]]
+    assert transport.singles == ["e0", "e5"]
+    assert [r.client_relevance for r in results] == expressions
+
+
+async def test_a_refused_batch_is_evaluated_one_expression_at_a_time():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u", refuse=True)
+
+    results = await evaluate_many(EXPRESSIONS, [CONTAINER], transport_factory=lambda t: transport)
+
+    assert transport.batches == [EXPRESSIONS[1:]]
+    assert transport.singles == EXPRESSIONS
+    assert [(r.client_relevance, r.ok, r.qna_batch_size) for r in results] == [
+        (e, True, None) for e in EXPRESSIONS
+    ]
+
+
+async def test_a_batch_that_raises_is_evaluated_one_expression_at_a_time():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class Raising(FakeBatchTransport):
+        async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
+            raise RuntimeError("boom")
+
+    transport = Raising("u")
+
+    results = await evaluate_many(EXPRESSIONS, [CONTAINER], transport_factory=lambda t: transport)
+
+    assert transport.singles == EXPRESSIONS
+    assert all(r.ok for r in results)
+
+
+async def test_a_batch_of_the_wrong_length_is_never_trusted():
+    """count_work promised one result per expression; a short batch must not lose any."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class Short(FakeBatchTransport):
+        async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
+            results = await super().evaluate_client_relevance_batch(expressions)
+            assert results is not None
+            return results[:-1]
+
+    transport = Short("u")
+
+    results = await evaluate_many(EXPRESSIONS, [CONTAINER], transport_factory=lambda t: transport)
+
+    assert [r.client_relevance for r in results] == EXPRESSIONS
+    assert transport.singles == EXPRESSIONS
+
+
+async def test_batching_can_be_turned_off():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u")
+
+    await evaluate_many(
+        EXPRESSIONS, [CONTAINER], batch=False, transport_factory=lambda t: transport
+    )
+
+    assert transport.batches == []
+    assert transport.singles == EXPRESSIONS
+
+
+async def test_a_transport_without_batching_is_evaluated_one_at_a_time():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeTransport("u")
+
+    results = await evaluate_many(EXPRESSIONS, [CONTAINER], transport_factory=lambda t: transport)
+
+    assert len(transport.calls) == len(EXPRESSIONS)
+    assert [r.client_relevance for r in results] == EXPRESSIONS
+
+
+async def test_batched_results_are_stamped_like_single_ones():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    target = Target(
+        kind="container", name="u", image="ubuntu:26.04", arch="arm64", platform="ubuntu"
+    )
+
+    results = await evaluate_many(
+        EXPRESSIONS,
+        [target],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: FakeBatchTransport("u"),
+        resolver=passthrough_resolver(),
+    )
+
+    assert {(r.platform, r.arch, r.qna_version) for r in results} == {
+        ("ubuntu", "arm64", "11.0.7.61")
+    }
+    # The transport's own timing for the run is kept, not overwritten.
+    assert [r.elapsed_ms for r in results[1:]] == [5] * 4
+
+
+async def test_a_batch_runs_on_the_fallback_version_and_says_so():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("debian11", newest_ok=(11, 0, 6, 137))
+
+    results = await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="container", name="debian:11", arch="arm64", platform="debian")],
+        qna_version="11.0.7.61",
+        transport_factory=lambda t: transport,
+        resolver=passthrough_resolver(),
+        previous_version=step_back,
+    )
+
+    assert [q.version if q else None for q in transport.batch_qna] == ["11.0.6.137"]
+    assert {(r.qna_version, r.qna_fallback_from) for r in results} == {("11.0.6.137", "11.0.7.61")}
+
+
+async def test_a_batch_holds_one_concurrency_slot():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    tracker = {"live": 0, "peak": 0}
+    targets = [Target(kind="container", name=f"c{i}", image="ubuntu:26.04") for i in range(3)]
+
+    await evaluate_many(
+        EXPRESSIONS,
+        targets,
+        max_parallel=1,
+        transport_factory=lambda t: FakeBatchTransport(t.name, tracker=tracker, delay=0.01),
+    )
+
+    assert tracker["peak"] == 1
+
+
+# --- fan-out batching: concurrent expressions, bounded -----------------------
+
+
+class SlowFanOutTransport(FakeFanOutTransport):
+    def __init__(self, hosts: list[str], tracker: dict) -> None:
+        super().__init__(hosts)
+        self._tracker = tracker
+
+    async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+        self._tracker["live"] += 1
+        self._tracker["peak"] = max(self._tracker["peak"], self._tracker["live"])
+        try:
+            await asyncio.sleep(0.01)
+            return await super().evaluate_client_relevance_fanout(client_relevance)
+        finally:
+            self._tracker["live"] -= 1
+
+
+async def test_fanout_expressions_run_concurrently_but_at_most_five_at_once():
+    from bigfix_remote_client_relevance.orchestrate import (
+        FANOUT_PARALLEL_EXPRESSIONS,
+        evaluate_many,
+    )
+
+    tracker = {"live": 0, "peak": 0}
+    expressions = [f"e{i}" for i in range(12)]
+
+    results = await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        max_parallel=50,
+        transport_factory=lambda t: SlowFanOutTransport(["alpha", "beta"], tracker),
+    )
+
+    assert FANOUT_PARALLEL_EXPRESSIONS == 5
+    assert tracker["peak"] == 5
+    assert [(r.client_relevance, r.host) for r in results] == [
+        (e, host) for e in expressions for host in ("alpha", "beta")
+    ]
+
+
+async def test_fanout_expressions_run_one_at_a_time_without_batching():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    tracker = {"live": 0, "peak": 0}
+
+    await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="fastquery", name="lab")],
+        batch=False,
+        transport_factory=lambda t: SlowFanOutTransport(["alpha"], tracker),
+    )
+
+    assert tracker["peak"] == 1
+
+
+async def test_after_a_chunk_falls_back_the_rest_run_one_at_a_time():
+    """A chunk that times out because its expressions are slow would time out
+    again in the next chunk, paying timeout_s per chunk on every run."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u", refuse=True)
+    expressions = [f"e{i}" for i in range(7)]
+
+    results = await evaluate_many(
+        expressions, [CONTAINER], batch_size=2, transport_factory=lambda t: transport
+    )
+
+    assert transport.batches == [["e1", "e2"]], "one failed chunk, then no more attempts"
+    assert transport.singles == expressions
+    assert [r.client_relevance for r in results] == expressions
+
+
+@pytest.mark.parametrize("batch_size", [0, -3])
+async def test_a_batch_size_below_one_is_rejected(batch_size):
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    with pytest.raises(ValueError, match="batch_size"):
+        await evaluate_many(
+            EXPRESSIONS,
+            [CONTAINER],
+            batch_size=batch_size,
+            transport_factory=lambda t: FakeBatchTransport("u"),
+        )
+
+
+async def test_a_fanout_transport_can_ask_for_fewer_expressions_at_once():
+    """Fast Query over SaaS sends one query per computer: expressions side by
+    side would split one call budget and starve each other's deadlines."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class OneAtATime(SlowFanOutTransport):
+        parallel_expressions = 1
+
+    tracker = {"live": 0, "peak": 0}
+
+    await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: OneAtATime(["alpha"], tracker),
+    )
+
+    assert tracker["peak"] == 1

@@ -14,7 +14,8 @@ polling until they answer or time runs out, and turning rows into one
 **BigFix SaaS takes one computer per query.** Through a ``SaasBackend`` the
 transport sends one query per computer and polls each on its own, all
 against the one deadline, with at most :data:`MAX_CONCURRENT_CALLS` server
-calls in flight. A failed submit is that computer's result and is never
+calls in flight -- per transport, so across expressions run side by side
+too. A failed submit is that computer's result and is never
 resent: SaaS answers most failures with a bare 500, possibly after the query
 reached the root server.
 
@@ -152,6 +153,22 @@ class TransportFastQuery:
         self._host = host
         self._clock = clock
         self._sleep = sleep
+        # One cap per transport, not per expression: evaluate_many runs a
+        # few expressions side by side, and the server sees all of them.
+        self._calls = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+        self._told_per_computer = False
+
+    @property
+    def parallel_expressions(self) -> int | None:
+        """How many expressions evaluate_many may run side by side here.
+
+        One when sending one query per computer: side by side, expressions
+        would split the one MAX_CONCURRENT_CALLS budget while each one's
+        deadline runs, so a 100-computer target would leave most computers
+        "not submitted" instead of answered. ``None`` keeps the
+        orchestrator's default for one query per expression.
+        """
+        return 1 if self._one_computer_per_query else None
 
     async def aclose(self) -> None:
         closer = getattr(self._backend, "aclose", None)
@@ -286,12 +303,15 @@ class TransportFastQuery:
         started: float,
     ) -> list[ClientRelevanceResult]:
         """One query per computer, side by side, merged like one query's rows."""
-        logger.info(
+        # INFO once per transport: a batch of expressions would repeat it.
+        logger.log(
+            logging.DEBUG if self._told_per_computer else logging.INFO,
             "Fast Query: one query per computer for %d computer(s) "
             "(BigFix SaaS takes one computer per query)",
             len(ids),
         )
-        calls = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+        self._told_per_computer = True
+        calls = self._calls
         outcomes = await asyncio.gather(
             *(
                 self._one_computer(client_relevance, computer_id, deadline, timeout_s, calls)
