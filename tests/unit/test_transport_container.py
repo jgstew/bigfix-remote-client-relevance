@@ -336,6 +336,16 @@ async def test_a_provisioned_qna_runs_with_a_utf8_locale(resolved, extracted):
     assert evals == [f"{QNA_WITH_UTF8}/opt/bigfix_qna/opt/BESClient/bin/qna -t -showtypes"]
 
 
+def test_the_qna_path_stays_one_shell_word_after_the_locale():
+    from bigfix_remote_client_relevance.bootstrap.targets import spec_for
+
+    command = TransportContainer("ubuntu:22.04", engine=FakeEngine())._eval_command(
+        spec_for("ubuntu"), "/opt/my qna/qna"
+    )
+
+    assert shlex.split(command) == ["LANG=${LANG:-C.UTF-8}", "/opt/my qna/qna", "-t", "-showtypes"]
+
+
 async def test_relevance_error_maps_to_relevance(qna_output):
     engine = FakeEngine(responses=[(r"-showtypes", (qna_output("relevance_error"), "", 0))])
 
@@ -2246,6 +2256,20 @@ async def test_stdin_too_large_for_one_argument_is_an_engine_error():
 
     with pytest.raises(ContainerEngineError, match="argument list too long"):
         await engine.exec_in("abc123456789", "qna -t", input="x" * 200_000)
+
+
+async def test_an_answer_that_mentions_the_phrase_is_still_qna_output():
+    """stdout is qna's answers; only the runtime's own refusal (126) counts."""
+    container = FakeExecContainer(
+        FakeExecResult(exit_code=1, output=(b"A: argument list too long\n", b""))
+    )
+    engine = engine_with(FakeExecClient(container))
+
+    stdout, _stderr, code = await engine.exec_in(
+        "abc123456789", "qna -t", input='"argument list too long"\n'
+    )
+
+    assert (stdout, code) == ("A: argument list too long\n", 1)
 
 
 # --- every container carries its own deadline -------------------------------

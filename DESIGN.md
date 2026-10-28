@@ -867,8 +867,9 @@ saves nothing; the container is stopped when the batch is. `evaluate_client_rele
 one-element expression list, so the two can never drift.
 
 **qna stdin batching (issue #9).** Sharing the transport still left one qna
-process per expression — for a container, a stdin-staging exec plus an
-eval exec each, about 190 ms per expression on a native container, while
+process per expression — for a container at the time, a stdin-staging exec
+plus an eval exec each (one exec since #79), about 190 ms per expression on a
+native container, while
 368 expressions on one qna stdin took 70 ms in total. So with `batch=True`
 (the default) a group's expressions after the first go through one qna
 process per `batch_size` chunk (default 100, and at most

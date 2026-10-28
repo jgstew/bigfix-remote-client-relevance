@@ -155,7 +155,9 @@ def deadline_command(ttl_s: float) -> list[str]:
 # qna answers any non-ASCII string with "Transcoding Failure of result" unless
 # its locale is UTF-8, and Debian, Ubuntu, openSUSE and Oracle Linux images set
 # no LANG at all (issue #79). C.UTF-8 is the one locale every tested image
-# carries; a LANG the image sets itself, via ENV, is kept.
+# carries; a LANG the image sets itself, via ENV, is kept. So is a non-UTF-8
+# one (LANG=C, or an LC_ALL / LC_CTYPE that outranks it), which still fails
+# the same way -- such an image chose that locale.
 _QNA_LOCALE = 'LANG="${LANG:-C.UTF-8}"'
 
 # How the runtime words an exec whose argv is over the kernel's limit.
@@ -816,7 +818,9 @@ class DockerEngine:
             # Too large a payload fails the exec itself (one argv string is
             # capped at 128 KiB), with a 126 that would otherwise read as "no
             # qna in this image". MAX_BATCH_BYTES keeps batches well under it.
-            if input is not None and code != 0 and _ARG_TOO_LONG in f"{out}{err}".lower():
+            # Only a 126 counts: stdout is qna's answers, and an answer may
+            # contain the phrase.
+            if input is not None and code == 126 and _ARG_TOO_LONG in f"{out}{err}".lower():
                 raise ContainerEngineError(
                     f"could not pass stdin to the container: {(out or err).strip()}"
                 )
