@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +26,7 @@ from bigfix_remote_client_relevance.orchestrate import (
     default_transport_factory,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
+    evaluate_many,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.results import (
@@ -35,6 +38,7 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
+from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport
 
 
 class FakeTransport:
@@ -152,6 +156,126 @@ async def test_library_ssh_transport_still_guarded_through_an_explicit_factory(m
 
     assert result.error_kind == ERROR_KIND_TRANSPORT
     assert result.error == "host.example: no asyncssh here"
+
+
+# --- optional transport capabilities ----------------------------------------
+#
+# _group asks every transport whether it is a FanOutTransport / BatchTransport.
+# isinstance() against a runtime_checkable Protocol costs ~1.8 us per miss on
+# 3.12+ (inspect.getattr_static per call), paid per target on every run; the
+# run's capability cache answers from the class once instead. It keeps
+# 3.12+'s isinstance semantics on every Python, 3.11 included, where
+# isinstance is hasattr-based and a MagicMock looked like both.
+
+
+class _WithBoth:
+    async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+        return []
+
+    async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
+        return None
+
+
+class _Neither:
+    pass
+
+
+class _SubOfBoth(_WithBoth):
+    pass
+
+
+class _DisabledOnClass:
+    evaluate_client_relevance_fanout = None
+    evaluate_client_relevance_batch = None
+
+
+class _Proxy:
+    """Answers any attribute through __getattr__, as a remote proxy might."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+def _instance_assigned():
+    transport = _Neither()
+    transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
+    transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    return transport
+
+
+def _instance_none_over_class():
+    transport = _WithBoth()
+    transport.evaluate_client_relevance_fanout = None
+    transport.evaluate_client_relevance_batch = None
+    return transport
+
+
+def _assigned_over_disabled_class():
+    transport = _DisabledOnClass()
+    transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
+    transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    return transport
+
+
+# (make transport, expected for both protocols) -- expected is what
+# isinstance() answers on Python 3.12+.
+CAPABILITY_CASES = {
+    "method on the class": (_WithBoth, True),
+    "subclass": (_SubOfBoth, True),
+    "no method": (_Neither, False),
+    "method assigned on the instance": (_instance_assigned, True),
+    # The class answers first, so an instance None doesn't hide its method.
+    "instance None over a class method": (_instance_none_over_class, True),
+    "None on the class": (_DisabledOnClass, False),
+    "instance method over None on the class": (_assigned_over_disabled_class, True),
+    "MagicMock": (MagicMock, False),
+    # isinstance also asks __class__, which a spec'd mock reports as the spec.
+    "MagicMock spec'd as one": (lambda: MagicMock(spec=_WithBoth), True),
+    "__getattr__ proxy": (_Proxy, False),
+}
+
+
+@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+@pytest.mark.parametrize("case", CAPABILITY_CASES)
+def test_capabilities_match_isinstance(case, protocol):
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    make, expected = CAPABILITY_CASES[case]
+    transport = make()
+
+    capabilities = _Capabilities()
+    check = {FanOutTransport: capabilities.fan_out, BatchTransport: capabilities.batch}[protocol]
+
+    assert check(transport) is expected
+    if sys.version_info >= (3, 12):
+        assert isinstance(transport, protocol) is expected
+
+
+async def test_capabilities_are_worked_out_once_per_class_not_per_target(monkeypatch):
+    from bigfix_remote_client_relevance import orchestrate as orchestrate_module
+
+    asked: list[tuple[type, type]] = []
+    real = orchestrate_module._class_implements
+
+    def counting(cls, protocol):
+        asked.append((cls, protocol))
+        return real(cls, protocol)
+
+    monkeypatch.setattr(orchestrate_module, "_class_implements", counting)
+    targets = [Target(kind="ssh", name=f"host{i}") for i in range(50)]
+
+    results = await evaluate_many(
+        ["true", "false"],
+        targets,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 100
+    assert sorted(asked, key=lambda pair: pair[1].__name__) == [
+        (FakeTransport, BatchTransport),
+        (FakeTransport, FanOutTransport),
+    ]
 
 
 # --- fan-out ---------------------------------------------------------------
