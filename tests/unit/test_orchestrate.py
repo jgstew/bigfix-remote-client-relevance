@@ -8,6 +8,7 @@ version), bounded concurrency, and one version resolution per run.
 from __future__ import annotations
 
 import asyncio
+import builtins
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,53 @@ def make_resolver(mapping=None, counter=None):
 
 
 SSH_TARGETS = [Target(kind="ssh", name=f"host{i}") for i in range(3)]
+
+
+# --- the ssh availability guard ---------------------------------------------
+
+
+async def test_own_transport_factory_never_imports_asyncssh(monkeypatch):
+    """The early ssh guard is for this library's own TransportSSH, which
+    imports asyncssh when it connects anyway. A caller's own transport_factory
+    owns its transport: importing asyncssh for it cost ~65 ms on the first
+    evaluation in every process (1.10.0), for a dependency it never used."""
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] == "asyncssh":
+            raise AssertionError("asyncssh imported for a caller's own transport")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+    results = await evaluate_client_relevance(
+        "true",
+        SSH_TARGETS,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert [(r.host, r.error) for r in results] == [(t.name, None) for t in SSH_TARGETS]
+
+
+async def test_own_transport_factory_runs_ssh_targets_where_asyncssh_is_missing(monkeypatch):
+    """Without asyncssh (iOS, Android), a caller that brings its own ssh-kind
+    transport still gets it run; only the library's TransportSSH needs asyncssh."""
+    from bigfix_remote_client_relevance import orchestrate as orchestrate_module
+    from bigfix_remote_client_relevance.transports import ssh as ssh_module
+
+    monkeypatch.setattr(ssh_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
+    monkeypatch.setattr(
+        orchestrate_module,
+        "default_transport_factory",
+        lambda *a, **k: pytest.fail("default factory used"),
+    )
+
+    results = await evaluate_client_relevance(
+        "true", SSH_TARGETS, transport_factory=lambda t: FakeTransport(t.name)
+    )
+
+    assert [r.error for r in results] == [None] * len(SSH_TARGETS)
 
 
 # --- fan-out ---------------------------------------------------------------
