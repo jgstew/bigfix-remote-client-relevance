@@ -668,3 +668,199 @@ def test_run_auto_discovery_passes_entries_with_defaults_applied(tmp_path, monke
     assert call["existing"]["this-mac"]["qna_version"] == []
     assert call["existing"]["pinned"]["qna_version"] == "11.0"
     assert set(call["skip"]) == {"this-mac", "pinned"}
+
+
+# --- helpers for front ends (issue #54, plus discover_into from #84) ---------
+#
+# Ported from bigfix-relevance-debugger's upstream/remote_client_relevance.py.
+# Discovery itself is always injected: nothing here evaluates a candidate or
+# writes the real ~/.bigfix/remote_clients.toml.
+
+
+def test_supported_archs_is_public_in_display_order():
+    assert "SUPPORTED_ARCHS" in discovery_module.__all__
+    assert discovery_module.SUPPORTED_ARCHS == ("x86_64", "arm64")
+
+
+def test_published_arches_from_manifest_in_stable_order():
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    images = FakeImages(platforms={"debian:11": {"arm64", "x86_64"}})
+
+    assert published_arches("debian:11", images) == ["x86_64", "arm64"]
+
+
+def test_published_arches_single_arch_image():
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    images = FakeImages(platforms={"x86-only:1": {"x86_64"}})
+
+    assert published_arches("x86-only:1", images) == ["x86_64"]
+
+
+def test_published_arches_unknown_manifest_means_this_machine(monkeypatch):
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    monkeypatch.setattr(discovery_module, "host_arch", lambda: "arm64")
+
+    # No entry: FakeImages.platforms() returns None, as for a local-only tag.
+    assert published_arches("local-only:dev", FakeImages()) == ["arm64"]
+
+
+def test_published_arches_empty_manifest_means_this_machine(monkeypatch):
+    # EngineImageSource returns an empty set for a manifest with no arch qna
+    # supports (or no linux entries); that is no better than not knowing.
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    monkeypatch.setattr(discovery_module, "host_arch", lambda: "arm64")
+
+    assert published_arches("windows-only:1", FakeImages(platforms={"windows-only:1": set()})) == [
+        "arm64"
+    ]
+
+
+def test_published_arches_no_engine_means_this_machine(monkeypatch):
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    monkeypatch.setattr(discovery_module, "host_arch", lambda: "x86_64")
+
+    assert published_arches("debian:11", None) == ["x86_64"]
+
+
+def test_published_arches_trusts_the_engine_filter_and_keeps_new_arches():
+    # EngineImageSource.platforms already filters to what qna supports; a
+    # second filter here would drop an arch the library starts returning.
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    images = FakeImages(platforms={"debian:11": {"riscv64", "arm64", "x86_64"}})
+
+    assert published_arches("debian:11", images) == ["x86_64", "arm64", "riscv64"]
+
+
+def _never_discover(path):
+    pytest.fail(f"should not discover into {path}")
+
+
+def test_existing_inventory_is_used_without_discovery(tmp_path):
+    from bigfix_remote_client_relevance.discovery import find_or_discover_inventory
+
+    found = tmp_path / "remote_clients.toml"
+    found.write_text("", encoding="utf-8")
+
+    path = find_or_discover_inventory(
+        find=lambda: found, user_path=tmp_path / "user.toml", discover=_never_discover
+    )
+
+    assert path == found
+
+
+def test_first_run_discovers_into_the_user_inventory(tmp_path):
+    from bigfix_remote_client_relevance.discovery import find_or_discover_inventory
+
+    user = tmp_path / ".bigfix" / "remote_clients.toml"
+    calls: list = []
+
+    def fake_discover(path):
+        calls.append(path)
+        path.parent.mkdir(parents=True)
+        path.write_text('[hosts.local]\ntransport = "local"\n', encoding="utf-8")
+        return ["local"]
+
+    path = find_or_discover_inventory(find=lambda: None, user_path=user, discover=fake_discover)
+
+    assert calls == [user]
+    assert path == user
+
+
+def test_existing_user_file_is_not_rediscovered(tmp_path):
+    # e.g. the placeholder a fruitless discovery leaves behind: it exists, so
+    # discovery must not repeat on every start.
+    from bigfix_remote_client_relevance.discovery import find_or_discover_inventory
+
+    user = tmp_path / "remote_clients.toml"
+    user.write_text("# placeholder\n", encoding="utf-8")
+
+    path = find_or_discover_inventory(find=lambda: None, user_path=user, discover=_never_discover)
+
+    assert path == user
+
+
+def test_discovery_that_writes_nothing_returns_none(tmp_path):
+    from bigfix_remote_client_relevance.discovery import find_or_discover_inventory
+
+    path = find_or_discover_inventory(
+        find=lambda: None, user_path=tmp_path / "x.toml", discover=lambda p: []
+    )
+
+    assert path is None
+
+
+def test_find_or_discover_resolves_its_defaults_per_call(tmp_path, monkeypatch):
+    """Defaults are looked up when called, not bound at import, so the search
+    path, the per-user file and discovery can all be replaced afterwards."""
+    from bigfix_remote_client_relevance.discovery import find_or_discover_inventory
+
+    user = tmp_path / ".bigfix" / "remote_clients.toml"
+    calls: list = []
+    monkeypatch.setattr(discovery_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(discovery_module, "user_inventory_path", lambda: user)
+    monkeypatch.setattr(
+        discovery_module, "run_auto_discovery", lambda path, **kwargs: calls.append(path) or []
+    )
+
+    assert find_or_discover_inventory() is None
+    assert calls == [user]
+
+
+def test_discover_into_runs_even_when_the_file_exists(tmp_path):
+    # A placeholder (or emptied) inventory: discovery adds what it finds.
+    from bigfix_remote_client_relevance.discovery import discover_into
+
+    path = tmp_path / "remote_clients.toml"
+    path.write_text("# placeholder\n", encoding="utf-8")
+    calls: list = []
+
+    def fake_discover(p):
+        calls.append(p)
+        p.write_text('[hosts.local]\ntransport = "local"\n', encoding="utf-8")
+        return ["local"]
+
+    assert discover_into(path, discover=fake_discover) == path
+    assert calls == [path]
+
+
+def test_discover_into_defaults_to_the_user_inventory(tmp_path, monkeypatch):
+    from bigfix_remote_client_relevance.discovery import discover_into
+
+    user = tmp_path / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(discovery_module, "user_inventory_path", lambda: user)
+    calls: list = []
+
+    assert discover_into(None, discover=lambda p: calls.append(p) or []) is None
+    assert calls == [user]
+
+
+def test_discover_into_defaults_to_run_auto_discovery(tmp_path, monkeypatch):
+    from bigfix_remote_client_relevance.discovery import discover_into
+
+    path = tmp_path / "remote_clients.toml"
+    calls: list = []
+    monkeypatch.setattr(
+        discovery_module, "run_auto_discovery", lambda p, **kwargs: calls.append(p) or []
+    )
+
+    assert discover_into(path) is None
+    assert calls == [path]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SUPPORTED_ARCHS",
+        "discover_into",
+        "find_or_discover_inventory",
+        "published_arches",
+    ],
+)
+def test_front_end_helpers_are_in_discovery_all(name):
+    assert name in discovery_module.__all__

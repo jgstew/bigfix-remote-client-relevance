@@ -38,6 +38,7 @@ EXPECTED_ROOT_EXPORTS = [
     "ResolvedQna",
     "ResultPayload",
     "SCHEMA_VERSION",
+    "SUPPORTED_ARCHS",
     "FanOutTransport",
     "Target",
     "Transport",
@@ -48,19 +49,23 @@ EXPECTED_ROOT_EXPORTS = [
     "TransportSSH",
     "can_run_processes",
     "count_work",
+    "discover_into",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",
     "evaluate_many",
     "evaluate_many_stream",
     "find_inventory_path",
+    "find_or_discover_inventory",
     "find_qna_path",
     "format_result",
     "format_results",
     "load_inventory",
     "parse_qna_output",
+    "published_arches",
     "reclaim_stray_containers",
     "result_to_dict",
     "results_to_dicts",
+    "target_platform",
     "worst_exit_code",
 ]
 
@@ -94,6 +99,20 @@ def test_version_is_reported():
             # The progress pair an MCP server needs: stream for incremental
             # notifications, count_work for the denominator.
             ["count_work", "evaluate_client_relevance_stream"],
+        ),
+        (
+            "bigfix_remote_client_relevance.discovery",
+            # What a front end needs before it evaluates anything (#54).
+            [
+                "SUPPORTED_ARCHS",
+                "discover_into",
+                "find_or_discover_inventory",
+                "published_arches",
+            ],
+        ),
+        (
+            "bigfix_remote_client_relevance.bootstrap.targets",
+            ["target_platform"],
         ),
         (
             "bigfix_remote_client_relevance.results",
