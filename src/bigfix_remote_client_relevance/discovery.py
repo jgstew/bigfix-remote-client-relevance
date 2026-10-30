@@ -128,10 +128,10 @@ class EngineImageSource:
 
 
 def published_arches(image: str, images: ImageSource | None) -> list[str]:
-    """The arches to run ``image`` as: every one its manifest publishes that qna supports.
+    """The arches to run ``image`` as: every one ``images`` reports for its manifest.
 
-    In :data:`SUPPORTED_ARCHS` order, then any other arch ``images`` reports,
-    sorted. Falls back to this machine's arch when there is no engine or the
+    :data:`SUPPORTED_ARCHS` first, in that order, then any other arch
+    ``images`` reports, sorted. Falls back to this machine's arch when there is no engine or the
     registry can't be asked (offline, a local-only tag) -- the same rule
     discovery applies to its container candidates. Blocking: it may ask a
     registry.
@@ -357,6 +357,9 @@ class _Discovery:
         return False
 
     def _archs(self, image: str) -> set[str]:
+        # Not published_arches(): discovery falls back to its own (possibly
+        # overridden) arch rather than host_arch(), and an empty manifest here
+        # means "nothing qna can run", so the image is skipped, not tried.
         published = self._platforms.get(image)
         if published is None:
             return {self._arch}
@@ -599,7 +602,11 @@ def find_or_discover_inventory(
     and the per-user file (:func:`user_inventory_path`) doesn't exist yet.
     Discovery always leaves that file behind (working hosts, or a
     placeholder when none worked), so it never repeats on its own. Returns
-    the file found or written, or None when discovery wrote nothing.
+    the file found or written, or None when discovery wrote nothing. After a
+    fruitless discovery that file is the comment-only placeholder, on which
+    :func:`~...inventory.load_inventory` raises ``EmptyInventoryError``;
+    :func:`discover_into` is the retry. Raises
+    :class:`~...inventory.InventoryError` if the file can't be written.
 
     Blocking -- discovery evaluates every candidate, may pull images, and
     calls ``asyncio.run`` -- so call it from a worker thread inside an event
@@ -627,7 +634,8 @@ def discover_into(
     inventory with no hosts, such as the placeholder a fruitless discovery
     leaves). :func:`run_auto_discovery` only adds hosts missing from the
     file. Blocking, like discovery itself. Returns ``path`` when it is a file
-    afterwards.
+    afterwards (possibly still the placeholder, if nothing worked). Raises
+    :class:`~...inventory.InventoryError` if ``path`` can't be written.
     """
     path = path if path is not None else user_inventory_path()
     (discover or run_auto_discovery)(path)

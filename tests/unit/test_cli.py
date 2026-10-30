@@ -1326,26 +1326,37 @@ def test_first_run_goes_through_the_library_helper(captured, tmp_path, monkeypat
     assert discovered == [user_inventory]
 
 
-def test_auto_discovery_flag_skips_the_first_run_helper(captured, tmp_path, monkeypatch):
-    # --auto-discovery runs discovery explicitly; the implicit first run must
-    # not run it a second time.
+@pytest.mark.parametrize("flag", ["--auto-discovery", "--auto-discovery-ssh"])
+def test_auto_discovery_flag_skips_the_first_run_helper(captured, tmp_path, monkeypatch, flag):
+    # Either flag runs discovery explicitly; the implicit first run must not
+    # run it a second time.
     user_inventory = tmp_path / "remote_clients.toml"
-    # The search path finds the file once --auto-discovery has written it.
+    # The search path finds the file once the flag's discovery has written it.
     monkeypatch.setattr(
         cli_module,
         "find_inventory_path",
         lambda: user_inventory if user_inventory.exists() else None,
     )
     monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "_interactive", lambda: True)
+    found = {"local": {"transport": "local", "qna_version": []}}
     calls: list = []
-    _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, calls)
+    _fake_discovery(monkeypatch, found, calls)
+
+    def fake_ssh(path, *, ask, tell):
+        from bigfix_remote_client_relevance.discovery import write_discovered
+
+        calls.append(path)
+        return write_discovered(path, found)
+
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", fake_ssh)
     monkeypatch.setattr(
         cli_module,
         "find_or_discover_inventory",
-        lambda **kwargs: pytest.fail("first-run helper ran alongside --auto-discovery"),
+        lambda **kwargs: pytest.fail(f"first-run helper ran alongside {flag}"),
     )
 
-    result = invoke("--auto-discovery", "name of operating system")
+    result = invoke(flag, "name of operating system")
 
     assert result.exit_code == 0, result.output
     assert calls == [user_inventory]

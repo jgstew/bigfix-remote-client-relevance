@@ -325,7 +325,9 @@ _SYS_PLATFORMS = {"darwin": "macos", "win32": "windows"}
 def target_platform(target: Target) -> str | None:
     """The :data:`KNOWN_TARGETS` key ``target`` will run as, if knowable without connecting.
 
-    An explicit (or inventory-recorded) ``platform`` wins; otherwise a
+    An explicit (or inventory-recorded) ``platform`` wins, returned as given
+    (``load_inventory`` validates it; a ``Target`` built in code is the
+    caller's word); otherwise a
     container is read from its image name and ``local`` from this machine.
     None means unknown until a transport probes it: an SSH host, a Linux
     controller (its distro needs the os-release probe), or a remote service

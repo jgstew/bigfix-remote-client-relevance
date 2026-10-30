@@ -448,7 +448,9 @@ published_arches("debian:12", images)  # ["x86_64", "arm64"], from the registry 
 - `find_or_discover_inventory()` is the CLI's first run: the inventory the
   search path finds, or else auto-discovery into `~/.bigfix/remote_clients.toml`
   once, if that file doesn't exist yet. It returns the file, or `None` if
-  discovery wrote nothing. `discover_into(path=None)` runs discovery again
+  discovery wrote nothing. When no candidate worked, the file is a
+  comment-only placeholder, and `load_inventory` raises `EmptyInventoryError`
+  on it. A path that can't be written raises `InventoryError`. `discover_into(path=None)` runs discovery again
   even when the file exists, adding only hosts it lacks. Both block, since
   discovery evaluates every candidate, so call them from a worker thread
   (`asyncio.to_thread`) inside an event loop.
