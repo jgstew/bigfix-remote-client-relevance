@@ -30,7 +30,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError, fallback_floor
@@ -46,6 +46,7 @@ from bigfix_remote_client_relevance.results import (
     ResolvedQna,
 )
 from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport, Transport
+from bigfix_remote_client_relevance.transports import ssh as ssh_transport
 from bigfix_remote_client_relevance.transports.batch import chunk_expressions
 
 if TYPE_CHECKING:
@@ -481,6 +482,77 @@ async def _release(transport: object) -> None:
         logger.debug("releasing a transport failed: %s", exc)
 
 
+# The one method each optional transport protocol is made of.
+_PROTOCOL_METHOD: dict[type, str] = {
+    FanOutTransport: "evaluate_client_relevance_fanout",
+    BatchTransport: "evaluate_client_relevance_batch",
+}
+
+
+def _class_implements(cls: type, protocol: type) -> bool:
+    """The class half of ``isinstance`` against a runtime_checkable Protocol.
+
+    ``issubclass`` covers explicit and ``register``-ed subclasses, but caches
+    a miss for the whole process; ``isinstance`` then looks at the class
+    again, so the first definition in the MRO is read here too, and a class
+    patched to gain the method counts from the next run.
+    """
+    if issubclass(cls, protocol):
+        return True
+    name = _PROTOCOL_METHOD[protocol]
+    for base in cls.__mro__:
+        if name in vars(base):
+            return vars(base)[name] is not None
+    return False
+
+
+class _Capabilities:
+    """Which optional protocols a run's transports implement, asked per target.
+
+    ``isinstance`` against a runtime_checkable Protocol is fast when the class
+    implements it (``ABCMeta`` caches that), but every miss walks the
+    protocol's members with ``inspect.getattr_static``: ~1.8 us on 3.12+, and
+    most transports miss at least one of these, on every target of every
+    run. So each class's answer is worked out once per run -- not per
+    process, since tests and plugins patch transport classes -- and only the
+    instance ``__dict__`` is looked at per target, which is all the rest of
+    ``isinstance`` (3.12+) reads for these one-method protocols. (Not
+    reproduced: a class whose ``__dict__`` is itself a property, and a class
+    object passed as the transport.)
+    """
+
+    def __init__(self) -> None:
+        self._by_class: dict[tuple[type, type], bool] = {}
+
+    def fan_out(self, transport: object) -> TypeGuard[FanOutTransport]:
+        return self._supports(transport, FanOutTransport)
+
+    def batch(self, transport: object) -> TypeGuard[BatchTransport]:
+        return self._supports(transport, BatchTransport)
+
+    def _supports(self, transport: object, protocol: type) -> bool:
+        if self._class_supports(type(transport), protocol):
+            return True
+        # isinstance asks __class__ too, which a spec'd mock reports as its spec.
+        reported = transport.__class__
+        if reported is not type(transport) and self._class_supports(reported, protocol):
+            return True
+        # Like getattr_static: a method assigned on the instance counts, and
+        # __getattr__ (a MagicMock's, a proxy's) never runs.
+        try:
+            attrs = object.__getattribute__(transport, "__dict__")
+        except AttributeError:
+            return False
+        return attrs.get(_PROTOCOL_METHOD[protocol]) is not None
+
+    def _class_supports(self, cls: type, protocol: type) -> bool:
+        key = (cls, protocol)
+        known = self._by_class.get(key)
+        if known is None:
+            known = self._by_class[key] = _class_implements(cls, protocol)
+        return known
+
+
 async def _evaluate_stream_indexed(
     expressions: Sequence[str],
     targets: Sequence[Target],
@@ -540,6 +612,7 @@ async def _evaluate_stream_indexed(
     previous_version = previous_version or default_previous_version
     memory = compat_memory or CompatMemory()
     semaphore = asyncio.Semaphore(max_parallel)
+    capabilities = _Capabilities()
     image_semaphore = asyncio.Semaphore(pull_parallel)
 
     # Resolve each distinct spec once per run and share the outcome, so a
@@ -593,16 +666,11 @@ async def _evaluate_stream_indexed(
         # that resolver downloaded an agent package nothing could run. A
         # pinned ssh/container target with its platform already known has no
         # probe to fail first, so the probe can't be relied on to stop it.
-        unavailable: str | None = None
+        # This one is about the platform, whoever builds the transport: no
+        # local or container transport can start qna there. (The ssh check,
+        # below, is about this library's own transport's dependency instead.)
         if target.kind in ("local", "container") and not can_run_processes():
             unavailable = no_process_advice(f"the {target.kind} transport")
-        elif target.kind == "ssh":
-            from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
-
-            unavailable = ssh_unavailable_reason()
-            if unavailable is not None:
-                unavailable = f"{target.label}: {unavailable}"
-        if unavailable is not None:
             for index, result in enumerate(
                 _group_failure(target, ERROR_KIND_TRANSPORT, unavailable)
             ):
@@ -625,6 +693,22 @@ async def _evaluate_stream_indexed(
             ):
                 emit(index, result)
             return
+
+        # Still before any probe or resolve. Only this library's TransportSSH
+        # needs asyncssh, however it was reached (the default factory, or
+        # default_transport_factory passed or wrapped by a caller). Checking
+        # by the transport built, not the target's kind, spares a caller's own
+        # ssh-kind transport the asyncssh import (~65 ms on a process's first
+        # run in 1.10.0) and the refusal where asyncssh is missing. Building a
+        # TransportSSH doesn't import asyncssh; connecting does.
+        if isinstance(transport, ssh_transport.TransportSSH):
+            ssh_missing = ssh_transport.ssh_unavailable_reason()
+            if ssh_missing is not None:
+                for index, result in enumerate(
+                    _group_failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {ssh_missing}")
+                ):
+                    emit(index, result)
+                return
 
         try:
             prepare = getattr(transport, "prepare", None)
@@ -786,7 +870,7 @@ async def _evaluate_stream_indexed(
                 await _prepare(resolved)
                 return
 
-            if isinstance(transport, FanOutTransport):
+            if capabilities.fan_out(transport):
                 # One cell, many endpoints. Nothing to fall back through:
                 # fan-out transports evaluate with whatever each endpoint has.
                 # Batching them is running a few at once; waiting for a lane
@@ -852,7 +936,7 @@ async def _evaluate_stream_indexed(
             # The first expression ran alone: it is what found out whether
             # the build starts here at all. The rest share qna processes, a
             # chunk at a time, when the transport can.
-            batcher = transport if batch and isinstance(transport, BatchTransport) else None
+            batcher = transport if batch and capabilities.batch(transport) else None
             index = 1
             for chunk in chunk_expressions(
                 expressions[1:], max_count=batch_size if batcher is not None else 1

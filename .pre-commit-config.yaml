@@ -73,7 +73,7 @@ repos:
   # ruff replaces black + flake8 + isort: `ruff-check` lints (and fixes),
   # `ruff-format` is the formatter. Config lives in pyproject.toml.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: 38bfb07c0c64c304f47eb52090f8288150c77730 # v0.17.1
+    rev: 25bcf95026b96e2dd3c0aec3090c3d6ef6ca2e6c # v0.17.3
     hooks:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]
@@ -178,7 +178,7 @@ repos:
         stages: [manual]
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
-    rev: 0494aa7fa1314e98913a41227d8f0a515b2c1049 # 0.38.2
+    rev: a76b92851fc9eede9f9bc4073eb55202f34eb0df # 0.39.0
     hooks:
       - id: check-github-workflows
         args: ["--verbose"]
@@ -217,7 +217,7 @@ repos:
         # locally to get the online-only audits.
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 02747c5f318750b3c3ccfc1d83dd787b35d6c078 # 0.13.3
+    rev: 46787482b9fb2003c56e0f7592e312ef381829d9 # 0.13.6
     hooks:
       - id: uv-lock
       # uv-sync is a post-checkout/post-merge/post-rewrite hook, not a
