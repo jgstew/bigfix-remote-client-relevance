@@ -482,16 +482,28 @@ async def _release(transport: object) -> None:
         logger.debug("releasing a transport failed: %s", exc)
 
 
-def _class_implements(cls: type, protocol: type) -> bool:
-    """The class half of ``isinstance`` against a runtime_checkable Protocol."""
-    return issubclass(cls, protocol)
-
-
 # The one method each optional transport protocol is made of.
 _PROTOCOL_METHOD: dict[type, str] = {
     FanOutTransport: "evaluate_client_relevance_fanout",
     BatchTransport: "evaluate_client_relevance_batch",
 }
+
+
+def _class_implements(cls: type, protocol: type) -> bool:
+    """The class half of ``isinstance`` against a runtime_checkable Protocol.
+
+    ``issubclass`` covers explicit and ``register``-ed subclasses, but caches
+    a miss for the whole process; ``isinstance`` then looks at the class
+    again, so the first definition in the MRO is read here too, and a class
+    patched to gain the method counts from the next run.
+    """
+    if issubclass(cls, protocol):
+        return True
+    name = _PROTOCOL_METHOD[protocol]
+    for base in cls.__mro__:
+        if name in vars(base):
+            return vars(base)[name] is not None
+    return False
 
 
 class _Capabilities:
@@ -502,9 +514,11 @@ class _Capabilities:
     protocol's members with ``inspect.getattr_static``: ~1.8 us on 3.12+, and
     most transports miss at least one of these, on every target of every
     run. So each class's answer is worked out once per run -- not per
-    process, since tests and callers patch transport classes -- and only the
+    process, since tests and plugins patch transport classes -- and only the
     instance ``__dict__`` is looked at per target, which is all the rest of
-    ``isinstance`` (3.12+) reads for these one-method protocols.
+    ``isinstance`` (3.12+) reads for these one-method protocols. (Not
+    reproduced: a class whose ``__dict__`` is itself a property, and a class
+    object passed as the transport.)
     """
 
     def __init__(self) -> None:

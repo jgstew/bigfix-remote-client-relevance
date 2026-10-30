@@ -196,6 +196,18 @@ class _Proxy:
         return lambda *args, **kwargs: None
 
 
+class _Slotted:
+    __slots__ = ("evaluate_client_relevance_batch", "evaluate_client_relevance_fanout")
+
+
+class _Registered:
+    pass
+
+
+FanOutTransport.register(_Registered)
+BatchTransport.register(_Registered)
+
+
 def _instance_assigned():
     transport = _Neither()
     transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
@@ -232,6 +244,9 @@ CAPABILITY_CASES = {
     # isinstance also asks __class__, which a spec'd mock reports as the spec.
     "MagicMock spec'd as one": (lambda: MagicMock(spec=_WithBoth), True),
     "__getattr__ proxy": (_Proxy, False),
+    # The slot's descriptor is on the class, so even unset it counts.
+    "__slots__, unset": (_Slotted, True),
+    "registered with the ABC": (_Registered, True),
 }
 
 
@@ -249,6 +264,52 @@ def test_capabilities_match_isinstance(case, protocol):
     assert check(transport) is expected
     if sys.version_info >= (3, 12):
         assert isinstance(transport, protocol) is expected
+
+
+def test_capabilities_explicit_protocol_subclass():
+    """Naming the protocols as bases inherits their stub methods."""
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    class Concrete(FanOutTransport, BatchTransport):
+        pass
+
+    transport = Concrete()  # pyright: ignore[reportAbstractUsage]
+    capabilities = _Capabilities()
+
+    assert capabilities.fan_out(transport) and capabilities.batch(transport)
+
+
+def test_capabilities_see_a_method_added_to_the_class_after_a_miss(monkeypatch):
+    """issubclass caches a miss for the whole process; isinstance doesn't stop
+    there (it looks at the class again), so a class patched to gain the
+    method -- as a test or a plugin might -- counts from the next run on."""
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    class Late:
+        pass
+
+    assert not _Capabilities().batch(Late())
+    assert not isinstance(Late(), BatchTransport)
+
+    monkeypatch.setattr(
+        Late,
+        "evaluate_client_relevance_batch",
+        _WithBoth.evaluate_client_relevance_batch,
+        raising=False,
+    )
+
+    assert isinstance(Late(), BatchTransport)
+    assert _Capabilities().batch(Late())
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="__protocol_attrs__ is 3.12+")
+@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+def test_capabilities_know_every_protocol_member(protocol):
+    """The cache checks one named method per protocol; a member added to the
+    protocol must be added there too, or the answers quietly drift."""
+    from bigfix_remote_client_relevance.orchestrate import _PROTOCOL_METHOD
+
+    assert set(protocol.__protocol_attrs__) == {_PROTOCOL_METHOD[protocol]}
 
 
 async def test_capabilities_are_worked_out_once_per_class_not_per_target(monkeypatch):
