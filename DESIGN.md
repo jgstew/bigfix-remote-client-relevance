@@ -1033,8 +1033,8 @@ bigfix-remote-client-relevance --setup-fastquery
   across runs on one loop, and an httpx transport per connection. It is
   evaluate-level, not per `Target`, so inventories and the result payload
   are unchanged. It applies through the default transport factory; with a
-  custom factory, passing it too is a `ValueError` (the factory would
-  silently drop the caller's trust policy), and `fastquery_transport()`
+  custom factory, passing it too with a `fastquery` target is a
+  `ValueError` (the factory would silently drop the caller's trust policy), and `fastquery_transport()`
   builds the same transport for that factory.
   **SaaS accounts that require MFA cannot be used from the CLI yet.** No
   TOTP prompt is passed to `SaasBackend` (a library caller can pass one in

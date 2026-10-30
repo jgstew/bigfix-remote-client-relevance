@@ -229,7 +229,9 @@ class SessionContext:
 
     prompt: Callable[[str], str] | None = None
     """Asks for a password missing from the connection, and a SaaS TOTP code.
-    None: never prompt."""
+    Called synchronously, on the event loop: a password once per target
+    that needs it (put it in the ``Config`` to ask once), a TOTP code once
+    per SaaS sign-in. None: never prompt."""
 
     saas_sessions: SaasSessionPool | None = None
     """Shares SaaS sign-ins across runs, e.g. for an app's lifetime. A SaaS
@@ -258,6 +260,8 @@ def fastquery_transport(
 
     from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
+    if target.kind != "fastquery":
+        raise ValueError(f"fastquery_transport got a {target.kind!r} target")
     ctx = session or SessionContext()
     conn = require_fastquery_connection(target.connection, config=ctx.config)
     # Never the session library's implicit TrustStore(): it warns, and in its
@@ -668,9 +672,13 @@ async def _evaluate_stream_indexed(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
-    if session is not None and transport_factory is not None:
+    if (
+        session is not None
+        and transport_factory is not None
+        and any(target.kind == "fastquery" for target in targets)
+    ):
         # The factory would never see it, so a trust policy the caller chose
-        # (deferred trust, say) would silently not apply.
+        # (deferred trust, say) would silently not apply to these targets.
         raise ValueError(
             "session applies to the default transport factory; a custom factory "
             "passes it on itself, e.g. fastquery_transport(target, session=session)"

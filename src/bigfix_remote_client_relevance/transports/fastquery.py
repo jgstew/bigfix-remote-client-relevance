@@ -135,7 +135,7 @@ class TransportFastQuery:
             one_computer_per_query: Send one query per computer instead of
                 one for all. ``None`` decides from the backend's target
                 limit (``client_query_max_targets``: 1 for a ``SaasBackend``,
-                none for REST). Decided before sending, never from the
+                none for REST); any integer limit means one per computer. Decided before sending, never from the
                 error: SaaS refuses several ids without sending anything,
                 so that error says nothing about the computers.
             host: What a result is reported under when no computer can be
@@ -149,9 +149,16 @@ class TransportFastQuery:
         if one_computer_per_query is None:
             from bigfix_remote_session_relevance import client_query_max_targets
 
+            try:
+                limit = client_query_max_targets(backend)
+            except TypeError:
+                # No ClientQuery API: constructing still works, as before
+                # 1.12, and the missing call fails as that host's result.
+                limit = None
             # Any limit means one per computer: no backend has a limit above
-            # one, so splitting into chunks of N would be untested code.
-            one_computer_per_query = client_query_max_targets(backend) is not None
+            # one, so splitting into chunks of N would be untested code. An
+            # int, so a mock backend's every-attribute-exists is no limit.
+            one_computer_per_query = isinstance(limit, int)
         self._one_computer_per_query = one_computer_per_query
         self._host = host
         self._clock = clock

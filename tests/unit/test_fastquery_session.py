@@ -579,7 +579,11 @@ def tls_server(tmp_path) -> Iterator[_TLSServer]:
     httpd = Server(("127.0.0.1", 0), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
-    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    # Handshake in the handler thread, not in accept(): a client that
+    # connects and stalls must not block serve_forever (and so shutdown).
+    httpd.socket = context.wrap_socket(
+        httpd.socket, server_side=True, do_handshake_on_connect=False
+    )
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -649,3 +653,52 @@ async def test_deferred_trust_refuses_then_runs_after_accept(tls_server, tmp_pat
 
     assert [(r.host, r.answers) for r in answered] == [("web", ["Linux"])]
     assert tls_server.seen and all(had_auth for _, _, had_auth in tls_server.seen)
+
+
+# --- review follow-ups -----------------------------------------------------
+
+
+async def test_a_session_with_a_custom_factory_is_fine_without_fastquery_targets():
+    """An app passing one shared session everywhere can still test its SSH
+    targets with a fake factory: there is no trust policy to drop."""
+    from bigfix_remote_client_relevance.results import ClientRelevanceResult
+
+    class Fake:
+        async def evaluate_client_relevance(self, rel, *, qna_path=None, qna=None, timeout_s=30.0):
+            return ClientRelevanceResult(
+                host="box", transport="fake", client_relevance=rel, answers=["yes"]
+            )
+
+    results = await evaluate_client_relevance(
+        "true",
+        [Target(kind="ssh", name="box")],
+        transport_factory=lambda t: Fake(),  # type: ignore[arg-type,return-value]
+        session=SessionContext(),
+    )
+
+    assert results[0].answers == ["yes"]
+
+
+def test_fastquery_transport_refuses_another_kind_of_target():
+    with pytest.raises(ValueError, match="'ssh' target"):
+        fastquery_transport(Target(kind="ssh", name="box"))
+
+
+def test_a_mock_backend_keeps_one_query_for_all():
+    """A MagicMock's every attribute is a non-None mock; that is not a limit."""
+    from unittest.mock import AsyncMock
+
+    transport = TransportFastQuery(AsyncMock(), computer_ids=[1, 2])
+
+    assert transport._one_computer_per_query is False
+
+
+def test_a_backend_without_the_client_query_api_still_constructs():
+    """As before 1.12: what it lacks fails when called, as that host's result."""
+
+    class Partial:
+        async def evaluate(self, session_relevance): ...
+
+    transport = TransportFastQuery(Partial(), computer_ids=[1])  # type: ignore[arg-type]
+
+    assert transport._one_computer_per_query is False
