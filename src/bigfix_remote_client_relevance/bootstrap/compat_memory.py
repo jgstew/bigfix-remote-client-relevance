@@ -28,6 +28,9 @@ APP_NAME = "bigfix_remote_client_relevance"
 
 DEFAULT_TTL_S = 30 * 24 * 60 * 60
 
+# Coarser than any common filesystem's timestamp tick (FAT's is 2 s).
+_RACY_NS = 3_000_000_000
+
 _FULL_VERSION = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
 
@@ -111,39 +114,50 @@ class CompatMemory:
     def _load_cached(self) -> dict[str, object]:
         try:
             stamp = _stamp(self._path.stat())
-        except OSError:
-            return {}  # missing, or no access: nothing remembered
+        except (OSError, ValueError):
+            return {}  # missing, no access, or no such path: nothing remembered
         if self._cached is not None and self._cached[0] == stamp:
             return self._cached[1]
-        # Stat before reading: if the file is replaced in between, the newer
-        # content sits under the older stamp and is simply re-read next time.
-        entries = self._load()
-        self._cached = (stamp, entries)
+        read = self._read()
+        if read is None:
+            return {}  # not cached, so a momentary lock is retried next time
+        st, entries = read
+        # git's "racily clean" rule: a rewrite within one timestamp tick, or a
+        # freed inode number reused within it, can leave the stamp unchanged,
+        # so a file that recent is re-read rather than trusted.
+        if abs(time.time_ns() - st.st_mtime_ns) > _RACY_NS:
+            self._cached = (_stamp(st), entries)
         return entries
 
     def _load(self) -> dict[str, object]:
+        read = self._read()
+        return read[1] if read is not None else {}
+
+    def _read(self) -> tuple[os.stat_result, dict[str, object]] | None:
+        # Stat and read one open file, so the stamp is for what was parsed
+        # even if another run replaces the file in between.
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            with self._path.open(encoding="utf-8") as handle:
+                st = os.fstat(handle.fileno())
+                data = json.loads(handle.read())
         except FileNotFoundError:
-            return {}
+            return None
         except (OSError, ValueError) as exc:
             logger.debug("ignoring unreadable compat memory %s: %s", self._path, exc)
-            return {}
-        return data if isinstance(data, dict) else {}
+            return None
+        return st, data if isinstance(data, dict) else {}
 
     def _save(self, entries: dict[str, object]) -> None:
         # Write-then-rename, so a concurrent reader never sees half a file.
+        # The next lookup re-reads: the partial name is shared by threads, so
+        # what lands at the path may not be exactly what this call wrote.
+        self._cached = None
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             partial = self._path.with_suffix(f".{os.getpid()}.partial")
             partial.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-            # Stamped before the rename, which keeps it: a concurrent run's
-            # write landing after ours has another stamp and is re-read.
-            stamp = _stamp(partial.stat())
             partial.replace(self._path)
-            self._cached = (stamp, entries)
-        except OSError as exc:
-            self._cached = None
+        except (OSError, ValueError) as exc:
             logger.debug("could not save compat memory %s: %s", self._path, exc)
 
 
