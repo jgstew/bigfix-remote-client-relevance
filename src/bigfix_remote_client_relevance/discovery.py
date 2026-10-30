@@ -44,6 +44,7 @@ from tomlkit.exceptions import ParseError
 
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.inventory import InventoryError, _target_from_entry
+from bigfix_remote_client_relevance.inventory_paths import find_inventory_path, user_inventory_path
 from bigfix_remote_client_relevance.orchestrate import Target, evaluate_client_relevance
 from bigfix_remote_client_relevance.platform_support import can_run_processes
 from bigfix_remote_client_relevance.results import ClientRelevanceResult
@@ -58,6 +59,7 @@ DISCOVERY_TIMEOUT_S = 300.0
 QNA_STREAM = "11.0"
 
 SUPPORTED_ARCHS = ("x86_64", "arm64")
+"""The arches qna ships builds for, in display order."""
 
 UBI10 = "registry.access.redhat.com/ubi10/ubi"
 UBI9 = "registry.access.redhat.com/ubi9/ubi"
@@ -123,6 +125,24 @@ class EngineImageSource:
             if entry.get("os") == "linux"
         }
         return archs & set(SUPPORTED_ARCHS)
+
+
+def published_arches(image: str, images: ImageSource | None) -> list[str]:
+    """The arches to run ``image`` as: every one ``images`` reports for its manifest.
+
+    :data:`SUPPORTED_ARCHS` first, in that order, then any other arch
+    ``images`` reports, sorted. Falls back to this machine's arch when there is no engine or the
+    registry can't be asked (offline, a local-only tag) -- the same rule
+    discovery applies to its container candidates. Blocking: it may ask a
+    registry.
+    """
+    published = images.platforms(image) if images is not None else None
+    if not published:
+        return [host_arch()]
+    # EngineImageSource already filters to what qna supports; SUPPORTED_ARCHS
+    # only orders the result, so an arch added there later still comes through.
+    known = [arch for arch in SUPPORTED_ARCHS if arch in published]
+    return known + sorted(published - set(SUPPORTED_ARCHS))
 
 
 class _Engine(Protocol):
@@ -337,6 +357,9 @@ class _Discovery:
         return False
 
     def _archs(self, image: str) -> set[str]:
+        # Not published_arches(): discovery falls back to its own (possibly
+        # overridden) arch rather than host_arch(), and an empty manifest here
+        # means "nothing qna can run", so the image is skipped, not tried.
         published = self._platforms.get(image)
         if published is None:
             return {self._arch}
@@ -566,15 +589,72 @@ def run_auto_discovery(path: Path, **kwargs: Any) -> list[str]:
     return added
 
 
+def find_or_discover_inventory(
+    *,
+    find: Callable[[], Path | None] | None = None,
+    user_path: Path | None = None,
+    discover: Callable[[Path], list[str]] | None = None,
+) -> Path | None:
+    """The inventory to use, running first-run auto-discovery when there is none.
+
+    The CLI's first-run rule, for every front end that shares this library's
+    inventory: discover only when :func:`find_inventory_path` finds nothing
+    and the per-user file (:func:`user_inventory_path`) doesn't exist yet.
+    Discovery always leaves that file behind (working hosts, or a
+    placeholder when none worked), so it never repeats on its own. Returns
+    the file found or written, or None when discovery wrote nothing. After a
+    fruitless discovery that file is the comment-only placeholder, on which
+    :func:`~...inventory.load_inventory` raises ``EmptyInventoryError``;
+    :func:`discover_into` is the retry. Raises
+    :class:`~...inventory.InventoryError` if the file can't be written.
+
+    Blocking -- discovery evaluates every candidate, may pull images, and
+    calls ``asyncio.run`` -- so call it from a worker thread inside an event
+    loop. The keywords are for tests and callers with their own discovery
+    wrapper; defaults are looked up per call, not bound at import.
+    """
+    found = (find or find_inventory_path)()
+    if found is not None:
+        return found
+    user_path = user_path if user_path is not None else user_inventory_path()
+    if not user_path.exists():
+        (discover or run_auto_discovery)(user_path)
+    return user_path if user_path.is_file() else None
+
+
+def discover_into(
+    path: Path | None = None,
+    *,
+    discover: Callable[[Path], list[str]] | None = None,
+) -> Path | None:
+    """Run auto-discovery into ``path`` (the per-user inventory by default).
+
+    Unlike :func:`find_or_discover_inventory`, it runs even when the file
+    exists: for a front end whose user has no client targets configured (an
+    inventory with no hosts, such as the placeholder a fruitless discovery
+    leaves). :func:`run_auto_discovery` only adds hosts missing from the
+    file. Blocking, like discovery itself. Returns ``path`` when it is a file
+    afterwards (possibly still the placeholder, if nothing worked). Raises
+    :class:`~...inventory.InventoryError` if ``path`` can't be written.
+    """
+    path = path if path is not None else user_inventory_path()
+    (discover or run_auto_discovery)(path)
+    return path if path.is_file() else None
+
+
 __all__ = [
     "PLACEHOLDER",
     "PROBE_RELEVANCE",
+    "SUPPORTED_ARCHS",
     "EngineImageSource",
     "ImageSource",
     "default_image_source",
     "discover",
+    "discover_into",
     "ensure_writable",
+    "find_or_discover_inventory",
     "host_name_for",
+    "published_arches",
     "read_existing",
     "run_auto_discovery",
     "write_discovered",

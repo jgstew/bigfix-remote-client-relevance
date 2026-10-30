@@ -127,7 +127,7 @@ wheels = [
 
 [[package]]
 name = "bigfix-remote-client-relevance"
-version = "1.10.1"
+version = "1.11.0"
 source = { editable = "." }
 dependencies = [
     { name = "asyncssh", marker = "sys_platform != 'android' and sys_platform != 'ios'" },

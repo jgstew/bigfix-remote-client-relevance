@@ -1298,6 +1298,70 @@ def test_first_run_without_any_inventory_auto_discovers(captured, tmp_path, monk
     assert {t.name for t in captured["targets"]} == {"local"}
 
 
+def test_first_run_goes_through_the_library_helper(captured, tmp_path, monkeypatch):
+    """The CLI's implicit first run is discovery.find_or_discover_inventory, the
+    same function other front ends call, so the two rules can't drift (#54)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    user_inventory = tmp_path / "home" / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    discovered: list = []
+    _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, discovered)
+    helper_calls: list = []
+    real_helper = cli_module.find_or_discover_inventory
+
+    def spy(**kwargs):
+        helper_calls.append(kwargs)
+        return real_helper(**kwargs)
+
+    monkeypatch.setattr(cli_module, "find_or_discover_inventory", spy)
+
+    result = invoke("name of operating system")
+
+    assert result.exit_code == 0, result.output
+    (call,) = helper_calls
+    assert call["user_path"] == user_inventory
+    # The CLI's own discovery wrapper (logging, InventoryError -> usage error)
+    # is what the helper runs.
+    assert discovered == [user_inventory]
+
+
+@pytest.mark.parametrize("flag", ["--auto-discovery", "--auto-discovery-ssh"])
+def test_auto_discovery_flag_skips_the_first_run_helper(captured, tmp_path, monkeypatch, flag):
+    # Either flag runs discovery explicitly; the implicit first run must not
+    # run it a second time.
+    user_inventory = tmp_path / "remote_clients.toml"
+    # The search path finds the file once the flag's discovery has written it.
+    monkeypatch.setattr(
+        cli_module,
+        "find_inventory_path",
+        lambda: user_inventory if user_inventory.exists() else None,
+    )
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
+    monkeypatch.setattr(cli_module, "_interactive", lambda: True)
+    found = {"local": {"transport": "local", "qna_version": []}}
+    calls: list = []
+    _fake_discovery(monkeypatch, found, calls)
+
+    def fake_ssh(path, *, ask, tell):
+        from bigfix_remote_client_relevance.discovery import write_discovered
+
+        calls.append(path)
+        return write_discovered(path, found)
+
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", fake_ssh)
+    monkeypatch.setattr(
+        cli_module,
+        "find_or_discover_inventory",
+        lambda **kwargs: pytest.fail(f"first-run helper ran alongside {flag}"),
+    )
+
+    result = invoke(flag, "name of operating system")
+
+    assert result.exit_code == 0, result.output
+    assert calls == [user_inventory]
+
+
 def test_first_run_discovering_nothing_is_still_a_usage_error(captured, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)

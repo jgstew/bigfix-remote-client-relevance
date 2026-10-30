@@ -242,3 +242,105 @@ def test_host_arch_reports_this_machine(monkeypatch):
     monkeypatch.setattr(platform_module, "machine", lambda: "aarch64")
 
     assert host_arch() == "arm64"
+
+
+# --- target_platform: a target's KNOWN_TARGETS key without connecting ---------
+#
+# Ported from bigfix-relevance-debugger's upstream/remote_client_relevance.py
+# (issue #54), which a front end uses to show each target's platform -- and
+# what can run there -- before evaluating anything.
+
+
+def _container(image, **kwargs):
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    return Target(kind="container", name=image, image=image, **kwargs)
+
+
+def _ssh(name, **kwargs):
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    return Target(kind="ssh", name=name, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("target", "platform"),
+    [
+        (_ssh("win", platform="windows"), "windows"),
+        (_ssh("pi", platform="raspbian"), "raspbian"),
+        (_ssh("sles", platform="suse"), "suse"),
+        (_ssh("unknown"), None),
+        (_container("debian:11"), "debian"),
+        (_container("ubuntu:24.04"), "ubuntu"),
+        (_container("almalinux:9"), "rhel"),
+        (_container("rockylinux:9"), "rhel"),
+        (_container("amazonlinux:2023"), "rhel"),
+        (_container("oraclelinux:9"), "rhel"),
+        (_container("fedora:41"), "rhel"),
+        (_container("centos:7"), "rhel"),
+        (_container("registry.access.redhat.com/ubi9/ubi"), "rhel"),
+        (_container("registry.access.redhat.com/ubi10/ubi:latest"), "rhel"),
+        (_container("opensuse/leap:15"), "suse"),
+        (_container("mystery:1"), None),
+        # An explicit platform beats the image name.
+        (_container("debian:11", platform="ubuntu"), "ubuntu"),
+    ],
+)
+def test_target_platform(target, platform):
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+
+    assert target_platform(target) == platform
+
+
+def test_target_platform_reads_the_name_when_no_image_is_set():
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    assert target_platform(Target(kind="container", name="debian:12")) == "debian"
+
+
+def test_target_platform_only_returns_known_bootstrap_keys():
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+
+    images = ["debian:11", "ubuntu:24.04", "almalinux:9", "opensuse/leap:15", "ubi9/ubi"]
+
+    for image in images:
+        assert target_platform(_container(image)) in KNOWN_TARGETS
+
+
+def test_target_platform_agrees_with_discovery_on_shared_distros():
+    """Two tables name the same distros: discovery's (distro -> deb/rpm family,
+    for picking one host per family) and this one (image token -> bootstrap
+    key). A distro discovery tries must land in the family it was tried for,
+    or a "debian-family" candidate would be provisioned with an rpm."""
+    from bigfix_remote_client_relevance import discovery
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+
+    family_of_key = {"ubuntu": "debian", "debian": "debian", "raspbian": "debian", "rhel": "rhel"}
+    for distro, family in discovery._FAMILY_OF_DISTRO.items():
+        platform = target_platform(_container(f"{distro}:1"))
+        assert platform is not None, distro
+        assert family_of_key[platform] == family, distro
+
+
+@pytest.mark.parametrize(
+    ("sys_platform", "platform"),
+    [("darwin", "macos"), ("win32", "windows"), ("linux", None), ("ios", None)],
+)
+def test_local_target_platform_is_this_machine(monkeypatch, sys_platform, platform):
+    # Linux needs the os-release probe the transport does anyway; iOS has no
+    # bootstrap key at all (no local qna there).
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    monkeypatch.setattr("sys.platform", sys_platform)
+
+    assert target_platform(Target(kind="local", name="local")) == platform
+
+
+@pytest.mark.parametrize("kind", ["fastquery", "online_evaluator"])
+def test_target_platform_is_unknown_for_remote_services(kind):
+    from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+    from bigfix_remote_client_relevance.orchestrate import Target
+
+    assert target_platform(Target(kind=kind, name="svc")) is None

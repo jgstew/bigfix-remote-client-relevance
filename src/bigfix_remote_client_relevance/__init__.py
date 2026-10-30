@@ -33,6 +33,12 @@ from a submodule is never required:
 * :func:`can_run_processes` — False on iOS, Android and WASM, where only the
   ``fastquery`` and ``online_evaluator`` transports can work, so a front end
   can offer just those.
+* :func:`target_platform`, :func:`published_arches` and
+  :data:`SUPPORTED_ARCHS` — a target's platform and an image's arches without
+  evaluating anything, for a front end that shows them up front.
+* :func:`find_or_discover_inventory` — the CLI's first-run rule (use the
+  inventory the search path finds, else auto-discover into the per-user one
+  once); :func:`discover_into` runs discovery again on demand. Both block.
 * :class:`BigFixRelevanceError` — one base for every exception the setup path
   (inventory loading, version resolution, artifact caching) can raise.
 """
@@ -43,6 +49,13 @@ import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
+from bigfix_remote_client_relevance.bootstrap.targets import target_platform
+from bigfix_remote_client_relevance.discovery import (
+    SUPPORTED_ARCHS,
+    discover_into,
+    find_or_discover_inventory,
+    published_arches,
+)
 from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
 from bigfix_remote_client_relevance.inventory import InventoryError, load_inventory
 from bigfix_remote_client_relevance.inventory_paths import find_inventory_path
@@ -113,6 +126,7 @@ __all__ = [
     "EXIT_TRANSPORT",
     "RESULT_JSON_SCHEMA",
     "SCHEMA_VERSION",
+    "SUPPORTED_ARCHS",
     "BigFixRelevanceError",
     "ClientRelevanceResult",
     "FanOutTransport",
@@ -129,18 +143,22 @@ __all__ = [
     "TransportSSH",
     "can_run_processes",
     "count_work",
+    "discover_into",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",
     "evaluate_many",
     "evaluate_many_stream",
     "find_inventory_path",
+    "find_or_discover_inventory",
     "find_qna_path",
     "format_result",
     "format_results",
     "load_inventory",
     "parse_qna_output",
+    "published_arches",
     "reclaim_stray_containers",
     "result_to_dict",
     "results_to_dicts",
+    "target_platform",
     "worst_exit_code",
 ]
