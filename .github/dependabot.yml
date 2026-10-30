@@ -6,7 +6,10 @@
 #
 # The 7-day cooldown is the point, not a courtesy: a release published minutes
 # ago is the likeliest to be a compromised one. It matches `exclude-newer` in
-# pyproject.toml and is zizmor's minimum.
+# pyproject.toml and is zizmor's minimum. The maintainer's own bigfix*
+# libraries (github.com/jgstew/bigfix*) are exempt, as in pyproject.toml's
+# `exclude-newer-package`: named one by one, since a "bigfix-*" wildcard would
+# also exempt anyone else's package with that prefix.
 version: 2
 updates:
   # "uv", not "pip": uv.lock is what the release wheel is built from
@@ -18,6 +21,8 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
+      exclude:
+        - "bigfix-remote-session-relevance"
     open-pull-requests-limit: 5
     labels:
       - "dependencies"

@@ -50,8 +50,15 @@ from bigfix_remote_client_relevance.transports import ssh as ssh_transport
 from bigfix_remote_client_relevance.transports.batch import chunk_expressions
 
 if TYPE_CHECKING:
-    from bigfix_remote_session_relevance import ConnectionConfig
-    from bigfix_remote_session_relevance.backends.saas import SaasSessionPool
+    import httpx
+    from bigfix_remote_session_relevance import (
+        Config,
+        ConnectionConfig,
+        SaasSessionPool,
+        TrustPolicy,
+    )
+
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
 
 logger = logging.getLogger(__name__)
 
@@ -194,18 +201,110 @@ TransportFactory = Callable[[Target], Transport]
 Resolver = Callable[[str | None, Target], Coroutine[Any, Any, ResolvedQna]]
 
 
+@dataclass(frozen=True, kw_only=True)
+class SessionContext:
+    """How Fast Query targets reach their BigFix server.
+
+    For a front end that holds its own connections, trust store, prompt and
+    SaaS sign-ins (an app with no config file, a password from a keychain, a
+    "Trust this certificate?" dialog) instead of the session library's config
+    file. Every field is optional; an empty context is exactly the default.
+    Only ``fastquery`` targets use it, and only through the default transport
+    factory or :func:`fastquery_transport`.
+    """
+
+    config: Config | None = None
+    """Where ``Target.connection`` is looked up. None: the session library's
+    ``load_config()`` (its config file, else ``BES_*`` / ``~/.besapi.conf``)."""
+
+    trust: TrustPolicy | None = None
+    """Certificate trust for REST connections. None: an explicit
+    ``TrustStore(trust_on_first_use="auto")``, which pins a first-use
+    certificate without asking, as the CLI always has. A front end passes a
+    ``TrustStore`` with a callback to ask, or with
+    ``trust_on_first_use=False`` for deferred trust: the result is then a
+    transport error naming host:port and the fingerprint, the certificate is
+    in ``TrustStore.pending``, and after ``TrustStore.accept(host_port)`` the
+    same target runs."""
+
+    prompt: Callable[[str], str] | None = None
+    """Asks for a password missing from the connection, and a SaaS TOTP code.
+    Called synchronously, on the event loop: a password once per target
+    that needs it (put it in the ``Config`` to ask once), a TOTP code once
+    per SaaS sign-in. None: never prompt."""
+
+    saas_sessions: SaasSessionPool | None = None
+    """Shares SaaS sign-ins across runs, e.g. for an app's lifetime. A SaaS
+    session belongs to the event loop it signed in on, so share a pool only
+    between runs on one loop. None: one pool per run."""
+
+    http_transport: Callable[[ConnectionConfig], httpx.AsyncBaseTransport | None] | None = None
+    """The httpx transport for each connection, for tests and proxies. A
+    custom transport bypasses certificate pinning (the session library
+    applies trust only to its own TLS). None: the session library's own."""
+
+
+def fastquery_transport(
+    target: Target,
+    *,
+    session: SessionContext | None = None,
+    saas_sessions: SaasSessionPool | None = None,
+) -> TransportFastQuery:
+    """The Fast Query transport for a ``fastquery`` target.
+
+    What :func:`default_transport_factory` builds, for a caller with its own
+    factory. ``session`` says where the connection and its trust come from;
+    ``saas_sessions``, when given, wins over the session's pool.
+    """
+    from bigfix_remote_session_relevance import SaasBackend, TrustStore, backend_from_config
+
+    from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
+
+    if target.kind != "fastquery":
+        raise ValueError(f"fastquery_transport got a {target.kind!r} target")
+    ctx = session or SessionContext()
+    conn = require_fastquery_connection(target.connection, config=ctx.config)
+    # Never the session library's implicit TrustStore(): it warns, and in its
+    # 2.0 it refuses first-use certificates this has always accepted.
+    trust = ctx.trust if ctx.trust is not None else TrustStore(trust_on_first_use="auto")
+    # Not entered as a context manager: the transport owns it from here,
+    # and the fan-out's _release closes it through TransportFastQuery.aclose.
+    # The transport reads the backend's target limit (SaaS: one computer).
+    backend = backend_from_config(
+        conn,
+        trust=trust,
+        prompt=ctx.prompt,
+        transport=ctx.http_transport(conn) if ctx.http_transport is not None else None,
+    )
+    pool = saas_sessions if saas_sessions is not None else ctx.saas_sessions
+    if isinstance(backend, SaasBackend) and pool is not None:
+        # One login and one cached failure per account, not per target:
+        # 100 failed SaaS logins lock the account for good.
+        pool.attach(backend)
+    return TransportFastQuery(
+        backend,  # type: ignore[arg-type]  # require_fastquery_connection: REST or SaaS
+        computer_ids=target.computer_ids,
+        computer_query=target.computer_query,
+        use_client_context=target.use_client_context,
+        host=target.name,
+    )
+
+
 def default_transport_factory(
     target: Target,
     *,
     coordinator: object | None = None,
     saas_sessions: SaasSessionPool | None = None,
+    session: SessionContext | None = None,
 ) -> Transport:
     """Build the transport a target calls for.
 
     ``coordinator`` is how a fan-out shares image work between the transports
-    it builds, and ``saas_sessions`` how its SaaS Fast Query targets share one
-    sign-in per account; both are keyword-only and optional so the
-    one-argument :data:`TransportFactory` signature still holds.
+    it builds, ``saas_sessions`` how its SaaS Fast Query targets share one
+    sign-in per account, and ``session`` where Fast Query connections and
+    their trust come from (:class:`SessionContext`); all are keyword-only
+    and optional so the one-argument :data:`TransportFactory` signature
+    still holds.
     """
     if target.kind == "local":
         from bigfix_remote_client_relevance.transports.local import TransportLocal
@@ -274,27 +373,7 @@ def default_transport_factory(
             coordinator=coordinator,  # type: ignore[arg-type]
         )
     if target.kind == "fastquery":
-        from bigfix_remote_session_relevance import RestBackend, SaasBackend, TrustStore
-
-        from bigfix_remote_client_relevance.transports.fastquery import TransportFastQuery
-
-        conn = require_fastquery_connection(target.connection)
-        backend_class = SaasBackend if conn.backend == "saas" else RestBackend
-        # Not entered as a context manager: the transport owns it from here,
-        # and the fan-out's _release closes it through TransportFastQuery.aclose.
-        # The transport sees a SaasBackend and sends one query per computer.
-        backend = backend_class.from_config(conn, trust=TrustStore())
-        if isinstance(backend, SaasBackend) and saas_sessions is not None:
-            # One login and one cached failure per account, not per target:
-            # 100 failed SaaS logins lock the account for good.
-            saas_sessions.attach(backend)
-        return TransportFastQuery(
-            backend,
-            computer_ids=target.computer_ids,
-            computer_query=target.computer_query,
-            use_client_context=target.use_client_context,
-            host=target.name,
-        )
+        return fastquery_transport(target, session=session, saas_sessions=saas_sessions)
     if target.kind == "online_evaluator":
         from bigfix_remote_client_relevance.transports.online_evaluator import (
             TransportOnlineEvaluator,
@@ -314,23 +393,27 @@ SETUP_FASTQUERY_ADVICE = "run --setup-fastquery to add a REST or SaaS connection
 FASTQUERY_BACKENDS = frozenset({"rest", "saas"})
 
 
-def require_fastquery_connection(name: str | None) -> ConnectionConfig:
+def require_fastquery_connection(
+    name: str | None, *, config: Config | None = None
+) -> ConnectionConfig:
     """The enabled connection called ``name``, if Fast Query can use it.
 
-    Otherwise raises ``ValueError`` saying which of unknown, disabled, or
-    the wrong backend it is: "none found" for a SaaS connection that plainly
-    exists sent the user hunting for a config problem they did not have.
+    Looked up in ``config``, or the session library's ``load_config()`` when
+    None. Otherwise raises ``ValueError`` saying which of unknown, disabled,
+    or the wrong backend it is: "none found" for a SaaS connection that
+    plainly exists sent the user hunting for a config problem they did not have.
     """
     from bigfix_remote_session_relevance import ConfigError, load_config
 
     if not name:
         raise ValueError(f"Fast Query needs a connection; {SETUP_FASTQUERY_ADVICE}")
-    try:
-        config = load_config()
-    except ConfigError as exc:
-        # No setup advice: the wizard would have to read this same file, so
-        # the cause is the whole message -- fixing the file is the fix.
-        raise ValueError(f"cannot read the connection config for Fast Query ({exc})") from exc
+    if config is None:
+        try:
+            config = load_config()
+        except ConfigError as exc:
+            # No setup advice: the wizard would have to read this same file, so
+            # the cause is the whole message -- fixing the file is the fix.
+            raise ValueError(f"cannot read the connection config for Fast Query ({exc})") from exc
     try:
         conn = config.connection(name)
     except ConfigError as exc:
@@ -567,6 +650,7 @@ async def _evaluate_stream_indexed(
     compat_memory: CompatMemory | None = None,
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    session: SessionContext | None = None,
 ) -> AsyncIterator[tuple[tuple[int, int], ClientRelevanceResult]]:
     """Shared core: yield ``((work_index, sub), result)`` as each result lands.
 
@@ -588,6 +672,17 @@ async def _evaluate_stream_indexed(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    if (
+        session is not None
+        and transport_factory is not None
+        and any(target.kind == "fastquery" for target in targets)
+    ):
+        # The factory would never see it, so a trust policy the caller chose
+        # (deferred trust, say) would silently not apply to these targets.
+        raise ValueError(
+            "session applies to the default transport factory; a custom factory "
+            "passes it on itself, e.g. fastquery_transport(target, session=session)"
+        )
 
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
@@ -596,14 +691,17 @@ async def _evaluate_stream_indexed(
 
         coordinator = ImageCoordinator()
         # Likewise one SaaS session pool per run (not per process: a session
-        # is tied to the run's event loop and should not outlive it).
-        from bigfix_remote_session_relevance.backends.saas import SaasSessionPool
+        # is tied to the run's event loop and should not outlive it), unless
+        # the caller's session brings one it keeps on its own loop.
+        saas_sessions = session.saas_sessions if session is not None else None
+        if saas_sessions is None:
+            from bigfix_remote_session_relevance import SaasSessionPool
 
-        saas_sessions = SaasSessionPool()
+            saas_sessions = SaasSessionPool()
 
         def _default_transport_factory(target: Target) -> Transport:
             return default_transport_factory(
-                target, coordinator=coordinator, saas_sessions=saas_sessions
+                target, coordinator=coordinator, saas_sessions=saas_sessions, session=session
             )
 
         transport_factory = _default_transport_factory
@@ -1211,6 +1309,7 @@ async def evaluate_client_relevance_stream(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
+    session: SessionContext | None = None,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate ``client_relevance`` on every target, for every version.
 
@@ -1232,6 +1331,7 @@ async def evaluate_client_relevance_stream(
         resolver=resolver,
         previous_version=previous_version,
         compat_memory=compat_memory,
+        session=session,
     ):
         yield result
 
@@ -1248,6 +1348,7 @@ async def evaluate_client_relevance(
     resolver: Resolver | None = None,
     previous_version: PreviousVersion | None = None,
     compat_memory: CompatMemory | None = None,
+    session: SessionContext | None = None,
 ) -> list[ClientRelevanceResult]:
     """Evaluate ``client_relevance`` on every target, for every version.
 
@@ -1270,6 +1371,7 @@ async def evaluate_client_relevance(
         resolver=resolver,
         previous_version=previous_version,
         compat_memory=compat_memory,
+        session=session,
     ):
         by_index[index] = result
     return [by_index[key] for key in sorted(by_index)]
@@ -1289,6 +1391,7 @@ async def evaluate_many_stream(
     compat_memory: CompatMemory | None = None,
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    session: SessionContext | None = None,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate every expression on every target, for every version.
 
@@ -1308,6 +1411,7 @@ async def evaluate_many_stream(
         compat_memory=compat_memory,
         batch=batch,
         batch_size=batch_size,
+        session=session,
     ):
         yield result
 
@@ -1326,6 +1430,7 @@ async def evaluate_many(
     compat_memory: CompatMemory | None = None,
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    session: SessionContext | None = None,
 ) -> list[ClientRelevanceResult]:
     """Evaluate several expressions across several targets in one pass.
 
@@ -1375,6 +1480,7 @@ async def evaluate_many(
         compat_memory=compat_memory,
         batch=batch,
         batch_size=batch_size,
+        session=session,
     ):
         by_index[index] = result
     return [by_index[i] for i in sorted(by_index)]
@@ -1402,6 +1508,7 @@ __all__ = [
     "EXIT_TRANSPORT",
     "PreviousVersion",
     "Resolver",
+    "SessionContext",
     "Target",
     "TransportFactory",
     "count_work",
@@ -1412,5 +1519,6 @@ __all__ = [
     "evaluate_client_relevance_stream",
     "evaluate_many",
     "evaluate_many_stream",
+    "fastquery_transport",
     "worst_exit_code",
 ]

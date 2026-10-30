@@ -1015,16 +1015,30 @@ bigfix-remote-client-relevance --setup-fastquery
   unknown, disabled, or a backend without ClientQuery (e.g. "connection
   'x' is a webreports connection, and Fast Query only works through REST
   or SaaS; run --setup-fastquery to add a REST or SaaS connection"). A
-  `rest` connection builds a `RestBackend`, a `saas` one a `SaasBackend`.
-  The SaaS backends of one run share a session per account through one
+  connection's backend is built with session-relevance's
+  `backend_from_config` (`rest`: `RestBackend`, `saas`: `SaasBackend`), and
+  `TransportFastQuery` sends one query per computer when the backend's
+  `client_query_max_targets` is set (SaaS: 1; REST: none). Trust is always
+  explicit: `TrustStore(trust_on_first_use="auto")` by default, never the
+  bare `TrustStore()`, which warns in session-relevance 1.x and refuses
+  first-use certificates in 2.0; the test suite turns that warning into an
+  error. The SaaS backends of one run share a session per account through one
   `SaasSessionPool` (made per run, like the image coordinator; a session
   holds an `asyncio.Lock`, so it cannot outlive the run's event loop): one
   login and one cached failure for all of an account's targets, since 100
-  failed SaaS logins lock the account for good. `SaasSessionPool` is not
-  exported from session-relevance's top level, so it is imported from
-  `bigfix_remote_session_relevance.backends.saas`.
-  **SaaS accounts that require MFA cannot be used yet.** No TOTP prompt is
-  passed to `SaasBackend`, so the sign-in fails with session-relevance's
+  failed SaaS logins lock the account for good.
+  **`SessionContext`** (library only; the CLI passes none) replaces each
+  of those defaults for a front end: the `Config` connections are looked up
+  in, the `TrustPolicy`, a password/TOTP `prompt`, a `SaasSessionPool` kept
+  across runs on one loop, and an httpx transport per connection. It is
+  evaluate-level, not per `Target`, so inventories and the result payload
+  are unchanged. It applies through the default transport factory; with a
+  custom factory, passing it too with a `fastquery` target is a
+  `ValueError` (the factory would silently drop the caller's trust policy), and `fastquery_transport()`
+  builds the same transport for that factory.
+  **SaaS accounts that require MFA cannot be used from the CLI yet.** No
+  TOTP prompt is passed to `SaasBackend` (a library caller can pass one in
+  `SessionContext.prompt`), so the sign-in fails with session-relevance's
   "this account requires a TOTP code (MFA); run interactively to enter it"
   in every computer's `transport` result ("Fast Query submit failed: …"),
   on every run, however it is run. `--setup-fastquery` still saves such an account, because the wizard
