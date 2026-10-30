@@ -92,6 +92,7 @@ from bigfix_remote_client_relevance.discovery import (
 from bigfix_remote_client_relevance.inventory import _target_from_entry
 from bigfix_remote_client_relevance.orchestrate import evaluate_client_relevance
 from bigfix_remote_client_relevance.results import ERROR_KIND_TRANSPORT
+from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
 
 logger = logging.getLogger(__name__)
 
@@ -1191,6 +1192,11 @@ def run_ssh_discovery(
     reply); ``tell`` shows a line. ``mdns_window_s`` of 0 skips mDNS.
     Returns the inventory names added.
     """
+    # Before reading anything or prompting: no host found could be tested.
+    unavailable = ssh_unavailable_reason()
+    if unavailable is not None:
+        tell(f"SSH discovery skipped: {unavailable}")
+        return []
     ensure_writable(path)
     defaults, existing = read_existing(path)
     ssh_dir = ssh_dir if ssh_dir is not None else Path.home() / ".ssh"

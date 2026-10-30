@@ -219,6 +219,14 @@ Files in the repo are the source of truth; this section explains *why*.
   `typer` (CLI), plus `requests`, `beautifulsoup4` and `platformdirs` added
   when the release-site scraper and controller cache landed. `tomllib` is
   stdlib at the 3.11 floor, so the inventory loader needs no TOML package.
+  On iOS and Android (`sys_platform` `ios` / `android`, Python 3.13+)
+  markers leave out `asyncssh`, whose `cryptography` has no wheels there,
+  and `zstandard`; no extras, so plain `uvx` keeps SSH. Only `fastquery`
+  and `online_evaluator` can work there: `ssh` reports the missing
+  asyncssh as a `transport` result, and `platform_support.can_run_processes()`
+  keeps `local` (and discovery's local and container candidates) from
+  resolving or downloading qna that could never start. The `mobile-resolve`
+  CI job checks both platforms keep resolving wheels-only.
 - **Dependency quarantine — 7 days** (`[tool.uv] exclude-newer = "-P7D"`).
   Resolution ignores any distribution uploaded in the last week. The
   window is a supply-chain measure: the common failure modes of a fresh

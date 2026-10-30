@@ -30,6 +30,15 @@ Or run it without installing:
 uvx bigfix-remote-client-relevance --container ubuntu:22.04 --qna-version 11.0 "name of operating system"
 ```
 
+**iOS and Android** (Python 3.13+, e.g. an app embedding Python): the package
+installs there too, with no extra steps, but only the `fastquery` and
+`online_evaluator` transports work. `ssh`, `container` and `local` don't:
+`asyncssh` (whose `cryptography` has no iOS/Android wheels) is left out of
+those installs, and neither platform can run qna. Those targets come back as
+`transport` errors naming the platform rather than failing the run, and
+auto-discovery only tries the online evaluator. `can_run_processes()` tells a
+front end which case it is in.
+
 ## Use
 
 Evaluate on a container, provisioning a pinned qna version on the fly — no

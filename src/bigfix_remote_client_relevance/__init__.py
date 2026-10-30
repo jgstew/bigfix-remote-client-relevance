@@ -30,6 +30,9 @@ from a submodule is never required:
   :data:`RESULT_JSON_SCHEMA` — the JSON wire shape and its schema.
 * :func:`format_result` / :func:`format_results` — the same human-readable text
   the CLI prints, without the CLI's dependencies.
+* :func:`can_run_processes` — False on iOS, Android and WASM, where only the
+  ``fastquery`` and ``online_evaluator`` transports can work, so a front end
+  can offer just those.
 * :class:`BigFixRelevanceError` — one base for every exception the setup path
   (inventory loading, version resolution, artifact caching) can raise.
 """
@@ -57,6 +60,7 @@ from bigfix_remote_client_relevance.orchestrate import (
     evaluate_many_stream,
     worst_exit_code,
 )
+from bigfix_remote_client_relevance.platform_support import can_run_processes
 from bigfix_remote_client_relevance.qna_paths import find_qna_path
 from bigfix_remote_client_relevance.render import format_result, format_results
 from bigfix_remote_client_relevance.results import (
@@ -123,6 +127,7 @@ __all__ = [
     "TransportLocal",
     "TransportOnlineEvaluator",
     "TransportSSH",
+    "can_run_processes",
     "count_work",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",

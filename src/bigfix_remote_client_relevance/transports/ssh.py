@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import logging
 import shlex
+import sys
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -193,6 +194,22 @@ def connect_kwargs(
     return kwargs
 
 
+def ssh_unavailable_reason() -> str | None:
+    """Why the ssh transport can't connect from here; ``None`` when it can.
+
+    iOS and Android installs leave asyncssh out: its cryptography dependency
+    has no wheels there (see pyproject.toml).
+    """
+    try:
+        import asyncssh  # noqa: F401 - only checking that it imports
+    except ImportError:
+        return (
+            f"the ssh transport needs asyncssh, which isn't installed here ({sys.platform}); "
+            "use fastquery or online_evaluator instead"
+        )
+    return None
+
+
 async def _connect(
     host: str,
     user: str | None,
@@ -201,6 +218,11 @@ async def _connect(
     *,
     verify_host_key: bool = True,
 ) -> SSHRunner:
+    # An SSHConnectionError, not the ImportError, so it reaches the caller as
+    # an ordinary transport result that says what to use instead.
+    unavailable = ssh_unavailable_reason()
+    if unavailable is not None:
+        raise SSHConnectionError(unavailable)
     import asyncssh
 
     if not verify_host_key:
@@ -598,4 +620,10 @@ class TransportSSH:
         return command
 
 
-__all__ = ["PREREQ_PROBE_MARKER", "SSHConnectionError", "SSHRunner", "TransportSSH"]
+__all__ = [
+    "PREREQ_PROBE_MARKER",
+    "SSHConnectionError",
+    "SSHRunner",
+    "TransportSSH",
+    "ssh_unavailable_reason",
+]

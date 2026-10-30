@@ -55,3 +55,45 @@ jobs:
       # auto-skip here (see tests/conftest.py).
       - name: Test
         run: uv run pytest -q -rs
+
+  # iOS and Android installs leave asyncssh (no cryptography wheels there) and
+  # zstandard out via markers in pyproject.toml. This keeps both resolving
+  # wheels-only, and desktop still getting asyncssh. Resolution only: nothing
+  # is installed and no simulator runs. `uv pip compile` reads [tool.uv] from
+  # pyproject.toml, so exclude-newer applies here as it does to uv.lock.
+  mobile-resolve:
+    name: resolves for iOS and Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # `if grep` rather than `! grep`: bash's errexit ignores a negated
+      # command, so `! grep` could never fail the step.
+      - name: iOS and Android resolve, without asyncssh, cryptography or zstandard
+        run: |
+          set -euo pipefail
+          for plat in arm64-apple-ios arm64-apple-ios-simulator aarch64-linux-android; do
+            for py in 3.13 3.15; do
+              echo "== $plat / $py"
+              uv pip compile pyproject.toml --quiet --no-header \
+                --python-version "$py" --python-platform "$plat" --only-binary :all: \
+                > "$RUNNER_TEMP/req-$plat-$py.txt"
+              if grep -E '^(asyncssh|cryptography|zstandard)==' "$RUNNER_TEMP/req-$plat-$py.txt"; then
+                echo "::error::$plat / $py resolved a package that has no wheels there"
+                exit 1
+              fi
+            done
+          done
+
+      - name: Desktop still gets asyncssh
+        run: |
+          set -euo pipefail
+          for plat in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            echo "== $plat"
+            uv pip compile pyproject.toml --quiet --no-header --python-version 3.13 \
+              --python-platform "$plat" | grep '^asyncssh=='
+          done
