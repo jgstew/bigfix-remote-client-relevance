@@ -517,6 +517,10 @@ async def _evaluate_stream_indexed(
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
 
+    # Only this library's own TransportSSH needs asyncssh, so only then does
+    # the early ssh guard below apply. A caller's factory owns its transport;
+    # checking for it imported asyncssh (~65 ms) on every process's first run.
+    own_ssh_transport = transport_factory is None
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
         # work with each other and with nothing else.
@@ -596,7 +600,7 @@ async def _evaluate_stream_indexed(
         unavailable: str | None = None
         if target.kind in ("local", "container") and not can_run_processes():
             unavailable = no_process_advice(f"the {target.kind} transport")
-        elif target.kind == "ssh":
+        elif target.kind == "ssh" and own_ssh_transport:
             from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
 
             unavailable = ssh_unavailable_reason()
