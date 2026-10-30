@@ -8,7 +8,10 @@ version), bounded concurrency, and one version resolution per run.
 from __future__ import annotations
 
 import asyncio
+import builtins
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,6 +26,7 @@ from bigfix_remote_client_relevance.orchestrate import (
     default_transport_factory,
     evaluate_client_relevance,
     evaluate_client_relevance_stream,
+    evaluate_many,
     worst_exit_code,
 )
 from bigfix_remote_client_relevance.results import (
@@ -34,6 +38,7 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
+from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport
 
 
 class FakeTransport:
@@ -78,6 +83,260 @@ def make_resolver(mapping=None, counter=None):
 
 
 SSH_TARGETS = [Target(kind="ssh", name=f"host{i}") for i in range(3)]
+
+
+# --- the ssh availability guard ---------------------------------------------
+
+
+async def test_own_transport_factory_never_imports_asyncssh(monkeypatch):
+    """The early ssh guard is for this library's own TransportSSH, which
+    imports asyncssh when it connects anyway. A caller's own transport_factory
+    owns its transport: importing asyncssh for it cost ~65 ms on the first
+    evaluation in every process (1.10.0), for a dependency it never used."""
+    real_import = builtins.__import__
+    attempts: list[str] = []
+
+    def guarded(name, *args, **kwargs):
+        if name.split(".")[0] == "asyncssh":
+            attempts.append(name)
+            raise ImportError("asyncssh is blocked in this test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+    results = await evaluate_client_relevance(
+        "true",
+        SSH_TARGETS,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert attempts == []
+    assert [(r.host, r.error) for r in results] == [(t.name, None) for t in SSH_TARGETS]
+
+
+async def test_own_transport_factory_runs_ssh_targets_where_asyncssh_is_missing(monkeypatch):
+    """Without asyncssh (iOS, Android), a caller that brings its own ssh-kind
+    transport still gets it run; only the library's TransportSSH needs asyncssh."""
+    from bigfix_remote_client_relevance.transports import ssh as ssh_module
+
+    monkeypatch.setattr(ssh_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
+
+    results = await evaluate_client_relevance(
+        "true",
+        SSH_TARGETS,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert [r.error for r in results] == [None] * len(SSH_TARGETS)
+
+
+@pytest.mark.parametrize("wrap", [False, True], ids=["as-is", "wrapped"])
+async def test_library_ssh_transport_still_guarded_through_an_explicit_factory(monkeypatch, wrap):
+    """default_transport_factory is public, and wrapping it is natural; its
+    TransportSSH needs asyncssh however it was reached. With platform and arch
+    known no probe runs first, so without the guard the resolver would
+    download an agent package before the connection failed (the 1.10.0 bug)."""
+    from bigfix_remote_client_relevance.transports import ssh as ssh_module
+
+    monkeypatch.setattr(ssh_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
+
+    async def never_resolve(spec, target):
+        pytest.fail("resolved a version for a transport that can't connect")
+
+    factory = (lambda t: default_transport_factory(t)) if wrap else default_transport_factory
+    target = Target(
+        kind="ssh", name="host.example", qna_version="11.0", platform="ubuntu", arch="arm64"
+    )
+
+    (result,) = await evaluate_client_relevance(
+        "true", [target], transport_factory=factory, resolver=never_resolve
+    )
+
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.error == "host.example: no asyncssh here"
+
+
+# --- optional transport capabilities ----------------------------------------
+#
+# _group asks every transport whether it is a FanOutTransport / BatchTransport.
+# isinstance() against a runtime_checkable Protocol costs ~1.8 us per miss on
+# 3.12+ (inspect.getattr_static per call), paid per target on every run; the
+# run's capability cache answers from the class once instead. It keeps
+# 3.12+'s isinstance semantics on every Python, 3.11 included, where
+# isinstance is hasattr-based and a MagicMock looked like both.
+
+
+class _WithBoth:
+    async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+        return []
+
+    async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
+        return None
+
+
+class _Neither:
+    pass
+
+
+class _SubOfBoth(_WithBoth):
+    pass
+
+
+class _DisabledOnClass:
+    evaluate_client_relevance_fanout = None
+    evaluate_client_relevance_batch = None
+
+
+class _Proxy:
+    """Answers any attribute through __getattr__, as a remote proxy might."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+class _Slotted:
+    __slots__ = ("evaluate_client_relevance_batch", "evaluate_client_relevance_fanout")
+
+
+class _Registered:
+    pass
+
+
+FanOutTransport.register(_Registered)
+BatchTransport.register(_Registered)
+
+
+def _instance_assigned():
+    transport = _Neither()
+    transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
+    transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    return transport
+
+
+def _instance_none_over_class():
+    transport = _WithBoth()
+    transport.evaluate_client_relevance_fanout = None
+    transport.evaluate_client_relevance_batch = None
+    return transport
+
+
+def _assigned_over_disabled_class():
+    transport = _DisabledOnClass()
+    transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
+    transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    return transport
+
+
+# (make transport, expected for both protocols) -- expected is what
+# isinstance() answers on Python 3.12+.
+CAPABILITY_CASES = {
+    "method on the class": (_WithBoth, True),
+    "subclass": (_SubOfBoth, True),
+    "no method": (_Neither, False),
+    "method assigned on the instance": (_instance_assigned, True),
+    # The class answers first, so an instance None doesn't hide its method.
+    "instance None over a class method": (_instance_none_over_class, True),
+    "None on the class": (_DisabledOnClass, False),
+    "instance method over None on the class": (_assigned_over_disabled_class, True),
+    "MagicMock": (MagicMock, False),
+    # isinstance also asks __class__, which a spec'd mock reports as the spec.
+    "MagicMock spec'd as one": (lambda: MagicMock(spec=_WithBoth), True),
+    "__getattr__ proxy": (_Proxy, False),
+    # The slot's descriptor is on the class, so even unset it counts.
+    "__slots__, unset": (_Slotted, True),
+    "registered with the ABC": (_Registered, True),
+}
+
+
+@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+@pytest.mark.parametrize("case", CAPABILITY_CASES)
+def test_capabilities_match_isinstance(case, protocol):
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    make, expected = CAPABILITY_CASES[case]
+    transport = make()
+
+    capabilities = _Capabilities()
+    check = {FanOutTransport: capabilities.fan_out, BatchTransport: capabilities.batch}[protocol]
+
+    assert check(transport) is expected
+    if sys.version_info >= (3, 12):
+        assert isinstance(transport, protocol) is expected
+
+
+def test_capabilities_explicit_protocol_subclass():
+    """Naming the protocols as bases inherits their stub methods."""
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    class Concrete(FanOutTransport, BatchTransport):
+        pass
+
+    transport = Concrete()  # pyright: ignore[reportAbstractUsage]
+    capabilities = _Capabilities()
+
+    assert capabilities.fan_out(transport) and capabilities.batch(transport)
+
+
+def test_capabilities_see_a_method_added_to_the_class_after_a_miss(monkeypatch):
+    """issubclass caches a miss for the whole process; isinstance doesn't stop
+    there (it looks at the class again), so a class patched to gain the
+    method -- as a test or a plugin might -- counts from the next run on."""
+    from bigfix_remote_client_relevance.orchestrate import _Capabilities
+
+    class Late:
+        pass
+
+    assert not _Capabilities().batch(Late())
+    assert not isinstance(Late(), BatchTransport)
+
+    monkeypatch.setattr(
+        Late,
+        "evaluate_client_relevance_batch",
+        _WithBoth.evaluate_client_relevance_batch,
+        raising=False,
+    )
+
+    assert isinstance(Late(), BatchTransport)
+    assert _Capabilities().batch(Late())
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="__protocol_attrs__ is 3.12+")
+@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+def test_capabilities_know_every_protocol_member(protocol):
+    """The cache checks one named method per protocol; a member added to the
+    protocol must be added there too, or the answers quietly drift."""
+    from bigfix_remote_client_relevance.orchestrate import _PROTOCOL_METHOD
+
+    assert set(protocol.__protocol_attrs__) == {_PROTOCOL_METHOD[protocol]}
+
+
+async def test_capabilities_are_worked_out_once_per_class_not_per_target(monkeypatch):
+    from bigfix_remote_client_relevance import orchestrate as orchestrate_module
+
+    asked: list[tuple[type, type]] = []
+    real = orchestrate_module._class_implements
+
+    def counting(cls, protocol):
+        asked.append((cls, protocol))
+        return real(cls, protocol)
+
+    monkeypatch.setattr(orchestrate_module, "_class_implements", counting)
+    targets = [Target(kind="ssh", name=f"host{i}") for i in range(50)]
+
+    results = await evaluate_many(
+        ["true", "false"],
+        targets,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
+    )
+
+    assert len(results) == 100
+    assert sorted(asked, key=lambda pair: pair[1].__name__) == [
+        (FakeTransport, BatchTransport),
+        (FakeTransport, FanOutTransport),
+    ]
 
 
 # --- fan-out ---------------------------------------------------------------
