@@ -589,13 +589,22 @@ async def _evaluate_stream_indexed(
         # caller actually set (never for one this run just probed itself).
         configured_platform = target.platform
 
-        if target.kind == "local" and not can_run_processes():
-            # Before the transport, the probes and above all the resolver: on
-            # iOS that resolver downloaded an agent package nothing could run.
+        # Before the transport, the probes and above all the resolver: on iOS
+        # that resolver downloaded an agent package nothing could run. A
+        # pinned ssh/container target with its platform already known has no
+        # probe to fail first, so the probe can't be relied on to stop it.
+        unavailable: str | None = None
+        if target.kind in ("local", "container") and not can_run_processes():
+            unavailable = no_process_advice(f"the {target.kind} transport")
+        elif target.kind == "ssh":
+            from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
+
+            unavailable = ssh_unavailable_reason()
+            if unavailable is not None:
+                unavailable = f"{target.label}: {unavailable}"
+        if unavailable is not None:
             for index, result in enumerate(
-                _group_failure(
-                    target, ERROR_KIND_TRANSPORT, no_process_advice("the local transport")
-                )
+                _group_failure(target, ERROR_KIND_TRANSPORT, unavailable)
             ):
                 emit(index, result)
             return

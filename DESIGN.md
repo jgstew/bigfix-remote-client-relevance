@@ -222,10 +222,11 @@ Files in the repo are the source of truth; this section explains *why*.
   On iOS and Android (`sys_platform` `ios` / `android`, Python 3.13+)
   markers leave out `asyncssh`, whose `cryptography` has no wheels there,
   and `zstandard`; no extras, so plain `uvx` keeps SSH. Only `fastquery`
-  and `online_evaluator` can work there: `ssh` reports the missing
-  asyncssh as a `transport` result, and `platform_support.can_run_processes()`
-  keeps `local` (and discovery's local and container candidates) from
-  resolving or downloading qna that could never start. The `mobile-resolve`
+  and `online_evaluator` can work there. `ssh`, `local` and `container`
+  targets fail as `transport` results before any version is resolved (the
+  missing asyncssh; `platform_support.can_run_processes()` for the other
+  two), so no qna is downloaded that could never start, and discovery
+  offers neither local nor container candidates there. The `mobile-resolve`
   CI job checks both platforms keep resolving wheels-only.
 - **Dependency quarantine — 7 days** (`[tool.uv] exclude-newer = "-P7D"`).
   Resolution ignores any distribution uploaded in the last week. The

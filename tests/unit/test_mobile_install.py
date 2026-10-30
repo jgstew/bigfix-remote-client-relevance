@@ -21,6 +21,22 @@ NO_PROCESS = ("ios", "tvos", "watchos", "android", "emscripten", "wasi")
 DESKTOP = ("darwin", "linux", "win32")
 
 
+@pytest.fixture(autouse=True)
+def _drop_fresh_imports():
+    """Drop every module a test imported for the first time, after the test.
+
+    ``_block`` re-imports the package with dependencies missing. monkeypatch
+    puts back the modules that were there before, but a submodule first
+    imported during the test would stay, bound to the throwaway copies, and
+    a later test on this worker could pick it up.
+    """
+    before = set(sys.modules)
+    yield
+    for name in set(sys.modules) - before:
+        if name.split(".")[0] in ("bigfix_remote_client_relevance", *BLOCKED):
+            del sys.modules[name]
+
+
 def _block(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the left-out dependencies unimportable, and the package fresh."""
     real_import = builtins.__import__
@@ -130,6 +146,28 @@ async def test_pinned_ssh_target_without_asyncssh_never_resolves_a_version(monke
     (result,) = results
     assert result.error_kind == pkg.ERROR_KIND_TRANSPORT
     assert "asyncssh" in result.error and "fastquery" in result.error
+
+
+async def test_ssh_target_with_platform_set_and_no_asyncssh_never_resolves(monkeypatch):
+    """With platform (and arch) known, no probe runs to fail first; the resolver
+    would download the agent package before the connection ever failed."""
+    _block(monkeypatch)
+    pkg = importlib.import_module("bigfix_remote_client_relevance")
+
+    results = await pkg.evaluate_client_relevance(
+        "name of operating system",
+        [
+            pkg.Target(
+                kind="ssh", name="host.example", qna_version="11.0", platform="ubuntu", arch=arch
+            )
+            for arch in ("x86_64", None)
+        ],
+        resolver=_fail,
+    )
+
+    assert [r.error_kind for r in results] == [pkg.ERROR_KIND_TRANSPORT] * 2
+    for result in results:
+        assert "asyncssh" in result.error and "fastquery" in result.error
 
 
 def test_ssh_discovery_without_asyncssh_says_so_and_contacts_nothing(monkeypatch, tmp_path):
@@ -285,6 +323,34 @@ async def test_local_target_on_ios_never_calls_an_injected_resolver(monkeypatch)
     )
 
     assert "ios" in (results[0].error or "")
+
+
+async def test_container_target_on_ios_fails_before_resolving_or_any_engine(monkeypatch):
+    from bigfix_remote_client_relevance.orchestrate import Target, evaluate_client_relevance
+    from bigfix_remote_client_relevance.results import ERROR_KIND_TRANSPORT
+
+    monkeypatch.setattr(sys, "platform", "ios")
+
+    results = await evaluate_client_relevance(
+        "name of operating system",
+        [
+            Target(
+                kind="container",
+                name="debian",
+                image="debian:11",
+                platform="debian",
+                arch="arm64",
+                qna_version="11.0",
+            )
+        ],
+        transport_factory=_fail,
+        resolver=_fail,
+    )
+
+    (result,) = results
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    error = result.error or ""
+    assert "container" in error and "ios" in error and "fastquery" in error
 
 
 async def test_local_target_on_desktop_still_resolves(monkeypatch):

@@ -62,6 +62,7 @@ from bigfix_remote_client_relevance.serialize import (
     results_to_dicts,
 )
 from bigfix_remote_client_relevance.ssh_discovery import run_ssh_discovery
+from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +352,9 @@ def _auto_discover_ssh() -> list[str]:
         _fail(str(exc))
     if added:
         logger.warning("auto-discovery added %s to %s", ", ".join(added), path)
-    else:
+    elif ssh_unavailable_reason() is None:
+        # Otherwise run_ssh_discovery has said why it skipped; "added nothing"
+        # would read as though it had looked.
         logger.warning("SSH auto-discovery added nothing to %s", path)
     return added
 
