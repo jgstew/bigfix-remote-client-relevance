@@ -142,7 +142,7 @@ class CompatMemory:
                 data = json.loads(handle.read())
         except FileNotFoundError:
             return None
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             logger.debug("ignoring unreadable compat memory %s: %s", self._path, exc)
             return None
         return st, data if isinstance(data, dict) else {}

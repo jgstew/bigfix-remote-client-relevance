@@ -264,3 +264,11 @@ def test_record_merges_with_what_another_process_wrote(tmp_path):
     memory.record(KEY, too_new="11.0.7.61", works="11.0.6.137")
 
     assert CompatMemory(path).lookup("other", "11.0.7.61") == "11.0.6.137"
+
+
+def test_a_pathologically_nested_file_reads_as_empty(tmp_path):
+    """json raises RecursionError, not ValueError, on deep enough nesting."""
+    path = tmp_path / "m.json"
+    path.write_text("[" * 200_000 + "]" * 200_000, encoding="utf-8")
+
+    assert CompatMemory(path).lookup(KEY, "11.0.7.61") is None
