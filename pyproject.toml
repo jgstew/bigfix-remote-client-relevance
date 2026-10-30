@@ -88,13 +88,13 @@ python-preference = "managed"
 # package (`--exclude-newer-package`) when a fresh release must be taken
 # early; see DESIGN.md § Packaging & Python versions.
 exclude-newer = "-P7D"
-# Fast Query's SessionContext needs bigfix-remote-session-relevance 1.5.0
-# (uploaded 2026-10-30T15:13Z; top-level SaasSessionPool, backend_from_config
-# and client_query_max_targets), a sibling package by the same maintainer,
-# inside the window. The fixed date lifts the quarantine up to that release
-# only; remove this once the rolling window has passed it (after 2026-11-06),
-# or it would hold the package back from then on.
-exclude-newer-package = { bigfix-remote-session-relevance = "2026-10-30T16:00:00Z" }
+# Policy: the maintainer's own bigfix* libraries (github.com/jgstew/bigfix*)
+# are exempt from the cooldown, so a release this repo needs is taken the day
+# it ships. "0 days" rather than a fixed date, which goes stale and silently
+# holds the package back. Name each one; Dependabot's cooldown exempts the
+# same list (.github/dependabot.yml), and tests/unit/test_dependency_policy.py
+# keeps the two in step.
+exclude-newer-package = { bigfix-remote-session-relevance = "0 days" }
 
 # --- Tooling ---------------------------------------------------------------
 
