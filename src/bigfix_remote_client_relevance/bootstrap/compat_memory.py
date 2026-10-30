@@ -39,6 +39,12 @@ def _key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
+def _stamp(st: os.stat_result) -> tuple[int, int, int]:
+    # The inode catches a same-size rewrite within one timestamp tick:
+    # _save's rename always puts a new inode at the path.
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 class CompatMemory:
     """``{target key: (lowest too-new version, version that worked)}``, on disk.
 
@@ -56,6 +62,10 @@ class CompatMemory:
         self._path = path or default_path()
         self._ttl_s = ttl_s
         self._clock = clock
+        # The orchestrator looks up once per pinned target, so re-parsing
+        # the file each time was half of a large run's time. Cached against
+        # the file's stamp, so another run's write is still seen.
+        self._cached: tuple[tuple[int, int, int], dict[str, object]] | None = None
 
     def lookup(self, key: str, version: str) -> str | None:
         """The version to use instead of ``version`` on ``key``, if known.
@@ -63,7 +73,7 @@ class CompatMemory:
         Anything at or above the recorded too-new version is redirected:
         runtime requirements only grow from one release to the next.
         """
-        entry = self._load().get(key)
+        entry = self._load_cached().get(key)
         if not isinstance(entry, dict):
             return None
         too_new, works, at = entry.get("too_new"), entry.get("works"), entry.get("recorded_at")
@@ -98,6 +108,19 @@ class CompatMemory:
         if entries.pop(key, None) is not None:
             self._save(entries)
 
+    def _load_cached(self) -> dict[str, object]:
+        try:
+            stamp = _stamp(self._path.stat())
+        except OSError:
+            return {}  # missing, or no access: nothing remembered
+        if self._cached is not None and self._cached[0] == stamp:
+            return self._cached[1]
+        # Stat before reading: if the file is replaced in between, the newer
+        # content sits under the older stamp and is simply re-read next time.
+        entries = self._load()
+        self._cached = (stamp, entries)
+        return entries
+
     def _load(self) -> dict[str, object]:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
@@ -114,8 +137,13 @@ class CompatMemory:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             partial = self._path.with_suffix(f".{os.getpid()}.partial")
             partial.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+            # Stamped before the rename, which keeps it: a concurrent run's
+            # write landing after ours has another stamp and is re-read.
+            stamp = _stamp(partial.stat())
             partial.replace(self._path)
+            self._cached = (stamp, entries)
         except OSError as exc:
+            self._cached = None
             logger.debug("could not save compat memory %s: %s", self._path, exc)
 
 
