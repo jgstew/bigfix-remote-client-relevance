@@ -30,7 +30,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError, fallback_floor
@@ -482,6 +482,63 @@ async def _release(transport: object) -> None:
         logger.debug("releasing a transport failed: %s", exc)
 
 
+def _class_implements(cls: type, protocol: type) -> bool:
+    """The class half of ``isinstance`` against a runtime_checkable Protocol."""
+    return issubclass(cls, protocol)
+
+
+# The one method each optional transport protocol is made of.
+_PROTOCOL_METHOD: dict[type, str] = {
+    FanOutTransport: "evaluate_client_relevance_fanout",
+    BatchTransport: "evaluate_client_relevance_batch",
+}
+
+
+class _Capabilities:
+    """Which optional protocols a run's transports implement, asked per target.
+
+    ``isinstance`` against a runtime_checkable Protocol is fast when the class
+    implements it (``ABCMeta`` caches that), but every miss walks the
+    protocol's members with ``inspect.getattr_static``: ~1.8 us on 3.12+, and
+    most transports miss at least one of these, on every target of every
+    run. So each class's answer is worked out once per run -- not per
+    process, since tests and callers patch transport classes -- and only the
+    instance ``__dict__`` is looked at per target, which is all the rest of
+    ``isinstance`` (3.12+) reads for these one-method protocols.
+    """
+
+    def __init__(self) -> None:
+        self._by_class: dict[tuple[type, type], bool] = {}
+
+    def fan_out(self, transport: object) -> TypeGuard[FanOutTransport]:
+        return self._supports(transport, FanOutTransport)
+
+    def batch(self, transport: object) -> TypeGuard[BatchTransport]:
+        return self._supports(transport, BatchTransport)
+
+    def _supports(self, transport: object, protocol: type) -> bool:
+        if self._class_supports(type(transport), protocol):
+            return True
+        # isinstance asks __class__ too, which a spec'd mock reports as its spec.
+        reported = transport.__class__
+        if reported is not type(transport) and self._class_supports(reported, protocol):
+            return True
+        # Like getattr_static: a method assigned on the instance counts, and
+        # __getattr__ (a MagicMock's, a proxy's) never runs.
+        try:
+            attrs = object.__getattribute__(transport, "__dict__")
+        except AttributeError:
+            return False
+        return attrs.get(_PROTOCOL_METHOD[protocol]) is not None
+
+    def _class_supports(self, cls: type, protocol: type) -> bool:
+        key = (cls, protocol)
+        known = self._by_class.get(key)
+        if known is None:
+            known = self._by_class[key] = _class_implements(cls, protocol)
+        return known
+
+
 async def _evaluate_stream_indexed(
     expressions: Sequence[str],
     targets: Sequence[Target],
@@ -541,6 +598,7 @@ async def _evaluate_stream_indexed(
     previous_version = previous_version or default_previous_version
     memory = compat_memory or CompatMemory()
     semaphore = asyncio.Semaphore(max_parallel)
+    capabilities = _Capabilities()
     image_semaphore = asyncio.Semaphore(pull_parallel)
 
     # Resolve each distinct spec once per run and share the outcome, so a
@@ -798,7 +856,7 @@ async def _evaluate_stream_indexed(
                 await _prepare(resolved)
                 return
 
-            if isinstance(transport, FanOutTransport):
+            if capabilities.fan_out(transport):
                 # One cell, many endpoints. Nothing to fall back through:
                 # fan-out transports evaluate with whatever each endpoint has.
                 # Batching them is running a few at once; waiting for a lane
@@ -864,7 +922,7 @@ async def _evaluate_stream_indexed(
             # The first expression ran alone: it is what found out whether
             # the build starts here at all. The rest share qna processes, a
             # chunk at a time, when the transport can.
-            batcher = transport if batch and isinstance(transport, BatchTransport) else None
+            batcher = transport if batch and capabilities.batch(transport) else None
             index = 1
             for chunk in chunk_expressions(
                 expressions[1:], max_count=batch_size if batcher is not None else 1
