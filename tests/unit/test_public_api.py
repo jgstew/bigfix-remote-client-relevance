@@ -46,6 +46,7 @@ EXPECTED_ROOT_EXPORTS = [
     "TransportLocal",
     "TransportOnlineEvaluator",
     "TransportSSH",
+    "can_run_processes",
     "count_work",
     "evaluate_client_relevance",
     "evaluate_client_relevance_stream",

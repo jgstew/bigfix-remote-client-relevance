@@ -1475,6 +1475,22 @@ def test_auto_discovery_ssh_list_goes_to_stderr_not_stdout(captured, tmp_path, m
     assert "the list" in result.stderr
 
 
+def test_auto_discovery_ssh_skipped_for_no_asyncssh_does_not_claim_it_ran(
+    captured, tmp_path, monkeypatch, caplog
+):
+    """run_ssh_discovery already said why it skipped; "added nothing" would imply it looked."""
+    monkeypatch.setattr(cli_module, "user_inventory_path", lambda: tmp_path / "remote_clients.toml")
+    monkeypatch.setattr(cli_module, "_interactive", lambda: True)
+    monkeypatch.setattr(cli_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
+    monkeypatch.setattr(cli_module, "run_ssh_discovery", lambda path, *, ask, tell: [])
+
+    result = invoke("--auto-discovery-ssh")
+
+    assert result.exit_code == 0, result.output
+    assert "added nothing" not in caplog.text
+    assert "added nothing" not in result.output
+
+
 # --- Fast Query --------------------------------------------------------------
 
 SETUP_ADVICE = "run --setup-fastquery to add a REST or SaaS connection"

@@ -22,6 +22,10 @@ Candidates:
   or just this machine's when the registry can't be asked. qna 11.0.7 is
   the first release with native arm64 builds for most distros, so the
   ``11.0`` stream covers both.
+
+Where qna can't be started at all (iOS, Android; see
+:mod:`~bigfix_remote_client_relevance.platform_support`), only
+``web-eval-rhel`` is tried.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from tomlkit.exceptions import ParseError
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.inventory import InventoryError, _target_from_entry
 from bigfix_remote_client_relevance.orchestrate import Target, evaluate_client_relevance
+from bigfix_remote_client_relevance.platform_support import can_run_processes
 from bigfix_remote_client_relevance.results import ClientRelevanceResult
 
 logger = logging.getLogger(__name__)
@@ -242,11 +247,20 @@ def _container(image: str, arch: str) -> dict[str, Any]:
 
 
 def _base_candidates() -> list[Candidate]:
+    # Where qna can't be started (iOS, Android), trying local would download
+    # an agent package nothing can run; see platform_support.
+    local: list[Candidate] = (
+        [
+            # Empty list, not a string: probe whatever qna is installed rather
+            # than provisioning a pinned version.
+            ("local", {"transport": "local", "qna_version": []}),
+            ("local-downloaded", {"transport": "local", "qna_version": QNA_STREAM}),
+        ]
+        if can_run_processes()
+        else []
+    )
     return [
-        # Empty list, not a string: probe whatever qna is installed rather
-        # than provisioning a pinned version.
-        ("local", {"transport": "local", "qna_version": []}),
-        ("local-downloaded", {"transport": "local", "qna_version": QNA_STREAM}),
+        *local,
         (
             "web-eval-rhel",
             {
@@ -385,10 +399,10 @@ async def discover(
 
     ``images`` is the container engine to look in; None means there isn't
     one (no container candidates at all). Left out, docker or podman is
-    looked for.
+    looked for, except where no engine can exist (see platform_support).
     """
     if images is _DEFAULT_IMAGES:
-        images = await asyncio.to_thread(default_image_source)
+        images = await asyncio.to_thread(default_image_source) if can_run_processes() else None
     run = _Discovery(
         evaluate or evaluate_client_relevance,
         set(skip),

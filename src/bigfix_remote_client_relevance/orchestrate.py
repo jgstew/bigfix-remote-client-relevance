@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 from bigfix_remote_client_relevance.bootstrap.compat_memory import CompatMemory
 from bigfix_remote_client_relevance.bootstrap.release_site import ResolveError, fallback_floor
 from bigfix_remote_client_relevance.bootstrap.targets import UnknownTargetError
+from bigfix_remote_client_relevance.platform_support import can_run_processes, no_process_advice
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_QNA,
@@ -587,6 +588,26 @@ async def _evaluate_stream_indexed(
         # so the corrective reprobe below only fires for a platform the
         # caller actually set (never for one this run just probed itself).
         configured_platform = target.platform
+
+        # Before the transport, the probes and above all the resolver: on iOS
+        # that resolver downloaded an agent package nothing could run. A
+        # pinned ssh/container target with its platform already known has no
+        # probe to fail first, so the probe can't be relied on to stop it.
+        unavailable: str | None = None
+        if target.kind in ("local", "container") and not can_run_processes():
+            unavailable = no_process_advice(f"the {target.kind} transport")
+        elif target.kind == "ssh":
+            from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
+
+            unavailable = ssh_unavailable_reason()
+            if unavailable is not None:
+                unavailable = f"{target.label}: {unavailable}"
+        if unavailable is not None:
+            for index, result in enumerate(
+                _group_failure(target, ERROR_KIND_TRANSPORT, unavailable)
+            ):
+                emit(index, result)
+            return
 
         if len(expressions) > 1 and target.kind == "container" and not target.keep_alive:
             # Without this the second expression starts a second container and
