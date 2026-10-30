@@ -46,6 +46,7 @@ from bigfix_remote_client_relevance.results import (
     ResolvedQna,
 )
 from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport, Transport
+from bigfix_remote_client_relevance.transports import ssh as ssh_transport
 from bigfix_remote_client_relevance.transports.batch import chunk_expressions
 
 if TYPE_CHECKING:
@@ -517,10 +518,6 @@ async def _evaluate_stream_indexed(
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
 
-    # Only this library's own TransportSSH needs asyncssh, so only then does
-    # the early ssh guard below apply. A caller's factory owns its transport;
-    # checking for it imported asyncssh (~65 ms) on every process's first run.
-    own_ssh_transport = transport_factory is None
     if transport_factory is None:
         # One coordinator per run, so the transports built below share image
         # work with each other and with nothing else.
@@ -597,16 +594,11 @@ async def _evaluate_stream_indexed(
         # that resolver downloaded an agent package nothing could run. A
         # pinned ssh/container target with its platform already known has no
         # probe to fail first, so the probe can't be relied on to stop it.
-        unavailable: str | None = None
+        # This one is about the platform, whoever builds the transport: no
+        # local or container transport can start qna there. (The ssh check,
+        # below, is about this library's own transport's dependency instead.)
         if target.kind in ("local", "container") and not can_run_processes():
             unavailable = no_process_advice(f"the {target.kind} transport")
-        elif target.kind == "ssh" and own_ssh_transport:
-            from bigfix_remote_client_relevance.transports.ssh import ssh_unavailable_reason
-
-            unavailable = ssh_unavailable_reason()
-            if unavailable is not None:
-                unavailable = f"{target.label}: {unavailable}"
-        if unavailable is not None:
             for index, result in enumerate(
                 _group_failure(target, ERROR_KIND_TRANSPORT, unavailable)
             ):
@@ -629,6 +621,22 @@ async def _evaluate_stream_indexed(
             ):
                 emit(index, result)
             return
+
+        # Still before any probe or resolve. Only this library's TransportSSH
+        # needs asyncssh, however it was reached (the default factory, or
+        # default_transport_factory passed or wrapped by a caller). Checking
+        # by the transport built, not the target's kind, spares a caller's own
+        # ssh-kind transport the asyncssh import (~65 ms on a process's first
+        # run in 1.10.0) and the refusal where asyncssh is missing. Building a
+        # TransportSSH doesn't import asyncssh; connecting does.
+        if isinstance(transport, ssh_transport.TransportSSH):
+            ssh_missing = ssh_transport.ssh_unavailable_reason()
+            if ssh_missing is not None:
+                for index, result in enumerate(
+                    _group_failure(target, ERROR_KIND_TRANSPORT, f"{target.label}: {ssh_missing}")
+                ):
+                    emit(index, result)
+                return
 
         try:
             prepare = getattr(transport, "prepare", None)

@@ -90,10 +90,12 @@ async def test_own_transport_factory_never_imports_asyncssh(monkeypatch):
     owns its transport: importing asyncssh for it cost ~65 ms on the first
     evaluation in every process (1.10.0), for a dependency it never used."""
     real_import = builtins.__import__
+    attempts: list[str] = []
 
     def guarded(name, *args, **kwargs):
         if name.split(".")[0] == "asyncssh":
-            raise AssertionError("asyncssh imported for a caller's own transport")
+            attempts.append(name)
+            raise ImportError("asyncssh is blocked in this test")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded)
@@ -105,27 +107,51 @@ async def test_own_transport_factory_never_imports_asyncssh(monkeypatch):
         resolver=make_resolver(),
     )
 
+    assert attempts == []
     assert [(r.host, r.error) for r in results] == [(t.name, None) for t in SSH_TARGETS]
 
 
 async def test_own_transport_factory_runs_ssh_targets_where_asyncssh_is_missing(monkeypatch):
     """Without asyncssh (iOS, Android), a caller that brings its own ssh-kind
     transport still gets it run; only the library's TransportSSH needs asyncssh."""
-    from bigfix_remote_client_relevance import orchestrate as orchestrate_module
     from bigfix_remote_client_relevance.transports import ssh as ssh_module
 
     monkeypatch.setattr(ssh_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
-    monkeypatch.setattr(
-        orchestrate_module,
-        "default_transport_factory",
-        lambda *a, **k: pytest.fail("default factory used"),
-    )
 
     results = await evaluate_client_relevance(
-        "true", SSH_TARGETS, transport_factory=lambda t: FakeTransport(t.name)
+        "true",
+        SSH_TARGETS,
+        transport_factory=lambda t: FakeTransport(t.name),
+        resolver=make_resolver(),
     )
 
     assert [r.error for r in results] == [None] * len(SSH_TARGETS)
+
+
+@pytest.mark.parametrize("wrap", [False, True], ids=["as-is", "wrapped"])
+async def test_library_ssh_transport_still_guarded_through_an_explicit_factory(monkeypatch, wrap):
+    """default_transport_factory is public, and wrapping it is natural; its
+    TransportSSH needs asyncssh however it was reached. With platform and arch
+    known no probe runs first, so without the guard the resolver would
+    download an agent package before the connection failed (the 1.10.0 bug)."""
+    from bigfix_remote_client_relevance.transports import ssh as ssh_module
+
+    monkeypatch.setattr(ssh_module, "ssh_unavailable_reason", lambda: "no asyncssh here")
+
+    async def never_resolve(spec, target):
+        pytest.fail("resolved a version for a transport that can't connect")
+
+    factory = (lambda t: default_transport_factory(t)) if wrap else default_transport_factory
+    target = Target(
+        kind="ssh", name="host.example", qna_version="11.0", platform="ubuntu", arch="arm64"
+    )
+
+    (result,) = await evaluate_client_relevance(
+        "true", [target], transport_factory=factory, resolver=never_resolve
+    )
+
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.error == "host.example: no asyncssh here"
 
 
 # --- fan-out ---------------------------------------------------------------
