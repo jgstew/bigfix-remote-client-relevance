@@ -182,7 +182,7 @@ dev = [
 
 [[package]]
 name = "bigfix-remote-session-relevance"
-version = "1.5.0"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -192,9 +192,9 @@ dependencies = [
     { name = "httpx" },
     { name = "tomlkit" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/10/711ab18f6a366c49aacd98be02c169441c4c1e20d4a2150ddf4ed8d7dd39/bigfix_remote_session_relevance-1.5.0.tar.gz", hash = "sha256:98ec1124aead3dc06226d90ec72a6bcf75715e0226a9d000caf1b76c47b9b310", size = 270524, upload-time = "2026-10-30T15:13:48.106Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/94/28ef61024a7cc8e7c3dd4ca142e23cd98640a935b7cef41ea25ebe71c7bb/bigfix_remote_session_relevance-1.6.0.tar.gz", hash = "sha256:b6f49d708feb526a05d412e4e5b8ef90aef7d60814df9ec5998318e4da6ae7ce", size = 279398, upload-time = "2026-10-30T17:01:48.823Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/66/dc6e7d965cbbd07d3846c2e62e09a2f54fbe87bd6673aa4e608598a75f6b/bigfix_remote_session_relevance-1.5.0-py3-none-any.whl", hash = "sha256:9f2a199f9f1a70b38738c3545f46f629f16757fba89f47fcc5889f8f564fe2bd", size = 98993, upload-time = "2026-10-30T15:13:47.038Z" },
+    { url = "https://files.pythonhosted.org/packages/00/8f/b93a23972349290ae1158c486a745ece5b2e9570e8bf3a20073414fae79e/bigfix_remote_session_relevance-1.6.0-py3-none-any.whl", hash = "sha256:72e0e3f5d90c770ac83fb2e143c4833167ea43aa1cf73faaeef26c0ddc166945", size = 103536, upload-time = "2026-10-30T17:01:47.605Z" },
 ]
 
 [[package]]
