@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 import typer
 
 from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
-from bigfix_remote_client_relevance.discovery import run_auto_discovery
+from bigfix_remote_client_relevance.discovery import find_or_discover_inventory, run_auto_discovery
 from bigfix_remote_client_relevance.inventory import (
     EmptyInventoryError,
     InventoryError,
@@ -297,9 +297,9 @@ def _update_inventory(
                 written_arch.add(host)
 
 
-def _auto_discover() -> list[str]:
-    """Run discovery against ~/.bigfix/remote_clients.toml; return hosts added."""
-    path = user_inventory_path()
+def _auto_discover(path: Path | None = None) -> list[str]:
+    """Run discovery against ``path`` (~/.bigfix/remote_clients.toml); return hosts added."""
+    path = path if path is not None else user_inventory_path()
     try:
         added = run_auto_discovery(path)
     except InventoryError as exc:
@@ -309,6 +309,11 @@ def _auto_discover() -> list[str]:
     else:
         logger.warning("auto-discovery found nothing new to add to %s", path)
     return added
+
+
+def _first_run_discover(path: Path) -> list[str]:
+    logger.info("no remote_clients.toml found; running first-run auto-discovery")
+    return _auto_discover(path)
 
 
 def _setup_fastquery() -> int:
@@ -762,22 +767,23 @@ def evaluate(
         # to spell out --inventory.
         needed = 1 if client_relevance_file else 2
         if len(args) < needed:
-            discovered = find_inventory_path()
-            if (
-                discovered is None
-                and not (auto_discovery or auto_discovery_ssh)
-                and not user_inventory_path().exists()
-            ):
+            if auto_discovery or auto_discovery_ssh:
+                # Discovery already ran explicitly, above.
+                discovered = find_inventory_path()
+            else:
                 # First run: nothing configured anywhere, so find out what
-                # works here rather than refusing outright. Once the file
-                # exists this never repeats unless --auto-discovery asks.
-                logger.info("no remote_clients.toml found; running first-run auto-discovery")
-                _auto_discover()
-                # Written either way: hosts that work, or, when none did, the
-                # comment-only placeholder that stops this from repeating on
-                # every run (loading it fails with a pointer back here).
-                if user_inventory_path().is_file():
-                    discovered = user_inventory_path()
+                # works here rather than refusing outright. Discovery leaves
+                # the file behind either way -- hosts that work, or the
+                # comment-only placeholder (loading it fails with a pointer
+                # back here) -- so this never repeats unless --auto-discovery
+                # asks. The library's helper, so other front ends get the
+                # same rule; the CLI's own wrapper keeps its logging and
+                # usage errors.
+                discovered = find_or_discover_inventory(
+                    find=find_inventory_path,
+                    user_path=user_inventory_path(),
+                    discover=_first_run_discover,
+                )
             if discovered is not None:
                 inventory = discovered
             else:

@@ -421,6 +421,38 @@ results = await evaluate_many(expressions, targets, batch=False)
 `evaluate_many_stream` is the completion-order form, the same way
 `evaluate_client_relevance_stream` is for the single-expression call.
 
+### Before evaluating: platforms, arches, the inventory
+
+A front end can show what each target is, and offer the right choices,
+without connecting to anything:
+
+```python
+from bigfix_remote_client_relevance import Target, published_arches, target_platform
+from bigfix_remote_client_relevance.discovery import default_image_source
+
+images = default_image_source()  # docker or podman if one answers, else None
+target_platform(Target(kind="container", name="almalinux:9"))  # "rhel"
+target_platform(Target(kind="ssh", name="box"))  # None: probed when evaluated
+published_arches("debian:12", images)  # ["x86_64", "arm64"], from the registry manifest
+```
+
+- `target_platform(target)` is the bootstrap key (`ubuntu`, `rhel`, `macos`,
+  ...) a target will run as, when that is knowable up front: an explicit or
+  inventory-recorded `platform`, a container's image name, or this machine
+  for `local` on macOS and Windows. Otherwise `None`.
+- `published_arches(image, images)` lists the arches the image's manifest
+  publishes, in `SUPPORTED_ARCHS` order (`("x86_64", "arm64")`). With no
+  engine (`images=None`) or no answer from the registry, it is this
+  machine's arch. `images` is a `discovery.ImageSource`, such as
+  `discovery.default_image_source()`. It may ask a registry, so it blocks.
+- `find_or_discover_inventory()` is the CLI's first run: the inventory the
+  search path finds, or else auto-discovery into `~/.bigfix/remote_clients.toml`
+  once, if that file doesn't exist yet. It returns the file, or `None` if
+  discovery wrote nothing. `discover_into(path=None)` runs discovery again
+  even when the file exists, adding only hosts it lacks. Both block, since
+  discovery evaluates every candidate, so call them from a worker thread
+  (`asyncio.to_thread`) inside an event loop.
+
 ### Container lifetime
 
 A container target evaluating more than one expression is kept alive for the

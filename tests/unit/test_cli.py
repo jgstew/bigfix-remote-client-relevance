@@ -1330,7 +1330,12 @@ def test_auto_discovery_flag_skips_the_first_run_helper(captured, tmp_path, monk
     # --auto-discovery runs discovery explicitly; the implicit first run must
     # not run it a second time.
     user_inventory = tmp_path / "remote_clients.toml"
-    monkeypatch.setattr(cli_module, "find_inventory_path", lambda: None)
+    # The search path finds the file once --auto-discovery has written it.
+    monkeypatch.setattr(
+        cli_module,
+        "find_inventory_path",
+        lambda: user_inventory if user_inventory.exists() else None,
+    )
     monkeypatch.setattr(cli_module, "user_inventory_path", lambda: user_inventory)
     calls: list = []
     _fake_discovery(monkeypatch, {"local": {"transport": "local", "qna_version": []}}, calls)

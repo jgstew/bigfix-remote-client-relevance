@@ -9,10 +9,17 @@ Everything here is pure string building, so it is testable without a target.
 
 from __future__ import annotations
 
+import re
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from bigfix_remote_client_relevance.exceptions import BigFixRelevanceError
+
+if TYPE_CHECKING:
+    # Only for the annotation: orchestrate imports this module.
+    from bigfix_remote_client_relevance.orchestrate import Target
 
 # Written after a successful extraction. Its presence (not merely the binary's)
 # is what marks a version as usable, so a half-extracted tree is never mistaken
@@ -285,6 +292,60 @@ def classify_uname(probe_output: str, *, strict: bool = False) -> str:
     return _refuse("unrecognized Linux distribution")
 
 
+# Container image-name tokens (split on /:._@-) -> KNOWN_TARGETS key. The
+# same distros as discovery._FAMILY_OF_DISTRO, which maps them to a deb/rpm
+# family instead (ubuntu -> debian there, ubuntu here); a test keeps the two
+# in agreement. This one also knows raspbian, redhat and the SUSE names.
+_IMAGE_TOKEN_PLATFORMS = {
+    "debian": "debian",
+    "raspbian": "raspbian",
+    "ubuntu": "ubuntu",
+    "rhel": "rhel",
+    "ubi": "rhel",
+    "ubi8": "rhel",
+    "ubi9": "rhel",
+    "ubi10": "rhel",
+    "redhat": "rhel",
+    "fedora": "rhel",
+    "centos": "rhel",
+    "almalinux": "rhel",
+    "rockylinux": "rhel",
+    "oraclelinux": "rhel",
+    "amazonlinux": "rhel",
+    "opensuse": "suse",
+    "suse": "suse",
+    "sles": "suse",
+}
+
+# A local target's key, where sys.platform alone decides it. Linux needs the
+# os-release probe; iOS and friends can't run local qna at all.
+_SYS_PLATFORMS = {"darwin": "macos", "win32": "windows"}
+
+
+def target_platform(target: Target) -> str | None:
+    """The :data:`KNOWN_TARGETS` key ``target`` will run as, if knowable without connecting.
+
+    An explicit (or inventory-recorded) ``platform`` wins; otherwise a
+    container is read from its image name and ``local`` from this machine.
+    None means unknown until a transport probes it: an SSH host, a Linux
+    controller (its distro needs the os-release probe), or a remote service
+    (``fastquery``, ``online_evaluator``). For a front end that shows each
+    target's platform, and what can run there, before evaluating.
+    """
+    if target.platform:
+        return target.platform
+    if target.kind == "container":
+        image = (target.image or target.name).lower()
+        for token in re.split(r"[/:._@-]", image):
+            platform = _IMAGE_TOKEN_PLATFORMS.get(token)
+            if platform in KNOWN_TARGETS:
+                return platform
+        return None
+    if target.kind == "local":
+        return _SYS_PLATFORMS.get(sys.platform)
+    return None
+
+
 __all__ = [
     "KNOWN_TARGETS",
     "MARKER_FILENAME",
@@ -295,4 +356,5 @@ __all__ = [
     "host_arch",
     "normalize_arch",
     "spec_for",
+    "target_platform",
 ]
