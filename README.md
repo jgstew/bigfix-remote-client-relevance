@@ -313,10 +313,12 @@ Requirements and limits:
   submit fails gets that error as its result and is not retried: SaaS
   answers most failures, including a computer id it does not know, with a
   bare HTTP 500 that doesn't say why, possibly after the query went out.
-- **SaaS accounts that require MFA (a TOTP code) don't work yet.** The tool
-  can't ask for the code, so every run fails to sign in with "this account
-  requires a TOTP code (MFA)", even though `--setup-fastquery` can save the
-  account. Use a SaaS account without MFA, or an on-prem REST connection.
+- **SaaS accounts that require MFA (a TOTP code) don't work from the CLI
+  yet.** It can't ask for the code, so every run fails to sign in with "this
+  account requires a TOTP code (MFA)", even though `--setup-fastquery` can
+  save the account. Use a SaaS account without MFA, or an on-prem REST
+  connection. As a library, a `SessionContext(prompt=...)` can answer it
+  (see [Fast Query from an app](#fast-query-from-an-app-sessioncontext)).
 
 ## As a library
 
@@ -420,6 +422,74 @@ results = await evaluate_many(expressions, targets, batch=False)
 
 `evaluate_many_stream` is the completion-order form, the same way
 `evaluate_client_relevance_stream` is for the single-expression call.
+
+### Fast Query from an app: `SessionContext`
+
+By default a `fastquery` target finds its connection in
+session-relevance's config file and pins a server's certificate the first
+time it sees it, as the CLI does. A front end that holds its own
+connections (no config file, a password from the Keychain, a "Trust this
+certificate?" dialog) passes a `SessionContext` instead. `Target` is
+unchanged: `connection` names a connection in the context's `Config`.
+
+```python
+from bigfix_remote_session_relevance import (
+    Config,
+    ConnectionConfig,
+    KnownCerts,
+    SaasSessionPool,
+    TrustStore,
+)
+from bigfix_remote_client_relevance import (
+    SessionContext,
+    Target,
+    evaluate_client_relevance_stream,
+)
+
+conn = ConnectionConfig(
+    name="saas",
+    backend="saas",
+    server="login.bigfix.com",
+    username=email,
+    password=keychain.get("saas:" + email),
+)
+session = SessionContext(
+    config=Config(connections=(conn,)),
+    trust=TrustStore(KnownCerts(app_dir / "known_certs.toml"), callback=ask_user),
+    saas_sessions=SaasSessionPool(),  # one sign-in per account for the app's lifetime
+)
+async for result in evaluate_client_relevance_stream(
+    "name of operating system",
+    [Target(kind="fastquery", name="saas", connection="saas", computer_ids=(1234567,))],
+    session=session,
+):
+    ...
+```
+
+Every field is optional, and an empty `SessionContext()` is the default:
+
+| Field | What it does | When `None` |
+|---|---|---|
+| `config` | where `Target.connection` is looked up | `load_config()`: the config file, else `BES_*` / `~/.besapi.conf` |
+| `trust` | certificate trust (a `TrustPolicy`) | `TrustStore(trust_on_first_use="auto")`: pin on first use, as before |
+| `prompt` | asks for a missing password, or a SaaS TOTP code | never prompt |
+| `saas_sessions` | shares SaaS sign-ins across runs | one pool per run |
+| `http_transport` | the httpx transport per connection (tests, proxies) | session-relevance's own |
+
+- **Deferred trust**, for an app that should not block a run on a dialog:
+  pass `TrustStore(KnownCerts(...), trust_on_first_use=False)`. An unpinned
+  certificate then fails that target with a `transport` error naming
+  host:port and the SHA-256 fingerprint, and sends no credentials; the
+  certificate is in `store.pending`. Show it, call
+  `store.accept(host_port)`, and run again.
+- A SaaS session belongs to the event loop it signed in on, so share a
+  `saas_sessions` pool only between runs on one loop.
+- An `http_transport` bypasses certificate pinning: session-relevance
+  applies trust only to its own TLS connections.
+- `session` works with the default transport factory. With your own
+  `transport_factory`, passing `session` too is a `ValueError` (it would
+  never reach your factory); build Fast Query transports in it with
+  `fastquery_transport(target, session=session)` instead.
 
 ### Before evaluating: platforms, arches, the inventory
 

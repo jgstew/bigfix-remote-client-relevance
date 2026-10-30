@@ -2634,7 +2634,7 @@ async def test_one_saas_session_pool_per_run(monkeypatch):
 
     pools: list[object] = []
 
-    def fake_factory(target, *, coordinator=None, saas_sessions=None):
+    def fake_factory(target, *, coordinator=None, saas_sessions=None, session=None):
         pools.append(saas_sessions)
         raise ValueError("not building anything")
 

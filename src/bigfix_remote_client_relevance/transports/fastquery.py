@@ -133,10 +133,11 @@ class TransportFastQuery:
                 (it is in the BESAPI 11.0.7.61 schema). Recorded on every
                 result.
             one_computer_per_query: Send one query per computer instead of
-                one for all. ``None`` decides from the backend's type: only
-                a ``SaasBackend`` needs it. Decided before sending, never
-                from the error: SaaS refuses several ids without sending
-                anything, so that error says nothing about the computers.
+                one for all. ``None`` decides from the backend's target
+                limit (``client_query_max_targets``: 1 for a ``SaasBackend``,
+                none for REST). Decided before sending, never from the
+                error: SaaS refuses several ids without sending anything,
+                so that error says nothing about the computers.
             host: What a result is reported under when no computer can be
                 (nothing targeted, or the submit failed).
             clock, sleep: Injected so tests never wait.
@@ -146,9 +147,11 @@ class TransportFastQuery:
         self._computer_query = computer_query
         self._use_client_context = use_client_context
         if one_computer_per_query is None:
-            from bigfix_remote_session_relevance import SaasBackend
+            from bigfix_remote_session_relevance import client_query_max_targets
 
-            one_computer_per_query = isinstance(backend, SaasBackend)
+            # Any limit means one per computer: no backend has a limit above
+            # one, so splitting into chunks of N would be untested code.
+            one_computer_per_query = client_query_max_targets(backend) is not None
         self._one_computer_per_query = one_computer_per_query
         self._host = host
         self._clock = clock
