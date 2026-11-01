@@ -1312,6 +1312,7 @@ async def test_every_run_gets_its_own_marker():
     assert len(markers) == 2
 
 
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a POSIX /bin/sh")
 def test_the_posix_marker_keeps_qna_exit_status(tmp_path):
     """The marker must survive in the remote shell's argv (so no exec of the
     last command) without the shell's own exit status replacing qna's."""
