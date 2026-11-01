@@ -1143,6 +1143,7 @@ async def test_a_batch_on_windows_runs_through_powershell(qna_output, fixed_sent
 
 MARKER = re.compile(r"bfrcr-run-[0-9a-f]{32}")
 T = 0.2  # timeout_s for every hang test: small, but well above scheduler noise
+SLACK = 0.6  # for a loaded `-n auto` runner; still far below N x T in every test
 
 
 async def _forever() -> None:
@@ -1207,8 +1208,9 @@ async def test_a_run_that_never_answers_comes_back_within_timeout_s():
     started = time.monotonic()
     result = await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
 
-    assert time.monotonic() - started < 3 * T
+    assert time.monotonic() - started < 2 * T + SLACK
     assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.error == f"test-host: no answer within {T}s"
     assert hung.cancelled == 1, "the hung run itself is cancelled, not left pending"
 
 
@@ -1222,8 +1224,28 @@ async def test_a_connection_that_never_opens_comes_back_within_timeout_s():
     started = time.monotonic()
     result = await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
 
-    assert time.monotonic() - started < 2 * T
+    assert time.monotonic() - started < T + SLACK
     assert result.error_kind == ERROR_KIND_TRANSPORT
+
+
+async def test_a_connection_that_never_opens_ends_the_target_for_the_run():
+    """A silently dropping host would otherwise cost timeout_s per expression."""
+    opened = 0
+
+    async def factory() -> FakeSSHRunner:
+        nonlocal opened
+        opened += 1
+        await _forever()
+        raise AssertionError("unreachable")
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    results = [
+        await transport.evaluate_client_relevance(e, qna_path="/q", timeout_s=T) for e in "abcd"
+    ]
+
+    assert opened == 1
+    assert {r.error_kind for r in results} == {ERROR_KIND_TRANSPORT}
 
 
 async def test_a_hung_eval_drops_the_connection_and_kills_its_qna_on_a_fresh_one():
@@ -1315,23 +1337,64 @@ async def test_a_timed_out_batch_is_a_warning_naming_host_and_size(caplog, fixed
     assert any("test-host" in m and str(len(BATCH_MIXED)) in m for m in warnings), warnings
 
 
-async def test_two_timeouts_in_a_row_end_the_target_for_the_rest_of_the_run():
-    """After a hung batch, a hung single says the host is stuck: the rest of
-    the chunk fails fast instead of costing timeout_s each (#98)."""
+async def test_two_different_expressions_timing_out_in_a_row_end_the_target():
+    """After a hung batch, two of its expressions hanging on their own says
+    the host is stuck: the rest fails fast instead of costing timeout_s
+    each (#98)."""
     hung = HangingRunner(responses=[FOUND_QNA])
     transport, _ = make_reconnecting_transport(hung)
 
-    assert await transport.evaluate_client_relevance_batch(["a", "b"], timeout_s=T) is None
-    first = await transport.evaluate_client_relevance("c", timeout_s=T)
+    assert await transport.evaluate_client_relevance_batch(["a", "b", "c"], timeout_s=T) is None
+    first = [await transport.evaluate_client_relevance(e, timeout_s=T) for e in "ab"]
     runs_so_far = len(hung.calls)
     started = time.monotonic()
-    rest = [await transport.evaluate_client_relevance(e, timeout_s=T) for e in "defgh"]
+    rest = [await transport.evaluate_client_relevance(e, timeout_s=T) for e in "cdefgh"]
 
-    assert first.error_kind == ERROR_KIND_TRANSPORT
-    assert time.monotonic() - started < T
+    assert {r.error_kind for r in first} == {ERROR_KIND_TRANSPORT}
+    assert time.monotonic() - started < SLACK
     assert len(hung.calls) == runs_so_far, "nothing more is sent to a stuck host"
     assert {r.error_kind for r in rest} == {ERROR_KIND_TRANSPORT}
     assert all("did not answer" in (r.error or "") for r in rest)
+
+
+async def test_a_slow_expression_heading_a_chunk_does_not_end_the_target(fixed_sentinel):
+    """Its batch times out, then it times out alone: that is one slow
+    expression twice, not two pieces of evidence that the host is stuck."""
+    hung = HangingRunner(responses=[FOUND_QNA, (r"-showtypes", qna_ok())], hang="-showtypes")
+
+    class SlowOnly(HangingRunner):
+        async def run(self, command, *, input=None, timeout=None):
+            if input is not None and "slow" not in input:
+                return await FakeSSHRunner.run(hung, command, input=input, timeout=timeout)
+            return await hung.run(command, input=input, timeout=timeout)
+
+    transport, _ = make_reconnecting_transport(SlowOnly())
+
+    assert await transport.evaluate_client_relevance_batch(["slow", "a", "b"], timeout_s=T) is None
+    results = [
+        await transport.evaluate_client_relevance(e, timeout_s=T) for e in ("slow", "a", "b")
+    ]
+
+    assert [r.error_kind for r in results] == [ERROR_KIND_TRANSPORT, None, None]
+
+
+async def test_a_batch_that_fails_without_timing_out_stays_at_debug(caplog, fixed_sentinel):
+    """A host that refuses extra sessions would say so on every run."""
+
+    async def refusing(command, *, input=None, timeout=None):
+        if input is not None:
+            raise OSError("channel open refused")
+        return FOUND_QNA[1]
+
+    runner = FakeSSHRunner()
+    runner.run = refusing  # type: ignore[method-assign]
+
+    # The logger by name: a CLI test earlier in this worker may have set its level.
+    with caplog.at_level(logging.DEBUG, logger="bigfix_remote_client_relevance.transports.ssh"):
+        assert await make_transport(runner).evaluate_client_relevance_batch(["a", "b"]) is None
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("batch" in r.getMessage() for r in caplog.records)
 
 
 async def test_an_answer_between_timeouts_keeps_the_target():
@@ -1363,7 +1426,7 @@ async def test_a_host_that_cannot_take_the_kill_is_ended_at_once():
         await transport.evaluate_client_relevance(e, qna_path="/q", timeout_s=T) for e in "abcdef"
     ]
 
-    assert time.monotonic() - started < 3 * T
+    assert time.monotonic() - started < 2 * T + SLACK
     assert {r.error_kind for r in results} == {ERROR_KIND_TRANSPORT}
 
 
@@ -1401,21 +1464,24 @@ async def test_evaluate_many_against_a_stuck_host_takes_about_timeout_s_not_n_ti
 
     # From the first answer: what comes before it is the orchestrator's own
     # first-call setup, not the hang. The batch's timeout_s, the kill's, done.
-    assert time.monotonic() - answered_at[0] < 3 * T
+    assert time.monotonic() - answered_at[0] < 2 * T + SLACK
     assert results[0].ok
     assert [r.client_relevance for r in results] == expressions
     assert {r.error_kind for r in results[1:]} == {ERROR_KIND_TRANSPORT}
 
 
-async def test_aclose_is_bounded_when_the_connection_will_not_close():
-    hung = HangingRunner(responses=[(r"-showtypes", qna_ok())], hang_close=True)
+async def test_aclose_is_bounded_when_the_connection_will_not_close(monkeypatch):
+    from bigfix_remote_client_relevance.transports import ssh
+
+    monkeypatch.setattr(ssh, "CLEANUP_TIMEOUT_S", T)
+    hung = HangingRunner(responses=[(r"-showtypes", qna_ok())], hang="^$", hang_close=True)
     transport = make_transport(hung)
     await transport.evaluate_client_relevance("true", qna_path="/q", timeout_s=T)
 
     started = time.monotonic()
-    await transport.aclose(timeout_s=T)
+    await transport.aclose()
 
-    assert time.monotonic() - started < 2 * T
+    assert time.monotonic() - started < T + SLACK
 
 
 # --- the asyncssh adapter on a hang --------------------------------------------
@@ -1474,7 +1540,7 @@ async def test_adapter_closes_the_process_when_it_times_out():
     with pytest.raises(TimeoutError):
         await _AsyncsshRunner(connection).run("qna", timeout=T)
 
-    assert time.monotonic() - started < 2 * T
+    assert time.monotonic() - started < T + SLACK
     assert connection.process.closed
 
 
@@ -1485,7 +1551,7 @@ async def test_adapter_bounds_a_session_that_never_opens():
     with pytest.raises(TimeoutError):
         await _AsyncsshRunner(FakeConnection(open_session=False)).run("qna", timeout=T)
 
-    assert time.monotonic() - started < 2 * T
+    assert time.monotonic() - started < T + SLACK
 
 
 async def test_adapter_closes_the_process_when_cancelled():

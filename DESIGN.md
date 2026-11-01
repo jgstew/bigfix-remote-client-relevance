@@ -937,10 +937,15 @@ local, ssh and container implement it, through the helpers in
   `taskkill /T /F` on the `powershell.exe` whose command line holds it; on
   POSIX `; exit $? # marker`, which keeps the marker in the remote shell's
   argv, and the kill is `pkill -TERM -P` on that shell. A host that cannot
-  take that kill, or that times out twice in a row with no qna answer in
-  between, gets nothing more for the rest of the run: its remaining
-  expressions fail at once with a transport error. A stuck target costs
-  about two `timeout_s`, not one per expression.
+  take that kill, that does not connect within `timeout_s`, or where two
+  different expressions time out in a row with no qna answer between gets
+  nothing more for the rest of the run: its remaining expressions fail at
+  once with a transport error. "Different", because a slow expression
+  heading a chunk times out twice (in its batch, then alone) without saying
+  anything about the rest. A stuck target costs about three `timeout_s`
+  (the batch, then two of its expressions), not one per expression. SFTP
+  uploads during provisioning are not bounded by `timeout_s`: an artifact
+  can take longer than one evaluation.
 - *One concurrency slot* (`max_parallel`) per chunk: it is one process.
 - *Result fields.* `qna_batch_size` (schema 1.4) is the chunk size, and
   `None` when the expression ran alone. `elapsed_ms` is the whole qna

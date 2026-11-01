@@ -69,17 +69,12 @@ CLEANUP_TIMEOUT_S = 10.0
 never longer than the run's own ``timeout_s``: cleanup must not outlast the
 work it cleans up after."""
 
-MAX_CONSECUTIVE_TIMEOUTS = 2
-"""Timeouts in a row, with no answer between them, after which a target gets
-nothing more for the rest of the run (#98): one is an expression too slow for
-``timeout_s``; two, with a fresh connection between, is a host that is stuck,
-and every further expression would cost another ``timeout_s`` to find that out."""
-
 _RUN_MARKER = re.compile(r"bfrcr-run-[0-9a-f]{32}")
 
 # The tail of a PowerShell -EncodedCommand that encodes nothing but the
-# marker's random hex. 60 base64 characters cover at most 47 bytes, which with
-# UTF-16LE is the last 24 characters of the 32 hex digits.
+# marker's random hex. The tail starts on a 4-character boundary, so its 60
+# base64 characters are 45 whole bytes: the last 22.5 UTF-16LE characters,
+# all within the marker's 32 hex digits.
 _WINDOWS_TOKEN_CHARS = 60
 
 
@@ -192,12 +187,7 @@ class _AsyncsshRunner:
 
     async def close(self) -> None:
         self._connection.close()  # type: ignore[attr-defined]
-        try:
-            async with asyncio.timeout(CLEANUP_TIMEOUT_S):
-                await self._connection.wait_closed()  # type: ignore[attr-defined]
-        except TimeoutError:
-            # A stuck peer never acknowledges the disconnect.
-            self._connection.abort()  # type: ignore[attr-defined]
+        await self._connection.wait_closed()  # type: ignore[attr-defined]
 
 
 def connect_kwargs(
@@ -329,9 +319,11 @@ class TransportSSH:
         )
         self._runner: SSHRunner | None = None
         self._spec: TargetSpec | None = None
-        # Timeouts since the last answer, and why the target was given up
-        # on for the rest of this transport's run (see MAX_CONSECUTIVE_TIMEOUTS).
-        self._timeouts_in_a_row = 0
+        self._connect_lock = asyncio.Lock()
+        # What last timed out since qna last answered (its stdin lines), and
+        # why the target was given up on for the rest of this run (#98; see
+        # _after_hang).
+        self._last_timed_out: frozenset[str] | None = None
         self._unresponsive: str | None = None
         # -showtypes support is per remote qna binary; probe at most once.
         self._showtypes_supported: dict[str, bool] = {}
@@ -347,14 +339,24 @@ class TransportSSH:
         if self._unresponsive is not None:
             raise _Unresponsive(self._unresponsive)
         if self._runner is None:
-            async with asyncio.timeout(timeout_s):
-                self._runner = await self._connection_factory()
+            # The lock is taken only to connect, so concurrent first calls
+            # share one connection; a connected transport never waits on it.
+            async with self._connect_lock:
+                if self._runner is None:
+                    try:
+                        async with asyncio.timeout(timeout_s):
+                            self._runner = await self._connection_factory()
+                    except TimeoutError:
+                        # A host that silently drops packets would otherwise
+                        # cost timeout_s for every expression left.
+                        self._give_up(f"no connection within {timeout_s}s")
+                        raise
         return _GuardedRunner(self, self._runner)
 
-    async def aclose(self, *, timeout_s: float = CLEANUP_TIMEOUT_S) -> None:
+    async def aclose(self) -> None:
         runner, self._runner = self._runner, None
         if runner is not None:
-            await self._close_quietly(runner, timeout_s)
+            await self._close_quietly(runner, CLEANUP_TIMEOUT_S)
 
     async def _close_quietly(self, runner: SSHRunner, timeout_s: float) -> None:
         try:
@@ -368,55 +370,75 @@ class TransportSSH:
     def _answered(self) -> None:
         # Only a qna answer counts: a probe that answers says nothing about
         # whether the next qna will.
-        self._timeouts_in_a_row = 0
+        self._last_timed_out = None
 
-    async def _after_hang(self, command: str, timeout_s: float, *, cancelled: bool) -> None:
-        """Clean up after a command that did not answer: drop the connection,
-        then stop the command's qna, if it was one, over a fresh connection.
+    async def _after_hang(
+        self,
+        stuck: SSHRunner,
+        command: str,
+        input: str | None,
+        timeout_s: float,
+        *,
+        cancelled: bool,
+    ) -> None:
+        """Clean up after a command that did not answer on ``stuck``: drop
+        that connection, then stop the command's qna, if it was one, over a
+        fresh connection.
 
         The connection goes because #99's stuck one never answered another
         session request either. Closing the channel does not stop the remote
         qna everywhere (Windows OpenSSH leaves qna.exe running), so it is
-        stopped by the marker its command carries. Best effort, and bounded
-        by its own short timeout: a host that cannot take even that is given
-        up on for the rest of the run, as is one that times out twice in a row.
+        stopped by the marker its command carries. Best effort, under its own
+        short timeout; a host that cannot take even that gets nothing more
+        this run.
+
+        Neither does one where two different expressions time out in a row
+        with no qna answer between (#98): each further expression would cost
+        another timeout_s to find that out. "Different" because one slow
+        expression heading a chunk times out twice, in its batch and then
+        alone, without saying anything about the rest.
         """
         if not cancelled:
-            self._timeouts_in_a_row += 1
-        stuck, self._runner = self._runner, None
-        if stuck is not None:
-            await self._close_quietly(stuck, timeout_s)
+            lines = frozenset((input or command).splitlines())
+            if self._last_timed_out is not None and not lines <= self._last_timed_out:
+                self._give_up(f"two expressions in a row did not answer within {timeout_s}s")
+            self._last_timed_out = lines
+        if self._runner is stuck:
+            self._runner = None
+        await self._close_quietly(stuck, timeout_s)
         marker = _marker_in(command)
+        if marker is None or self._spec is None:
+            return
         kill_timeout = min(timeout_s, CLEANUP_TIMEOUT_S)
-        if marker is not None and self._spec is not None:
-            fresh: SSHRunner | None = None
-            try:
-                async with asyncio.timeout(kill_timeout):
-                    fresh = await self._connection_factory()
-                    runner = _PowerShellRunner(fresh) if self._spec.family == "windows" else fresh
-                    stdout, _stderr, _code = await runner.run(
-                        self._kill_command(self._spec, command, marker), timeout=kill_timeout
-                    )
-            except Exception as exc:  # noqa: BLE001 - best effort, but say so
-                logger.warning(
-                    "%s: could not stop a qna that did not answer within %ss; it may "
-                    "still be running there (%r)",
-                    self.host,
-                    timeout_s,
-                    exc,
+        fresh: SSHRunner | None = None
+        try:
+            async with asyncio.timeout(kill_timeout):
+                fresh = await self._connection_factory()
+                runner = _PowerShellRunner(fresh) if self._spec.family == "windows" else fresh
+                stdout, _stderr, _code = await runner.run(
+                    self._kill_command(self._spec, command, marker), timeout=kill_timeout
                 )
-                if fresh is not None:
-                    await self._close_quietly(fresh, kill_timeout)
-                if not cancelled:
-                    self._give_up(f"did not answer within {kill_timeout}s to stop a hung qna")
-                return
+        except BaseException as exc:
+            if fresh is not None:
+                await self._close_quietly(fresh, kill_timeout)
+            if not isinstance(exc, Exception):
+                raise  # a second cancel: cleanup is best effort, the cancel is not
+            logger.warning(
+                "%s: could not stop a qna that did not answer within %ss; it may "
+                "still be running there (%r)",
+                self.host,
+                timeout_s,
+                exc,
+            )
+            if not cancelled:
+                self._give_up(f"did not answer within {kill_timeout}s to stop a hung qna")
+            return
+        logger.debug("stopped qna on %s: %s", self.host, stdout.split() or "none left")
+        if self._runner is None and self._unresponsive is None:
             # The next command reuses the connection that just answered.
             self._runner = fresh
-            logger.debug("stopped qna on %s: %s", self.host, stdout.split() or "none left")
-        if self._timeouts_in_a_row >= MAX_CONSECUTIVE_TIMEOUTS:
-            self._give_up(
-                f"did not answer within {timeout_s}s {self._timeouts_in_a_row} times in a row"
-            )
+        else:
+            await self._close_quietly(fresh, kill_timeout)
 
     def _give_up(self, reason: str) -> None:
         if self._unresponsive is None:
@@ -489,7 +511,9 @@ class TransportSSH:
         except BootstrapFailure as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP, qna_path=qna_path or "")
         except (SSHConnectionError, OSError, TimeoutError) as exc:
-            return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
+            # A bare TimeoutError (asyncio.timeout's) has no message of its own.
+            reason = str(exc) or f"no answer within {timeout_s}s"
+            return _result(error=f"{self.host}: {reason}", error_kind=ERROR_KIND_TRANSPORT)
         except Exception as exc:
             logger.exception("unexpected failure evaluating on %s", self.host)
             return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
@@ -566,12 +590,15 @@ class TransportSSH:
             )
             self._answered()
         except Exception as exc:  # noqa: BLE001 - the single path will report it
-            # WARNING: from outside, a batch that timed out looks like a hang.
-            logger.warning(
+            # WARNING for a timeout: from outside, it looks like a hang (#99).
+            # Anything else (a host refusing extra sessions) repeats every run.
+            timed_out = isinstance(exc, TimeoutError)
+            logger.log(
+                logging.WARNING if timed_out else logging.DEBUG,
                 "%s: a qna batch of %d expression(s) failed (%s); evaluating them one at a time",
                 self.host,
                 len(expressions),
-                f"no answer within {timeout_s}s" if isinstance(exc, TimeoutError) else repr(exc),
+                f"no answer within {timeout_s}s" if timed_out else repr(exc),
             )
             return None
         if code != 0:
@@ -834,7 +861,11 @@ class _GuardedRunner:
         except (TimeoutError, asyncio.CancelledError) as exc:
             if timeout is not None:
                 await transport._after_hang(
-                    command, timeout, cancelled=isinstance(exc, asyncio.CancelledError)
+                    self._inner,
+                    command,
+                    input,
+                    timeout,
+                    cancelled=isinstance(exc, asyncio.CancelledError),
                 )
             raise
         return result
