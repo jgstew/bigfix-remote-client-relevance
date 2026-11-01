@@ -19,6 +19,13 @@ too. A failed submit is that computer's result and is never
 resent: SaaS answers most failures with a bare 500, possibly after the query
 reached the root server.
 
+**Several expressions can share one query as a tuple** (#78):
+:meth:`TransportFastQuery.evaluate_client_relevance_tuple` sends
+``((e1), (e2), ...)`` and splits each answer back out, and hands the batch
+back -- ``None`` -- for anything that does not split cleanly. Which
+expressions are worth batching is the caller's call (the orchestrator's
+``tuple_batchable`` hints): this package cannot tell statically.
+
 **Version pinning does not apply to this transport.** Fast Query evaluates with
 whatever BES agent happens to be installed on each endpoint; there is no way to
 choose a qna version. That is inherent to the mechanism, not a first-cut
@@ -29,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import time
@@ -85,6 +93,12 @@ MAX_CONCURRENT_CALLS = 4
 
 _T = TypeVar("_T")
 
+# A tuple item whose display holds any of these is shown wrapped, as
+# `( a, b )` -- observed with qna 11.0.7 and through REST Fast Query (#78) --
+# so an answer part holding one cannot be trusted to be the item's own text.
+_WRAP_MARKERS = (",", "(", ")")
+TUPLE_SEPARATOR = ", "
+
 
 class _CallTimeout(Exception):
     """A server call ran out of time; the message names which one."""
@@ -93,6 +107,35 @@ class _CallTimeout(Exception):
 # What usually keeps an endpoint silent: the submit succeeds regardless,
 # including for computers outside the operator's scope.
 NO_ANSWER_CAUSES = "offline, UDP notifications blocked, or client/relay older than 9.5 Patch 2"
+
+
+def tuple_relevance(expressions: Sequence[str]) -> str:
+    """``((e1), (e2), ...)``: the expressions as one tuple, each parenthesized
+    so its own top-level commas and operators stay its own."""
+    return "(" + TUPLE_SEPARATOR.join(f"({expression})" for expression in expressions) + ")"
+
+
+def split_tuple_answer(rows: Sequence[ClientQueryRow], count: int) -> list[str] | None:
+    """One computer's tuple answer as ``count`` items, or ``None`` if untrusted.
+
+    Trusted only as exactly one non-failure row that splits on ``", "`` into
+    exactly ``count`` parts, none holding ``,``, ``(`` or ``)``. Each item
+    contributes at least one part, and an item displays exactly as it would
+    alone unless it holds one of those characters, when it is wrapped as
+    ``( ... )`` -- so a clean split is each item's own answer, and anything
+    else is not: an error in any item fails the whole tuple, an empty item
+    empties it (one ``""`` row), and a plural one repeats it.
+    """
+    if len(rows) != 1 or rows[0].is_failure:
+        return None
+    parts = rows[0].result.split(TUPLE_SEPARATOR)
+    if len(parts) != count or any(m in part for part in parts for m in _WRAP_MARKERS):
+        return None
+    return parts
+
+
+def _silence(timeout_s: float) -> str:
+    return f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
 
 
 class TransportFastQuery:
@@ -226,6 +269,105 @@ class TransportFastQuery:
                 )
             ]
 
+    async def evaluate_client_relevance_tuple(
+        self, expressions: Sequence[str], *, timeout_s: float = 30.0
+    ) -> list[list[ClientRelevanceResult]] | None:
+        """Several expressions in one tuple query: one fan-out list each, or ``None``.
+
+        Sends ``((e1), (e2), ...)`` as one ClientQuery and splits each
+        computer's answer back into one result per expression -- the same
+        result, field for field, that expression would have had alone, plus
+        ``qna_batch_size``. Never raises. ``None`` hands the whole batch back
+        to be evaluated one expression at a time, which the caller does for
+        anything short of a clean split from every computer that answered:
+        a failed submit or poll, or an answer that is not exactly one row
+        splitting into one clean part per expression (see
+        :func:`split_tuple_answer`). A tuple says nothing about *which* item
+        failed, so the single queries are what report it.
+
+        A computer that never answers is reported unanswered for every
+        expression, as it would have been for each one alone: falling back
+        would only wait out the timeout again per expression.
+        """
+        if len(expressions) < 2:
+            return None
+        started = self._clock()
+        try:
+            return await self._tuple(list(expressions), timeout_s=timeout_s, started=started)
+        except _CallTimeout as exc:
+            logger.debug("Fast Query tuple of %d: %s", len(expressions), exc)
+        except Exception as exc:  # transports report, never raise
+            logger.debug("Fast Query tuple failed: %s", exc, exc_info=True)
+        return None
+
+    async def _tuple(
+        self, expressions: list[str], *, timeout_s: float, started: float
+    ) -> list[list[ClientRelevanceResult]] | None:
+        deadline = started + timeout_s
+        relevance = tuple_relevance(expressions)
+        ids = await self._target_ids(deadline)
+        if isinstance(ids, str):
+            return None
+        if self._one_computer_per_query:
+            rows, reasons, failed = await self._per_computer_rows(
+                relevance, ids, deadline, timeout_s
+            )
+            if failed:
+                return None
+        else:
+            submitted = await self._call(
+                "Fast Query submit",
+                self._backend.submit_client_query(
+                    relevance, ids, use_client_context=self._use_client_context
+                ),
+                deadline,
+            )
+            if submitted.error is not None or submitted.query_id is None:
+                return None
+            logger.info(
+                "Fast Query %s submitted to %d computer(s): a tuple of %d expressions",
+                submitted.query_id,
+                len(ids),
+                len(expressions),
+            )
+            rows, poll_error = await self._poll(submitted.query_id, set(ids), deadline)
+            if poll_error is not None:
+                return None
+            reasons = dict.fromkeys(ids, _silence(timeout_s))
+
+        by_computer: dict[int, list[ClientQueryRow]] = {}
+        for result_row in rows:
+            by_computer.setdefault(result_row.computer_id, []).append(result_row)
+        items: dict[int, list[str]] = {}
+        for computer_id, group in by_computer.items():
+            split = split_tuple_answer(group, len(expressions))
+            if split is None:
+                # DEBUG: an expression that will not split does so every run.
+                logger.debug(
+                    "Fast Query tuple of %d did not split for computer %d: %r",
+                    len(expressions),
+                    computer_id,
+                    [r.result for r in group][:3],
+                )
+                return None
+            items[computer_id] = split
+
+        cells: list[list[ClientRelevanceResult]] = []
+        for index, expression in enumerate(expressions):
+            # Each item as the one row the expression alone would have had.
+            # replace(), not the constructor: this module imports
+            # session-relevance for annotations only, never at run time.
+            item_rows = [
+                dataclasses.replace(group[0], result=items[computer_id][index])
+                for computer_id, group in by_computer.items()
+            ]
+            cells.append(
+                self._merge(
+                    expression, ids, item_rows, reasons, started, batch_size=len(expressions)
+                )
+            )
+        return cells
+
     async def _fanout(
         self, client_relevance: str, *, timeout_s: float, started: float
     ) -> list[ClientRelevanceResult]:
@@ -272,19 +414,9 @@ class TransportFastQuery:
         started: float,
         fail: Callable[[str], list[ClientRelevanceResult]],
     ) -> list[ClientRelevanceResult]:
-        ids = list(self._computer_ids)
-        if self._computer_query is not None:
-            resolved = await self._call(
-                "computer query",
-                self._backend.evaluate(f"ids of ({self._computer_query})"),
-                deadline,
-            )
-            if resolved.error is not None:
-                return fail(f"computer query failed: {resolved.error.message}")
-            ids.extend(int(answer) for answer in resolved.answer_strings)
-        ids = list(dict.fromkeys(ids))  # merged, first appearance wins
-        if not ids:
-            return fail("no computers to query (the computer query matched none)")
+        ids = await self._target_ids(deadline)
+        if isinstance(ids, str):
+            return fail(ids)
         if self._one_computer_per_query:
             return await self._run_per_computer(client_relevance, ids, deadline, timeout_s, started)
 
@@ -301,8 +433,25 @@ class TransportFastQuery:
         logger.info("Fast Query %s submitted to %d computer(s)", submitted.query_id, len(ids))
 
         rows, poll_error = await self._poll(submitted.query_id, set(ids), deadline)
-        silence = poll_error or f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
+        silence = poll_error or _silence(timeout_s)
         return self._merge(client_relevance, ids, rows, dict.fromkeys(ids, silence), started)
+
+    async def _target_ids(self, deadline: float) -> list[int] | str:
+        """The computers to query, or why there are none."""
+        ids = list(self._computer_ids)
+        if self._computer_query is not None:
+            resolved = await self._call(
+                "computer query",
+                self._backend.evaluate(f"ids of ({self._computer_query})"),
+                deadline,
+            )
+            if resolved.error is not None:
+                return f"computer query failed: {resolved.error.message}"
+            ids.extend(int(answer) for answer in resolved.answer_strings)
+        ids = list(dict.fromkeys(ids))  # merged, first appearance wins
+        if not ids:
+            return "no computers to query (the computer query matched none)"
+        return ids
 
     async def _run_per_computer(
         self,
@@ -313,6 +462,18 @@ class TransportFastQuery:
         started: float,
     ) -> list[ClientRelevanceResult]:
         """One query per computer, side by side, merged like one query's rows."""
+        rows, reasons, _ = await self._per_computer_rows(client_relevance, ids, deadline, timeout_s)
+        return self._merge(client_relevance, ids, rows, reasons, started)
+
+    async def _per_computer_rows(
+        self,
+        client_relevance: str,
+        ids: list[int],
+        deadline: float,
+        timeout_s: float,
+    ) -> tuple[list[ClientQueryRow], dict[int, str], set[int]]:
+        """Every computer's rows from its own query, why each unanswered one
+        has none, and which of those failed rather than stayed silent."""
         # INFO once per transport: a batch of expressions would repeat it.
         logger.log(
             logging.DEBUG if self._told_per_computer else logging.INFO,
@@ -328,13 +489,18 @@ class TransportFastQuery:
                 for computer_id in ids
             )
         )
-        rows = [result_row for computer_rows, _ in outcomes for result_row in computer_rows]
+        rows = [result_row for computer_rows, _, _ in outcomes for result_row in computer_rows]
         reasons = {
             computer_id: reason
-            for computer_id, (_, reason) in zip(ids, outcomes, strict=True)
+            for computer_id, (_, reason, _) in zip(ids, outcomes, strict=True)
             if reason is not None
         }
-        return self._merge(client_relevance, ids, rows, reasons, started)
+        failed = {
+            computer_id
+            for computer_id, (_, _, silent) in zip(ids, outcomes, strict=True)
+            if computer_id in reasons and not silent
+        }
+        return rows, reasons, failed
 
     async def _one_computer(
         self,
@@ -343,17 +509,19 @@ class TransportFastQuery:
         deadline: float,
         timeout_s: float,
         calls: asyncio.Semaphore,
-    ) -> tuple[list[ClientQueryRow], str | None]:
+    ) -> tuple[list[ClientQueryRow], str | None, bool]:
         """This computer's rows, or why it has none; never raises.
 
         Anything going wrong here -- a refused submit, a raise, a call that
-        times out -- is this computer's alone; the others carry on.
+        times out -- is this computer's alone; the others carry on. The flag
+        is whether a computer without rows was merely silent: its query went
+        out and was polled cleanly to the end.
         """
         try:
             async with calls:
                 if self._clock() >= deadline:
                     # Sent this late, its answer could not count anyway.
-                    return [], f"not submitted: the {timeout_s:g} s timeout ran out first"
+                    return [], f"not submitted: the {timeout_s:g} s timeout ran out first", False
                 submitted = await self._call(
                     "Fast Query submit",
                     self._backend.submit_client_query(
@@ -364,15 +532,15 @@ class TransportFastQuery:
                     deadline,
                 )
         except _CallTimeout as exc:  # already says it was the submit
-            return [], str(exc)
+            return [], str(exc), False
         except Exception as exc:  # this computer's failure, not the run's
             logger.debug("Fast Query submit to computer %d raised", computer_id, exc_info=True)
-            return [], f"Fast Query submit failed: {exc}"
+            return [], f"Fast Query submit failed: {exc}", False
         if submitted.error is not None or submitted.query_id is None:
             # Never resent: SaaS answers a bare 500 for most failures,
             # possibly after the query reached the root server.
             message = submitted.error.message if submitted.error else "no query id returned"
-            return [], f"Fast Query submit failed: {message}"
+            return [], f"Fast Query submit failed: {message}", False
         logger.debug("Fast Query %s submitted to computer %d", submitted.query_id, computer_id)
         try:
             rows, poll_error = await self._poll(
@@ -380,10 +548,12 @@ class TransportFastQuery:
             )
         except Exception as exc:  # this computer's failure, not the run's
             logger.debug("Fast Query results for computer %d raised", computer_id, exc_info=True)
-            return [], f"Fast Query results failed: {exc}"
+            return [], f"Fast Query results failed: {exc}", False
         if any(result_row.computer_id == computer_id for result_row in rows):
-            return rows, None
-        return rows, poll_error or f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
+            return rows, None, True
+        if poll_error is not None:
+            return rows, poll_error, False
+        return rows, _silence(timeout_s), True
 
     def _merge(
         self,
@@ -392,10 +562,13 @@ class TransportFastQuery:
         rows: list[ClientQueryRow],
         reasons: dict[int, str],
         started: float,
+        *,
+        batch_size: int | None = None,
     ) -> list[ClientRelevanceResult]:
         """Answered computers by name, then the rest in targeting order.
 
-        ``reasons`` says why each unanswered computer has no answer.
+        ``reasons`` says why each unanswered computer has no answer;
+        ``batch_size`` goes on the answered ones, which a tuple batch answered.
         """
         by_computer: dict[int, list[ClientQueryRow]] = {}
         for result_row in rows:
@@ -404,7 +577,7 @@ class TransportFastQuery:
 
         answered = sorted(
             (
-                self._computer_result(client_relevance, group, elapsed_ms)
+                self._computer_result(client_relevance, group, elapsed_ms, batch_size)
                 for group in by_computer.values()
             ),
             key=lambda result: result.host.lower(),
@@ -469,7 +642,11 @@ class TransportFastQuery:
         return rows, None
 
     def _computer_result(
-        self, client_relevance: str, rows: list[ClientQueryRow], elapsed_ms: int
+        self,
+        client_relevance: str,
+        rows: list[ClientQueryRow],
+        elapsed_ms: int,
+        batch_size: int | None = None,
     ) -> ClientRelevanceResult:
         first = rows[0]
         failures = [r.result for r in rows if r.is_failure]
@@ -485,6 +662,7 @@ class TransportFastQuery:
             raw_qna_output=json.dumps([r.to_dict() for r in rows]),
             elapsed_ms=elapsed_ms,
             use_client_context=self._use_client_context,
+            qna_batch_size=batch_size,
         )
 
     def _failure(
@@ -501,4 +679,10 @@ class TransportFastQuery:
         )
 
 
-__all__ = ["MAX_CONCURRENT_CALLS", "NO_ANSWER_CAUSES", "TransportFastQuery"]
+__all__ = [
+    "MAX_CONCURRENT_CALLS",
+    "NO_ANSWER_CAUSES",
+    "TransportFastQuery",
+    "split_tuple_answer",
+    "tuple_relevance",
+]

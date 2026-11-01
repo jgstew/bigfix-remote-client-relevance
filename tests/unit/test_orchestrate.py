@@ -38,7 +38,11 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
-from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport
+from bigfix_remote_client_relevance.transports import (
+    BatchTransport,
+    FanOutTransport,
+    TupleFanOutTransport,
+)
 
 
 class FakeTransport:
@@ -175,6 +179,9 @@ class _WithBoth:
     async def evaluate_client_relevance_batch(self, expressions, *, qna=None, timeout_s=30.0):
         return None
 
+    async def evaluate_client_relevance_tuple(self, expressions, *, timeout_s=30.0):
+        return None
+
 
 class _Neither:
     pass
@@ -187,6 +194,7 @@ class _SubOfBoth(_WithBoth):
 class _DisabledOnClass:
     evaluate_client_relevance_fanout = None
     evaluate_client_relevance_batch = None
+    evaluate_client_relevance_tuple = None
 
 
 class _Proxy:
@@ -197,7 +205,11 @@ class _Proxy:
 
 
 class _Slotted:
-    __slots__ = ("evaluate_client_relevance_batch", "evaluate_client_relevance_fanout")
+    __slots__ = (
+        "evaluate_client_relevance_batch",
+        "evaluate_client_relevance_fanout",
+        "evaluate_client_relevance_tuple",
+    )
 
 
 class _Registered:
@@ -206,12 +218,14 @@ class _Registered:
 
 FanOutTransport.register(_Registered)
 BatchTransport.register(_Registered)
+TupleFanOutTransport.register(_Registered)
 
 
 def _instance_assigned():
     transport = _Neither()
     transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
     transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    transport.evaluate_client_relevance_tuple = _WithBoth().evaluate_client_relevance_tuple
     return transport
 
 
@@ -219,6 +233,7 @@ def _instance_none_over_class():
     transport = _WithBoth()
     transport.evaluate_client_relevance_fanout = None
     transport.evaluate_client_relevance_batch = None
+    transport.evaluate_client_relevance_tuple = None
     return transport
 
 
@@ -226,6 +241,7 @@ def _assigned_over_disabled_class():
     transport = _DisabledOnClass()
     transport.evaluate_client_relevance_fanout = _WithBoth().evaluate_client_relevance_fanout
     transport.evaluate_client_relevance_batch = _WithBoth().evaluate_client_relevance_batch
+    transport.evaluate_client_relevance_tuple = _WithBoth().evaluate_client_relevance_tuple
     return transport
 
 
@@ -250,7 +266,9 @@ CAPABILITY_CASES = {
 }
 
 
-@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+@pytest.mark.parametrize(
+    "protocol", [FanOutTransport, BatchTransport, TupleFanOutTransport], ids=lambda p: p.__name__
+)
 @pytest.mark.parametrize("case", CAPABILITY_CASES)
 def test_capabilities_match_isinstance(case, protocol):
     from bigfix_remote_client_relevance.orchestrate import _Capabilities
@@ -259,7 +277,11 @@ def test_capabilities_match_isinstance(case, protocol):
     transport = make()
 
     capabilities = _Capabilities()
-    check = {FanOutTransport: capabilities.fan_out, BatchTransport: capabilities.batch}[protocol]
+    check = {
+        FanOutTransport: capabilities.fan_out,
+        BatchTransport: capabilities.batch,
+        TupleFanOutTransport: capabilities.tuple_fan_out,
+    }[protocol]
 
     assert check(transport) is expected
     if sys.version_info >= (3, 12):
@@ -303,7 +325,9 @@ def test_capabilities_see_a_method_added_to_the_class_after_a_miss(monkeypatch):
 
 
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="__protocol_attrs__ is 3.12+")
-@pytest.mark.parametrize("protocol", [FanOutTransport, BatchTransport], ids=lambda p: p.__name__)
+@pytest.mark.parametrize(
+    "protocol", [FanOutTransport, BatchTransport, TupleFanOutTransport], ids=lambda p: p.__name__
+)
 def test_capabilities_know_every_protocol_member(protocol):
     """The cache checks one named method per protocol; a member added to the
     protocol must be added there too, or the answers quietly drift."""
@@ -3120,3 +3144,254 @@ async def test_a_fanout_transport_can_ask_for_fewer_expressions_at_once():
     )
 
     assert tracker["peak"] == 1
+
+
+# --- fan-out tuple batches: hinted expressions share one query (#78) ---------
+
+
+class FakeTupleFanOutTransport(FakeFanOutTransport):
+    """Answers a tuple batch the way each expression would answer alone,
+    unless ``refuse`` -- a tuple that did not split -- hands it back."""
+
+    def __init__(self, hosts: list[str], *, refuse: bool = False, tracker=None) -> None:
+        super().__init__(hosts)
+        self.refuse = refuse
+        self.tuples: list[list[str]] = []
+        self.singles: list[str] = []
+        self._tracker = tracker
+
+    async def evaluate_client_relevance_fanout(self, client_relevance, *, timeout_s=30.0):
+        self.singles.append(client_relevance)
+        return await self._timed(super().evaluate_client_relevance_fanout(client_relevance))
+
+    async def evaluate_client_relevance_tuple(self, expressions, *, timeout_s=30.0):
+        self.tuples.append(list(expressions))
+        if self.refuse:
+            return None
+        cells = [
+            await FakeFanOutTransport.evaluate_client_relevance_fanout(self, expression)
+            for expression in expressions
+        ]
+        for cell in cells:
+            for result in cell:
+                result.qna_batch_size = len(expressions)
+        return await self._timed(asyncio.sleep(0, cells))
+
+    async def _timed(self, work):
+        if self._tracker is None:
+            return await work
+        self._tracker["live"] += 1
+        self._tracker["peak"] = max(self._tracker["peak"], self._tracker["live"])
+        try:
+            await asyncio.sleep(0.01)
+            return await work
+        finally:
+            self._tracker["live"] -= 1
+
+
+def _answers(results):
+    return [(r.client_relevance, r.host, r.answers, r.error) for r in results]
+
+
+async def test_hinted_expressions_share_tuple_queries_of_at_most_ten():
+    from bigfix_remote_client_relevance.orchestrate import FANOUT_TUPLE_SIZE, evaluate_many
+
+    transport = FakeTupleFanOutTransport(["alpha", "beta"])
+    expressions = [f"e{i}" for i in range(24)]
+    hints = [i not in (3, 7) for i in range(24)]
+
+    results = await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: transport,
+        tuple_batchable=hints,
+    )
+
+    assert FANOUT_TUPLE_SIZE == 10
+    batched = [e for i, e in enumerate(expressions) if hints[i]]
+    assert transport.tuples == [batched[:10], batched[10:20], batched[20:]]
+    assert sorted(transport.singles) == ["e3", "e7"]
+    assert _answers(results) == [
+        (e, host, [f"{e}@{host}"], None) for e in expressions for host in ("alpha", "beta")
+    ]
+
+
+async def test_results_are_the_same_with_tuple_hints_and_without():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    expressions = [f"e{i}" for i in range(7)]
+    target = [Target(kind="fastquery", name="lab")]
+
+    hinted = await evaluate_many(
+        expressions,
+        target,
+        transport_factory=lambda t: FakeTupleFanOutTransport(["alpha", "beta"]),
+        tuple_batchable=[True] * 7,
+    )
+    plain = await evaluate_many(
+        expressions,
+        target,
+        transport_factory=lambda t: FakeTupleFanOutTransport(["alpha", "beta"]),
+    )
+
+    assert _answers(hinted) == _answers(plain)
+
+
+async def test_without_hints_nothing_is_tupled():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeTupleFanOutTransport(["alpha"])
+
+    await evaluate_many(
+        EXPRESSIONS, [Target(kind="fastquery", name="lab")], transport_factory=lambda t: transport
+    )
+
+    assert transport.tuples == []
+    assert sorted(transport.singles) == sorted(EXPRESSIONS)
+
+
+async def test_batch_false_turns_tuples_off_too():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeTupleFanOutTransport(["alpha"])
+
+    await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="fastquery", name="lab")],
+        batch=False,
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * len(EXPRESSIONS),
+    )
+
+    assert transport.tuples == []
+
+
+async def test_a_lone_hinted_expression_is_not_a_tuple():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeTupleFanOutTransport(["alpha"])
+    expressions = [f"e{i}" for i in range(11)]
+
+    await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * 10 + [False],
+    )
+    assert transport.tuples == [expressions[:10]]
+
+    transport = FakeTupleFanOutTransport(["alpha"])
+    await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] + [False] * 10,
+    )
+    assert transport.tuples == []
+    assert sorted(transport.singles) == sorted(expressions)
+
+
+async def test_a_tuple_handed_back_is_evaluated_one_at_a_time_and_no_more_are_tried():
+    """Whatever stopped one tuple -- an agent that formats answers its own
+    way, an expression that errors -- likely stops the next: one failed
+    tuple per group is the most batching may cost."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeTupleFanOutTransport(["alpha"], refuse=True)
+    expressions = [f"e{i}" for i in range(25)]
+
+    results = await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * 25,
+        max_parallel=1,
+    )
+
+    assert len(transport.tuples) == 1
+    assert sorted(transport.singles) == sorted(expressions)
+    assert _answers(results) == [(e, "alpha", [f"{e}@alpha"], None) for e in expressions]
+
+
+async def test_a_tuple_that_raises_is_handed_back():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class Raising(FakeTupleFanOutTransport):
+        async def evaluate_client_relevance_tuple(self, expressions, *, timeout_s=30.0):
+            self.tuples.append(list(expressions))
+            raise RuntimeError("boom")
+
+    transport = Raising(["alpha"])
+
+    results = await evaluate_many(
+        EXPRESSIONS,
+        [Target(kind="fastquery", name="lab")],
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * len(EXPRESSIONS),
+    )
+
+    assert transport.tuples == [EXPRESSIONS]
+    assert _answers(results) == [(e, "alpha", [f"{e}@alpha"], None) for e in EXPRESSIONS]
+
+
+async def test_a_tuple_takes_one_of_the_five_lanes():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    tracker = {"live": 0, "peak": 0}
+    expressions = [f"e{i}" for i in range(60)]
+
+    await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        max_parallel=50,
+        transport_factory=lambda t: FakeTupleFanOutTransport(["alpha"], tracker=tracker),
+        tuple_batchable=[i % 2 == 0 for i in range(60)],
+    )
+
+    assert tracker["peak"] == 5
+
+
+async def test_tuple_hints_must_match_the_expressions():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    with pytest.raises(ValueError, match="tuple_batchable"):
+        await evaluate_many(
+            EXPRESSIONS,
+            [Target(kind="fastquery", name="lab")],
+            transport_factory=lambda t: FakeTupleFanOutTransport(["alpha"]),
+            tuple_batchable=[True],
+        )
+
+
+async def test_tuple_hints_leave_other_transports_alone():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    transport = FakeBatchTransport("u")
+
+    results = await evaluate_many(
+        EXPRESSIONS,
+        [CONTAINER],
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * len(EXPRESSIONS),
+    )
+
+    assert [r.client_relevance for r in results] == EXPRESSIONS
+
+
+async def test_tuple_hints_stream_too():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many_stream
+
+    transport = FakeTupleFanOutTransport(["alpha"])
+
+    results = [
+        result
+        async for result in evaluate_many_stream(
+            EXPRESSIONS,
+            [Target(kind="fastquery", name="lab")],
+            transport_factory=lambda t: transport,
+            tuple_batchable=[True] * len(EXPRESSIONS),
+        )
+    ]
+
+    assert transport.tuples == [EXPRESSIONS]
+    assert sorted(r.client_relevance for r in results) == sorted(EXPRESSIONS)

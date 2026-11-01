@@ -934,3 +934,266 @@ async def test_one_target_calls_after_the_deadline_share_one_hard_stop(monkeypat
     skipped = [r for r in results if "not checked" in (r.error or "")]
     assert skipped, [r.error for r in results]
     assert skipped[0].error == "Fast Query results not checked: the timeout ran out first"
+
+
+# --- tuple batches: several expressions in one ClientQuery (#78) -------------
+
+
+class FakeAgents(FakeClientQueryBackend):
+    """Endpoints that answer by what was asked: ``answers[relevance][computer]``.
+
+    Every submit gets its own query id, so a tuple and the single queries a
+    fallback sends are told apart. A computer with no entry never answers.
+    """
+
+    def __init__(self, answers: dict[str, dict[int, Sequence[ClientQueryRow]]], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._answers = answers
+        self._queries: dict[int, tuple[str, list[int]]] = {}
+
+    async def submit_client_query(self, client_relevance, computer_ids, *, use_client_context):
+        await super().submit_client_query(
+            client_relevance, computer_ids, use_client_context=use_client_context
+        )
+        query_id = 1000 + len(self._queries)
+        self._queries[query_id] = (client_relevance, list(computer_ids))
+        return _response(query_id=query_id)
+
+    async def client_query_results(self, query_id):
+        self.polled.append(query_id)
+        relevance, ids = self._queries[query_id]
+        by_computer = self._answers.get(relevance, {})
+        rows = [r for computer_id in ids for r in by_computer.get(computer_id, ())]
+        return _response(query_id=query_id, rows=rows)
+
+
+def _comparable(results):
+    return [
+        (
+            r.host,
+            r.transport,
+            r.client_relevance,
+            r.answers,
+            r.answer_types,
+            r.error,
+            r.error_kind,
+            r.raw_qna_output,
+            r.use_client_context,
+        )
+        for r in results
+    ]
+
+
+TUPLE_AB = '((name of operating system), (exists file "x"))'
+
+
+def _agents_ab(**kwargs) -> FakeAgents:
+    """Two computers that answer both expressions alone and as one tuple."""
+    return FakeAgents(
+        {
+            "name of operating system": {
+                11: [row(11, "Win11", name="beta")],
+                12: [row(12, "Linux", name="alpha")],
+            },
+            'exists file "x"': {
+                11: [row(11, "True", name="beta")],
+                12: [row(12, "False", name="alpha")],
+            },
+            TUPLE_AB: {
+                11: [row(11, "Win11, True", name="beta")],
+                12: [row(12, "Linux, False", name="alpha")],
+            },
+        },
+        **kwargs,
+    )
+
+
+async def test_tuple_batch_is_one_query_split_back_per_expression():
+    backend = _agents_ab()
+    expressions = ["name of operating system", 'exists file "x"']
+
+    cells = await make(backend, computer_ids=[11, 12]).evaluate_client_relevance_tuple(
+        expressions, timeout_s=30
+    )
+
+    assert backend.submitted == [(TUPLE_AB, [11, 12])]
+    assert cells is not None
+    assert [[(r.host, r.answers) for r in cell] for cell in cells] == [
+        [("alpha", ["Linux"]), ("beta", ["Win11"])],
+        [("alpha", ["False"]), ("beta", ["True"])],
+    ]
+    assert all(r.qna_batch_size == 2 for cell in cells for r in cell)
+
+
+async def test_tuple_batch_results_match_the_expressions_run_alone():
+    """Batching changes how many queries go out, never what a result says."""
+    expressions = ["name of operating system", 'exists file "x"']
+    transport = make(_agents_ab(), computer_ids=[11, 12, 99], use_client_context=True)
+
+    cells = await transport.evaluate_client_relevance_tuple(expressions, timeout_s=30)
+    alone = [
+        await transport.evaluate_client_relevance_fanout(expression, timeout_s=30)
+        for expression in expressions
+    ]
+
+    assert cells is not None
+    assert [_comparable(cell) for cell in cells] == [_comparable(cell) for cell in alone]
+
+
+async def test_a_silent_computer_is_unanswered_for_every_expression_without_falling_back():
+    """An offline computer would be just as silent for each expression on its
+    own; falling back would only wait out the timeout once per expression."""
+    backend = _agents_ab()
+
+    cells = await make(backend, computer_ids=[11, 99]).evaluate_client_relevance_tuple(
+        ["name of operating system", 'exists file "x"'], timeout_s=20
+    )
+
+    assert cells is not None
+    assert len(backend.submitted) == 1
+    for cell in cells:
+        assert [r.host for r in cell] == ["beta", "99"]
+        assert cell[1].error == (
+            "no answer within 20 s (offline, UDP notifications blocked, or "
+            "client/relay older than 9.5 Patch 2)"
+        )
+        assert cell[1].qna_batch_size is None
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([row(11, "Win11, True, extra")], id="too-many-parts"),
+        pytest.param([row(11, "Win11")], id="too-few-parts"),
+        pytest.param([row(11, "")], id="empty-plural-item"),
+        pytest.param([row(11, "( a, b ), True")], id="wrapped-item"),
+        pytest.param([row(11, "a,b, True")], id="comma-in-item"),
+        pytest.param([row(11, "(a, True")], id="paren-in-item"),
+        pytest.param([row(11, "Win11, True"), row(11, "Win11, False")], id="plural-item"),
+        pytest.param(
+            [row(11, "Singular expression refers to nonexistent object.", failure=True)],
+            id="error-item",
+        ),
+    ],
+)
+async def test_an_answer_that_does_not_split_cleanly_hands_the_batch_back(rows):
+    """Anything but one answer of exactly N clean parts is untrusted: a tuple
+    item holding ``,``, ``(`` or ``)`` is displayed wrapped as ``( ... )``,
+    an empty item empties the tuple, a plural one repeats it, and an error in
+    any item is the whole tuple's error."""
+    backend = FakeAgents({TUPLE_AB: {11: rows, 12: [row(12, "Linux, False")]}})
+
+    cells = await make(backend, computer_ids=[11, 12]).evaluate_client_relevance_tuple(
+        ["name of operating system", 'exists file "x"'], timeout_s=30
+    )
+
+    assert cells is None
+    assert len(backend.submitted) == 1, "the fallback is the orchestrator's"
+
+
+async def test_a_failed_submit_hands_the_batch_back():
+    backend = FakeClientQueryBackend(
+        submit=_response(error=ResultError(kind="http", message="HTTP 400: bad relevance"))
+    )
+
+    cells = await make(backend, computer_ids=[11]).evaluate_client_relevance_tuple(
+        ["true", "false"], timeout_s=30
+    )
+
+    assert cells is None
+
+
+async def test_a_failed_poll_hands_the_batch_back():
+    backend = FakeClientQueryBackend(
+        polls=[_response(error=ResultError(kind="http", message="HTTP 400: cannot get results"))]
+    )
+
+    cells = await make(backend, computer_ids=[11]).evaluate_client_relevance_tuple(
+        ["true", "false"], timeout_s=30
+    )
+
+    assert cells is None
+
+
+async def test_a_failed_computer_query_hands_the_batch_back():
+    backend = FakeClientQueryBackend(ids=ResultError(kind="session_relevance", message="nope"))
+
+    cells = await make(backend, computer_query="bogus").evaluate_client_relevance_tuple(
+        ["true", "false"], timeout_s=30
+    )
+
+    assert cells is None
+    assert backend.submitted == []
+
+
+async def test_a_tuple_batch_never_raises():
+    class Exploding(FakeClientQueryBackend):
+        async def submit_client_query(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    cells = await make(Exploding(), computer_ids=[11]).evaluate_client_relevance_tuple(
+        ["true", "false"], timeout_s=30
+    )
+
+    assert cells is None
+
+
+async def test_fewer_than_two_expressions_are_not_a_tuple():
+    backend = FakeClientQueryBackend()
+
+    cells = await make(backend, computer_ids=[11]).evaluate_client_relevance_tuple(
+        ["true"], timeout_s=30
+    )
+
+    assert cells is None
+    assert backend.submitted == []
+
+
+async def test_one_target_tuple_batch_is_one_query_per_computer():
+    backend = FakeOneTargetBackend(
+        answers={11: [row(11, "a, 1", name="alpha")], 12: [row(12, "b, 2", name="beta")]}
+    )
+
+    cells = await make_one_target(backend, computer_ids=[11, 12]).evaluate_client_relevance_tuple(
+        ["x", "y"], timeout_s=30
+    )
+
+    assert sorted(backend.submitted) == [("((x), (y))", [11]), ("((x), (y))", [12])]
+    assert cells is not None
+    assert [[(r.host, r.answers) for r in cell] for cell in cells] == [
+        [("alpha", ["a"]), ("beta", ["b"])],
+        [("alpha", ["1"]), ("beta", ["2"])],
+    ]
+
+
+async def test_one_target_refused_submit_hands_the_batch_back():
+    """On SaaS a refused submit is that computer's alone; for a tuple it
+    says nothing about which expression was refused, so the batch goes back."""
+    backend = FakeOneTargetBackend(
+        answers={11: [row(11, "a, 1", name="alpha")]}, refuse={12: SERVER_500}
+    )
+
+    cells = await make_one_target(backend, computer_ids=[11, 12]).evaluate_client_relevance_tuple(
+        ["x", "y"], timeout_s=30
+    )
+
+    assert cells is None
+
+
+@pytest.mark.parametrize("use_client_context", [True, False])
+async def test_tuple_batch_forwards_and_records_the_client_context(use_client_context):
+    backend = _agents_ab()
+
+    cells = await make(
+        backend, computer_ids=[11, 12], use_client_context=use_client_context
+    ).evaluate_client_relevance_tuple(["name of operating system", 'exists file "x"'], timeout_s=30)
+
+    assert backend.contexts == [use_client_context]
+    assert cells is not None
+    assert all(r.use_client_context is use_client_context for cell in cells for r in cell)
+
+
+def test_the_fast_query_transport_offers_tuple_batches():
+    from bigfix_remote_client_relevance.transports import TupleFanOutTransport
+
+    assert isinstance(make(FakeClientQueryBackend(), computer_ids=[1]), TupleFanOutTransport)
