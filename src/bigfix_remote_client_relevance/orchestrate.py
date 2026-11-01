@@ -45,7 +45,12 @@ from bigfix_remote_client_relevance.results import (
     ClientRelevanceResult,
     ResolvedQna,
 )
-from bigfix_remote_client_relevance.transports import BatchTransport, FanOutTransport, Transport
+from bigfix_remote_client_relevance.transports import (
+    BatchTransport,
+    FanOutTransport,
+    Transport,
+    TupleFanOutTransport,
+)
 from bigfix_remote_client_relevance.transports import ssh as ssh_transport
 from bigfix_remote_client_relevance.transports.batch import chunk_expressions
 
@@ -94,6 +99,13 @@ FANOUT_PARALLEL_EXPRESSIONS = 5
 """Most expressions a fan-out (Fast Query) target has in flight at once. Each
 is its own query to a BigFix server shared by everyone, so a batch is run a
 few at a time, not all at once."""
+
+FANOUT_TUPLE_SIZE = 10
+"""Most hinted expressions one fan-out tuple query carries (see
+``tuple_batchable`` on :func:`evaluate_many`). One item that errors, comes
+back empty or plural fails the whole tuple, and then every expression in it
+is sent again on its own, so this bounds what one wrong hint costs as much as
+it buys round trips."""
 
 
 @dataclass
@@ -569,6 +581,7 @@ async def _release(transport: object) -> None:
 _PROTOCOL_METHOD: dict[type, str] = {
     FanOutTransport: "evaluate_client_relevance_fanout",
     BatchTransport: "evaluate_client_relevance_batch",
+    TupleFanOutTransport: "evaluate_client_relevance_tuple",
 }
 
 
@@ -613,6 +626,9 @@ class _Capabilities:
     def batch(self, transport: object) -> TypeGuard[BatchTransport]:
         return self._supports(transport, BatchTransport)
 
+    def tuple_fan_out(self, transport: object) -> TypeGuard[TupleFanOutTransport]:
+        return self._supports(transport, TupleFanOutTransport)
+
     def _supports(self, transport: object, protocol: type) -> bool:
         if self._class_supports(type(transport), protocol):
             return True
@@ -651,6 +667,7 @@ async def _evaluate_stream_indexed(
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     session: SessionContext | None = None,
+    tuple_batchable: Sequence[bool] | None = None,
 ) -> AsyncIterator[tuple[tuple[int, int], ClientRelevanceResult]]:
     """Shared core: yield ``((work_index, sub), result)`` as each result lands.
 
@@ -672,6 +689,11 @@ async def _evaluate_stream_indexed(
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    if tuple_batchable is not None and len(tuple_batchable) != len(expressions):
+        raise ValueError(
+            f"tuple_batchable needs one hint per expression: got {len(tuple_batchable)} "
+            f"for {len(expressions)}"
+        )
     if (
         session is not None
         and transport_factory is not None
@@ -984,6 +1006,11 @@ async def _evaluate_stream_indexed(
                     for sub, result in enumerate(cell):
                         emit(index, result, sub)
 
+                if batch and tuple_batchable is not None and capabilities.tuple_fan_out(transport):
+                    await _fanout_tuples(transport, target, tuple_batchable, lanes, _cell, emit)
+                    return
+                # Without hints, exactly the pre-tuple path: no extra task or
+                # bookkeeping per target (500 targets measured it).
                 await asyncio.gather(*(_cell(i, e) for i, e in enumerate(expressions)))
                 return
 
@@ -1137,6 +1164,88 @@ async def _evaluate_stream_indexed(
             if not result.elapsed_ms:
                 result.elapsed_ms = elapsed_ms
         return results
+
+    async def _fanout_tuples(
+        transport: TupleFanOutTransport,
+        target: Target,
+        hints: Sequence[bool],
+        lanes: asyncio.Semaphore,
+        cell: Callable[[int, str], Coroutine[Any, Any, None]],
+        emit: Callable[..., None],
+    ) -> None:
+        """A fan-out group's expressions, hinted ones as tuples of up to
+        :data:`FANOUT_TUPLE_SIZE`; the rest, and any tuple handed back, by
+        ``cell`` one at a time."""
+        hinted = [i for i, hint in enumerate(hints) if hint]
+        chunks = [
+            hinted[start : start + FANOUT_TUPLE_SIZE]
+            for start in range(0, len(hinted), FANOUT_TUPLE_SIZE)
+        ]
+        # One alone is not a tuple: it goes the usual way.
+        chunks = [chunk for chunk in chunks if len(chunk) > 1]
+        tupled = {index for chunk in chunks for index in chunk}
+        tupling = True
+
+        async def _tuple_cell(chunk: list[int]) -> None:
+            nonlocal tupling
+            cells = None
+            async with lanes:
+                # Asked once a lane is free, not before: a tuple queued
+                # behind one that failed is not sent. Those already in
+                # flight (at most the lanes) still go.
+                if tupling:
+                    cells = await _evaluate_fanout_tuple(
+                        transport, target, [expressions[i] for i in chunk]
+                    )
+            if cells is None:
+                # Whatever stopped this tuple -- an item that errors or does
+                # not split, an agent formatting answers its own way -- would
+                # most likely stop the next one too, so no more are sent for
+                # this group.
+                tupling = False
+                await asyncio.gather(*(cell(i, expressions[i]) for i in chunk))
+                return
+            for index, results in zip(chunk, cells, strict=True):
+                for sub, result in enumerate(results):
+                    emit(index, result, sub)
+
+        async def _tuples() -> None:
+            # The first tuple runs before the others, as the first qna
+            # expression does: it finds out whether tuples work here at all.
+            if chunks:
+                await _tuple_cell(chunks[0])
+                await asyncio.gather(*(_tuple_cell(chunk) for chunk in chunks[1:]))
+
+        await asyncio.gather(
+            _tuples(), *(cell(i, e) for i, e in enumerate(expressions) if i not in tupled)
+        )
+
+    async def _evaluate_fanout_tuple(
+        transport: TupleFanOutTransport, target: Target, chunk: list[str]
+    ) -> list[list[ClientRelevanceResult]] | None:
+        """A chunk as one tuple query: a cell per expression, or ``None`` to
+        evaluate them one at a time. One semaphore slot: it is one query."""
+        started = time.monotonic()
+        async with semaphore:
+            try:
+                cells = await transport.evaluate_client_relevance_tuple(chunk, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001 - the single path will report it
+                logger.debug("tuple failed for %s: %s", target.label, exc)
+                cells = None
+        if cells is None or len(cells) != len(chunk) or not all(cells):
+            # DEBUG: a target that cannot tuple will say so on every run.
+            logger.debug(
+                "%s: a tuple of %d did not split cleanly; evaluating one at a time",
+                target.label,
+                len(chunk),
+            )
+            return None
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        for cell in cells:
+            for result in cell:
+                if not result.elapsed_ms:
+                    result.elapsed_ms = elapsed_ms
+        return cells
 
     def _stamp(
         result: ClientRelevanceResult,
@@ -1392,11 +1501,13 @@ async def evaluate_many_stream(
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     session: SessionContext | None = None,
+    tuple_batchable: Sequence[bool] | None = None,
 ) -> AsyncIterator[ClientRelevanceResult]:
     """Evaluate every expression on every target, for every version.
 
     Yields each ``ClientRelevanceResult`` as soon as its cell finishes, in
-    completion order. See :func:`evaluate_many` for what a batch buys.
+    completion order. See :func:`evaluate_many` for what a batch buys and
+    for ``tuple_batchable``.
     """
     async for _index, result in _evaluate_stream_indexed(
         expressions,
@@ -1412,6 +1523,7 @@ async def evaluate_many_stream(
         batch=batch,
         batch_size=batch_size,
         session=session,
+        tuple_batchable=tuple_batchable,
     ):
         yield result
 
@@ -1431,6 +1543,7 @@ async def evaluate_many(
     batch: bool = True,
     batch_size: int = DEFAULT_BATCH_SIZE,
     session: SessionContext | None = None,
+    tuple_batchable: Sequence[bool] | None = None,
 ) -> list[ClientRelevanceResult]:
     """Evaluate several expressions across several targets in one pass.
 
@@ -1457,8 +1570,18 @@ async def evaluate_many(
     batching changes how fast results arrive, never what they say. Batched results carry ``qna_batch_size``, and their
     ``elapsed_ms`` is the whole qna run's. A fan-out target (Fast Query)
     instead runs up to :data:`FANOUT_PARALLEL_EXPRESSIONS` expressions at
-    once, each still its own query. ``batch=False`` evaluates everything one
-    expression at a time, as before.
+    once, each its own query unless ``tuple_batchable`` says otherwise.
+    ``batch=False`` evaluates everything one expression at a time, as before.
+
+    ``tuple_batchable`` -- one ``bool`` per expression, from a caller that
+    can tell (bigfix-relevance-analyzer can; this package cannot) -- lets a
+    fan-out target that supports it (:class:`~.transports.TupleFanOutTransport`,
+    Fast Query) send up to :data:`FANOUT_TUPLE_SIZE` hinted expressions as one
+    tuple query and split the answer back out. A tuple that does not split
+    cleanly is evaluated again one expression at a time, and no further
+    tuples are sent for that target (those already in flight still finish),
+    so results are the same with hints and without. Tupled results carry
+    ``qna_batch_size``. ``None``, the default, tuples nothing.
 
     Every failure mode is reported inside a result rather than raised, and a
     group that dies before evaluating anything still answers once per
@@ -1481,6 +1604,7 @@ async def evaluate_many(
         batch=batch,
         batch_size=batch_size,
         session=session,
+        tuple_batchable=tuple_batchable,
     ):
         by_index[index] = result
     return [by_index[i] for i in sorted(by_index)]

@@ -132,7 +132,11 @@ repos:
     rev: 57b21406f092110c18776e39b0bda50d37c945c8 # v2.4.3
     hooks:
       - id: codespell
-        exclude: *captured_page
+        # The spike corpus is real relevance as published, misspellings and
+        # odd inspector names included; "fixing" it would change what was
+        # measured.
+        exclude: (?x)( ^tests/fixtures/release_site/patch_page_10\.0\.16\.html$
+          | ^tools/batchability/(corpus\.jsonl|scores\.md)$ )
 
   # Enforces .editorconfig itself, which until now nothing checked - notably
   # the `end_of_line = crlf` rule for .bat/.cmd files. `mixed-line-ending`

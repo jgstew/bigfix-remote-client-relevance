@@ -420,6 +420,31 @@ runs them one at a time. Online evaluator targets also run one at a time.
 results = await evaluate_many(expressions, targets, batch=False)
 ```
 
+A Fast Query target can also send several expressions as **one** query,
+the tuple `((e1), (e2), ...)`, which saves a submit and a round of polling
+per expression. Only you can say which expressions are safe to share one:
+any item that errors, comes back empty or with several values fails the
+whole tuple. So it is opt-in, per expression, with `tuple_batchable`, one
+`bool` per expression (a front end with
+[bigfix-relevance-analyzer](https://github.com/jgstew/bigfix-relevance-analyzer)
+can work these out; this package does not depend on it):
+
+```python
+results = await evaluate_many(
+    ["version of client", 'exists file "/etc/hosts"', "names of local users"],
+    targets,
+    tuple_batchable=[True, True, False],
+)
+```
+
+Hinted expressions go ten to a tuple. A tuple is only trusted when every
+computer that answers gives exactly one answer that splits back into one
+clean part per expression, none holding `,`, `(` or `)` (an item holding one
+is shown wrapped, as `( a, b )`). Anything else sends that tuple's
+expressions again one at a time, and no more tuples go to that target (any
+already sent still finish), so results are the same with hints and without. Tupled results carry
+`qna_batch_size`.
+
 `evaluate_many_stream` is the completion-order form, the same way
 `evaluate_client_relevance_stream` is for the single-expression call.
 

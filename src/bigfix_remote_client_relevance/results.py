@@ -144,9 +144,10 @@ class ClientRelevanceResult:
     Always ``None`` for every other transport."""
 
     qna_batch_size: int | None = None
-    """How many expressions shared the one qna process that answered this
-    one, when :func:`~..orchestrate.evaluate_many` batched them; ``None``
-    when it ran alone. A batched result's ``elapsed_ms`` is that whole run's
+    """How many expressions shared the one qna process -- or, for Fast Query,
+    the one tuple query (``tuple_batchable``) -- that answered this one, when
+    :func:`~..orchestrate.evaluate_many` batched them; ``None`` when it ran
+    alone. A batched result's ``elapsed_ms`` is that whole run's
     wall time, so this is what makes it readable; ``qna_time`` stays the
     expression's own."""
 

@@ -75,6 +75,25 @@ class FanOutTransport(Protocol):
 
 
 @runtime_checkable
+class TupleFanOutTransport(Protocol):
+    """Optional, on a fan-out transport: several expressions as one tuple query.
+
+    Fast Query costs a submit plus polling per expression; ``( e1, e2, ... )``
+    answers them all in one. Only for expressions the caller hinted are
+    batchable (``tuple_batchable`` on ``evaluate_many``): an item that errors,
+    comes back empty or plural fails the whole tuple. Returning ``None`` --
+    never raising -- hands the chunk back to be evaluated one expression at a
+    time, which the single path reports in its own words.
+    """
+
+    async def evaluate_client_relevance_tuple(
+        self, expressions: Sequence[str], *, timeout_s: float = 30.0
+    ) -> list[list[ClientRelevanceResult]] | None:
+        """One fan-out result list per expression, in order; or ``None`` to fall back."""
+        ...
+
+
+@runtime_checkable
 class BatchTransport(Protocol):
     """Optional: many expressions through one qna process.
 
@@ -135,5 +154,6 @@ __all__ = [
     "BatchTransport",
     "FanOutTransport",
     "Transport",
+    "TupleFanOutTransport",
     "probe_arch_via_relevance",
 ]

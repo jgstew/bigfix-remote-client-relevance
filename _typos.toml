@@ -5,3 +5,8 @@
 # (bootstrap/release_site.py) and the captured checksum fixtures, breaking
 # real RHEL artifact matching.
 rhe = "rhe"
+
+[files]
+# Real relevance as published and what qna said about it: inspector names
+# and content typos included. "Fixing" them would change what was measured.
+extend-exclude = ["tools/batchability/corpus.jsonl", "tools/batchability/scores.md"]
