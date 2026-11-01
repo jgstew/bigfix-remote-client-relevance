@@ -7,6 +7,7 @@
 | macOS 15.7 x86_64 (SSH, installed agent) | 11.0.7.61 | 545 | 291 | 139 | 0 | 85 | 14 | 16 |
 | Rocky Linux 9.3 arm64 (container) | 11.0.7.61 | 545 | 176 | 143 | 107 | 102 | 6 | 11 |
 | Ubuntu 26.04 arm64 (container) | 11.0.7.61 | 545 | 198 | 135 | 90 | 105 | 6 | 11 |
+| Windows Server 2022 x86_64 (SSH, installed agent) | 11.0.7.61 | 545 | 336 | 72 | 0 | 105 | 13 | 19 |
 
 ## Precision of a "safe to batch" verdict
 
@@ -17,63 +18,75 @@ Container environment errors (no SMBIOS, Rocky's RPM symlink) are left out of ev
 | classifier (platform-agnostic) | dev | macOS 15.7 x86_64 (SSH, installed agent) | 146 | 120 | 82.2% | 81.6% |
 | classifier (platform-agnostic) | dev | Rocky Linux 9.3 arm64 (container) | 101 | 73 | 72.3% | 83.0% |
 | classifier (platform-agnostic) | dev | Ubuntu 26.04 arm64 (container) | 104 | 80 | 76.9% | 82.5% |
-| classifier (platform-agnostic) | dev | all hosts | 351 | 273 | 77.8% | 82.2% |
+| classifier (platform-agnostic) | dev | Windows Server 2022 x86_64 (SSH, installed agent) | 146 | 137 | 93.8% | 83.0% |
+| classifier (platform-agnostic) | dev | all hosts | 497 | 410 | 82.5% | 82.5% |
 | classifier (platform-agnostic) | holdout | macOS 15.7 x86_64 (SSH, installed agent) | 160 | 126 | 78.8% | 87.5% |
 | classifier (platform-agnostic) | holdout | Rocky Linux 9.3 arm64 (container) | 113 | 79 | 69.9% | 89.8% |
 | classifier (platform-agnostic) | holdout | Ubuntu 26.04 arm64 (container) | 118 | 89 | 75.4% | 88.1% |
-| classifier (platform-agnostic) | holdout | all hosts | 391 | 294 | 75.2% | 88.3% |
+| classifier (platform-agnostic) | holdout | Windows Server 2022 x86_64 (SSH, installed agent) | 160 | 148 | 92.5% | 86.5% |
+| classifier (platform-agnostic) | holdout | all hosts | 551 | 442 | 80.2% | 87.7% |
 | classifier (platform-agnostic) | all | macOS 15.7 x86_64 (SSH, installed agent) | 306 | 246 | 80.4% | 84.5% |
 | classifier (platform-agnostic) | all | Rocky Linux 9.3 arm64 (container) | 214 | 152 | 71.0% | 86.4% |
 | classifier (platform-agnostic) | all | Ubuntu 26.04 arm64 (container) | 222 | 169 | 76.1% | 85.4% |
-| classifier (platform-agnostic) | all | all hosts | 742 | 567 | 76.4% | 85.3% |
+| classifier (platform-agnostic) | all | Windows Server 2022 x86_64 (SSH, installed agent) | 306 | 285 | 93.1% | 84.8% |
+| classifier (platform-agnostic) | all | all hosts | 1048 | 852 | 81.3% | 85.1% |
 | classifier (platform known) | dev | macOS 15.7 x86_64 (SSH, installed agent) | 122 | 119 | 97.5% | 81.0% |
 | classifier (platform known) | dev | Rocky Linux 9.3 arm64 (container) | 74 | 72 | 97.3% | 81.8% |
 | classifier (platform known) | dev | Ubuntu 26.04 arm64 (container) | 81 | 79 | 97.5% | 81.4% |
-| classifier (platform known) | dev | all hosts | 277 | 270 | 97.5% | 81.3% |
+| classifier (platform known) | dev | Windows Server 2022 x86_64 (SSH, installed agent) | 141 | 137 | 97.2% | 83.0% |
+| classifier (platform known) | dev | all hosts | 418 | 407 | 97.4% | 81.9% |
 | classifier (platform known) | holdout | macOS 15.7 x86_64 (SSH, installed agent) | 130 | 125 | 96.2% | 86.8% |
 | classifier (platform known) | holdout | Rocky Linux 9.3 arm64 (container) | 80 | 78 | 97.5% | 88.6% |
 | classifier (platform known) | holdout | Ubuntu 26.04 arm64 (container) | 91 | 88 | 96.7% | 87.1% |
-| classifier (platform known) | holdout | all hosts | 301 | 291 | 96.7% | 87.4% |
+| classifier (platform known) | holdout | Windows Server 2022 x86_64 (SSH, installed agent) | 153 | 148 | 96.7% | 86.5% |
+| classifier (platform known) | holdout | all hosts | 454 | 439 | 96.7% | 87.1% |
 | classifier (platform known) | all | macOS 15.7 x86_64 (SSH, installed agent) | 252 | 244 | 96.8% | 83.8% |
 | classifier (platform known) | all | Rocky Linux 9.3 arm64 (container) | 154 | 150 | 97.4% | 85.2% |
 | classifier (platform known) | all | Ubuntu 26.04 arm64 (container) | 172 | 167 | 97.1% | 84.3% |
-| classifier (platform known) | all | all hosts | 578 | 561 | 97.1% | 84.4% |
+| classifier (platform known) | all | Windows Server 2022 x86_64 (SSH, installed agent) | 294 | 285 | 96.9% | 84.8% |
+| classifier (platform known) | all | all hosts | 872 | 846 | 97.0% | 84.5% |
 | plurality == SINGULAR only | dev | macOS 15.7 x86_64 (SSH, installed agent) | 193 | 140 | 72.5% | 95.2% |
 | plurality == SINGULAR only | dev | Rocky Linux 9.3 arm64 (container) | 143 | 84 | 58.7% | 95.5% |
 | plurality == SINGULAR only | dev | Ubuntu 26.04 arm64 (container) | 149 | 94 | 63.1% | 96.9% |
-| plurality == SINGULAR only | dev | all hosts | 485 | 318 | 65.6% | 95.8% |
+| plurality == SINGULAR only | dev | Windows Server 2022 x86_64 (SSH, installed agent) | 193 | 157 | 81.3% | 95.2% |
+| plurality == SINGULAR only | dev | all hosts | 678 | 475 | 70.1% | 95.6% |
 | plurality == SINGULAR only | holdout | macOS 15.7 x86_64 (SSH, installed agent) | 193 | 135 | 69.9% | 93.8% |
 | plurality == SINGULAR only | holdout | Rocky Linux 9.3 arm64 (container) | 143 | 85 | 59.4% | 96.6% |
 | plurality == SINGULAR only | holdout | Ubuntu 26.04 arm64 (container) | 151 | 98 | 64.9% | 97.0% |
-| plurality == SINGULAR only | holdout | all hosts | 487 | 318 | 65.3% | 95.5% |
+| plurality == SINGULAR only | holdout | Windows Server 2022 x86_64 (SSH, installed agent) | 193 | 159 | 82.4% | 93.0% |
+| plurality == SINGULAR only | holdout | all hosts | 680 | 477 | 70.1% | 94.6% |
 | plurality == SINGULAR only | all | macOS 15.7 x86_64 (SSH, installed agent) | 386 | 275 | 71.2% | 94.5% |
 | plurality == SINGULAR only | all | Rocky Linux 9.3 arm64 (container) | 286 | 169 | 59.1% | 96.0% |
 | plurality == SINGULAR only | all | Ubuntu 26.04 arm64 (container) | 300 | 192 | 64.0% | 97.0% |
-| plurality == SINGULAR only | all | all hosts | 972 | 636 | 65.4% | 95.6% |
+| plurality == SINGULAR only | all | Windows Server 2022 x86_64 (SSH, installed agent) | 386 | 316 | 81.9% | 94.0% |
+| plurality == SINGULAR only | all | all hosts | 1358 | 952 | 70.1% | 95.1% |
 | shape only (exists / number of / comparison / and-or-not at the root) | dev | macOS 15.7 x86_64 (SSH, installed agent) | 142 | 115 | 81.0% | 78.2% |
 | shape only (exists / number of / comparison / and-or-not at the root) | dev | Rocky Linux 9.3 arm64 (container) | 93 | 62 | 66.7% | 70.5% |
 | shape only (exists / number of / comparison / and-or-not at the root) | dev | Ubuntu 26.04 arm64 (container) | 99 | 72 | 72.7% | 74.2% |
-| shape only (exists / number of / comparison / and-or-not at the root) | dev | all hosts | 334 | 249 | 74.6% | 75.0% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | Windows Server 2022 x86_64 (SSH, installed agent) | 142 | 125 | 88.0% | 75.8% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | all hosts | 476 | 374 | 78.6% | 75.3% |
 | shape only (exists / number of / comparison / and-or-not at the root) | holdout | macOS 15.7 x86_64 (SSH, installed agent) | 148 | 114 | 77.0% | 79.2% |
 | shape only (exists / number of / comparison / and-or-not at the root) | holdout | Rocky Linux 9.3 arm64 (container) | 98 | 65 | 66.3% | 73.9% |
 | shape only (exists / number of / comparison / and-or-not at the root) | holdout | Ubuntu 26.04 arm64 (container) | 106 | 78 | 73.6% | 77.2% |
-| shape only (exists / number of / comparison / and-or-not at the root) | holdout | all hosts | 352 | 257 | 73.0% | 77.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | Windows Server 2022 x86_64 (SSH, installed agent) | 148 | 133 | 89.9% | 77.8% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | all hosts | 500 | 390 | 78.0% | 77.4% |
 | shape only (exists / number of / comparison / and-or-not at the root) | all | macOS 15.7 x86_64 (SSH, installed agent) | 290 | 229 | 79.0% | 78.7% |
 | shape only (exists / number of / comparison / and-or-not at the root) | all | Rocky Linux 9.3 arm64 (container) | 191 | 127 | 66.5% | 72.2% |
 | shape only (exists / number of / comparison / and-or-not at the root) | all | Ubuntu 26.04 arm64 (container) | 205 | 150 | 73.2% | 75.8% |
-| shape only (exists / number of / comparison / and-or-not at the root) | all | all hosts | 686 | 506 | 73.8% | 76.1% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | Windows Server 2022 x86_64 (SSH, installed agent) | 290 | 258 | 89.0% | 76.8% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | all hosts | 976 | 764 | 78.3% | 76.3% |
 
 ## Classifier verdicts against actual outcomes (all hosts)
 
 | verdict (platform known) | one | error | empty | plural | split |
 |---|---:|---:|---:|---:|---:|
-| safe | 561 | 17 | 0 | 0 | 0 |
-| split_risk | 0 | 0 | 0 | 0 | 30 |
-| plural_risk | 25 | 27 | 243 | 21 | 4 |
-| unknown | 1 | 8 | 0 | 0 | 0 |
-| error_risk | 78 | 365 | 49 | 5 | 4 |
+| safe | 846 | 25 | 0 | 0 | 1 |
+| split_risk | 0 | 0 | 0 | 0 | 40 |
+| plural_risk | 42 | 36 | 332 | 30 | 7 |
+| unknown | 1 | 10 | 1 | 0 | 0 |
+| error_risk | 112 | 418 | 64 | 9 | 9 |
 
-## False "safe": classifier (platform-agnostic) (175)
+## False "safe": classifier (platform-agnostic) (196)
 
 - macOS 15.7 x86_64 (SSH, installed agent): error `r0045` `exists key "HKLM\SOFTWARE" of native registry` The operator "native registry" is not defined.
 - macOS 15.7 x86_64 (SSH, installed agent): error `r0083` `exists unique values whose(it starts with "Hyper-V") of ( ( if ( exists (it as string) whose(it contains "<dmi>") of pro` The operator "version strings" is not defined.
@@ -250,8 +263,29 @@ Container environment errors (no SMBIOS, Rocky's RPM symlink) are left out of ev
 - Ubuntu 26.04 arm64 (container): error `r0411` `/* exists NVIDIA GPU */ exists active devices whose(manufacturer of it as uppercase is "NVIDIA" AND description of it co` The operator "active devices" is not defined.
 - Ubuntu 26.04 arm64 (container): error `r0523` `version of registration server >= "9.5.0"` No inspector context.
 - Ubuntu 26.04 arm64 (container): error `r0532` `version of registration server >= "8.1"` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0073` `(windows of operating systems) AND (not exists distinguished names of local computers of active directories) AND (comput` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0080` `(windows of operating systems) AND (not exists distinguished names of local computers of active directories)` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0091` `exists files ending in ".png.base64" of folders "/tmp/_BigFix/Icons"` The operator "files ending in" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0092` `number of files ending in ".png.base64" of folders "/tmp/_BigFix/Icons"` The operator "files ending in" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0115` `average duration of evaluationcycle of client` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): split `r0141` `value of settings "_BESClient_UploadManager_BufferDirectory" of client | "__BESData/__Global/Upload"`
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0162` `exists cloud providers` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0344` `exists debianpackages` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0345` `not exists packages "docker-ce" of debianpackages` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0346` `(((unix of operating system) AND (exists debianpackages)) AND (not exists packages "docker-ce" of debianpackages)) AND (` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0347` `((unix of operating system) AND (exists debianpackages)) AND (4 != number of (packages "apt-transport-https" of it; pack` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0348` `((((unix of operating system) AND (exists packages "apt" of debianpackages)) AND (exists packages "curl" of debianpackag` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0349` `((((unix of operating system) AND (exists architectures whose(it = "x86_64") of operating systems)) AND (exists packages` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0350` `(((unix of operating system) AND (exists packages "apt" of debianpackages)) AND (exists lines whose(it does not start wi` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0351` `exists dns domainnames of local computers of active directories` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0355` `exists packages "apt" of debianpackages` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0398` `not exists distinguished names of local computers of active directories` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0413` `exists (user masks of it; group masks of it; other masks of it) whose(it < 6) of folders "/tmp"` The operator "user masks" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0415` `exists (packages "docker" of it; packages "docker-engine" of it; packages "docker.io" of it) of debianpackages` The operator "debianpackages" is not defined.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0523` `version of registration server >= "9.5.0"` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0532` `version of registration server >= "8.1"` No inspector context.
 
-## False "safe": classifier (platform known) (17)
+## False "safe": classifier (platform known) (26)
 
 - macOS 15.7 x86_64 (SSH, installed agent): error `r0083` `exists unique values whose(it starts with "Hyper-V") of ( ( if ( exists (it as string) whose(it contains "<dmi>") of pro` The operator "version strings" is not defined.
 - macOS 15.7 x86_64 (SSH, installed agent): error `r0115` `average duration of evaluationcycle of client` No inspector context.
@@ -270,3 +304,12 @@ Container environment errors (no SMBIOS, Rocky's RPM symlink) are left out of ev
 - Ubuntu 26.04 arm64 (container): error `r0381` `not exists services whose(display name of it starts with "GitHub Actions Runner")` The operator "services" is not defined.
 - Ubuntu 26.04 arm64 (container): error `r0523` `version of registration server >= "9.5.0"` No inspector context.
 - Ubuntu 26.04 arm64 (container): error `r0532` `version of registration server >= "8.1"` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0073` `(windows of operating systems) AND (not exists distinguished names of local computers of active directories) AND (comput` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0080` `(windows of operating systems) AND (not exists distinguished names of local computers of active directories)` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0115` `average duration of evaluationcycle of client` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): split `r0141` `value of settings "_BESClient_UploadManager_BufferDirectory" of client | "__BESData/__Global/Upload"`
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0162` `exists cloud providers` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0351` `exists dns domainnames of local computers of active directories` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0398` `not exists distinguished names of local computers of active directories` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0523` `version of registration server >= "9.5.0"` No inspector context.
+- Windows Server 2022 x86_64 (SSH, installed agent): error `r0532` `version of registration server >= "8.1"` No inspector context.

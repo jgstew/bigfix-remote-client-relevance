@@ -36,6 +36,7 @@ HOSTS = {
     "jgstews-mac-mini.local": ("macOS 15.7 x86_64 (SSH, installed agent)", "macos"),
     "rockylinux-9-arm64": ("Rocky Linux 9.3 arm64 (container)", "rhel"),
     "ubuntu-26-04-arm64": ("Ubuntu 26.04 arm64 (container)", "ubuntu"),
+    "windows-server-2022": ("Windows Server 2022 x86_64 (SSH, installed agent)", "windows"),
 }
 PLATFORMS = {host: platform for host, (_, platform) in HOSTS.items()}
 _WRAP_MARKERS = (",", "(", ")")

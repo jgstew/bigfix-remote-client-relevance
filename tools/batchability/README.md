@@ -38,10 +38,13 @@ environment variables of the machines they ran on.
    `env-error` marks errors the container itself causes (no SMBIOS/DMI
    tables; Rocky's image cannot set up the RPM inspector), which no real
    endpoint shares and which are left out of the precision table.
-3. **Hosts.** macOS 15.7 (x86_64, over SSH with `become`), Rocky Linux 9.3
-   and Ubuntu 26.04 (arm64 containers, native on an M1 Pro, Docker 29.7.2).
-   A Windows Server 2022 run over SSH was attempted and abandoned: its qna
-   hung on the first chunk (see the PR).
+3. **Hosts.** macOS 15.7 (x86_64, over SSH with `become`), Windows Server
+   2022 (x86_64, over SSH), Rocky Linux 9.3 and Ubuntu 26.04 (arm64
+   containers, native on an M1 Pro, Docker 29.7.2). macOS and Windows have
+   the BES agent installed. On Windows the qna stdin batch hung now and then
+   (timing, not content: a hung chunk answered statement by statement), so
+   most of its corpus ran one qna per expression (`--no-batch`), which gives
+   the same answers.
 4. **Dev / holdout.** Rules were tuned against even-numbered statements only;
    odd ones are the holdout.
 
@@ -49,6 +52,9 @@ Probes that decided rules (qna 11.0.7, Rocky container):
 
 - A tuple item displays exactly as it does alone, unless it holds `,`, `(` or
   `)`: then it is wrapped, `"a, b"` → `( a, b )`, `"a)"` → `(( a) )`.
+  Balanced parentheses are not wrapped (`C:\Program Files (x86)\...` came
+  back as is), which is why the client's split check refuses any part
+  holding one of the three, wrapped or not.
   REST Fast Query against a Windows agent showed the same wrapping.
 - `exists x` / `number of x` absorb only `x`'s *outermost* step being missing
   (`exists file "/nope"` is False), not a missing object beneath it:
@@ -63,21 +69,25 @@ Probes that decided rules (qna 11.0.7, Rocky container):
 ## Result
 
 See `scores.md`. With the endpoint's platform known, a "safe" verdict was
-right **97.1%** of the time (561 of 578), catching **84.4%** of the
+right **97.0%** of the time (846 of 872), catching **84.5%** of the
 statements that really were batchable; on the holdout half alone, 96.7%.
-Every miss is an error the tables cannot foresee: 14 inspectors that need the
-agent's client context ("No inspector context." under qna, and under Fast
-Query without `UseClientContext`), and 3 inspectors the tables list for a
-platform whose qna lacks them. Without the platform, precision drops to
-76.4%, almost all from Windows-only inspectors on other platforms. The
-analyzer's plurality alone (`SINGULAR`) is 65.4%, and the root's shape alone
-(`exists` / `number of` / a comparison / `and` `or` `not`) 73.8%.
+Windows alone: 96.9% (285 of 294). Of the 26 misses, 25 are errors the
+tables cannot foresee: 22 inspectors that need the agent's client context
+("No inspector context." under qna, and under Fast Query without
+`UseClientContext`), and 3 inspectors the tables list for a platform whose
+qna lacks them. The last is a setting's value, a Windows path with
+`(x86)` in it, that the client's split check would refuse: a fallback, not
+a wrong answer. Without the platform, precision drops to 81.3%, almost all
+from Windows-only inspectors on other platforms. The analyzer's plurality
+alone (`SINGULAR`) is 70.1%, and the root's shape alone (`exists` /
+`number of` / a comparison / `and` `or` `not`) 78.3%.
 
 ### Caveats
 
 - The counts are (statement, host) pairs: each statement counts once per
-  host, so the 578 "safe" verdicts cover 263 distinct statements.
-- Ground truth is qna (its stdin batch path), tupled with **one** sentinel
+  host, so the 872 "safe" verdicts cover 306 distinct statements.
+- Ground truth is qna (its stdin batch path; one qna per expression for
+  most of Windows), tupled with **one** sentinel
   in last position. It does not exercise Fast Query itself, ten-item tuples,
   or an item that is not last; that the client's split check holds for
   those rests on the display rule above, which REST Fast Query matched in a

@@ -52,6 +52,9 @@ async def main() -> None:
     parser.add_argument("--host", required=True)
     parser.add_argument("--inventory", default=str(Path("~/.bigfix/remote_clients.toml")))
     parser.add_argument("--timeout", type=float, default=120.0)
+    # Windows over SSH: a qna stdin batch can hang past its timeout, so that
+    # host ran one qna per expression (same answers, just slower).
+    parser.add_argument("--no-batch", action="store_true")
     args = parser.parse_args()
 
     targets = [
@@ -63,7 +66,9 @@ async def main() -> None:
         raise SystemExit(f"{args.host!r} matched {len(targets)} inventory entries")
     rows = [json.loads(line) for line in Path(args.corpus).read_text().splitlines() if line]
     expressions = [row["text"] for row in rows] + [tupled(row["text"]) for row in rows]
-    results = await evaluate_many(expressions, targets, timeout_s=args.timeout)
+    results = await evaluate_many(
+        expressions, targets, timeout_s=args.timeout, batch=not args.no_batch
+    )
     if len(results) != len(expressions):
         raise SystemExit(f"{len(results)} results for {len(expressions)} expressions")
     singles, tuples = results[: len(rows)], results[len(rows) :]
@@ -98,5 +103,5 @@ def _write(out: Path, records: list[dict[str, object]]) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     asyncio.run(main())
