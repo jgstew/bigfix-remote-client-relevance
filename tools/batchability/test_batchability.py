@@ -152,7 +152,7 @@ def test_the_worst_kind_wins():
 def test_reasons_point_at_the_node():
     text = 'size of file "/nonexistent"'
 
-    (lookup,) = [r for r in batchability(text).reasons if r.rule == "singular-lookup"]
+    (lookup,) = (r for r in batchability(text).reasons if r.rule == "singular-lookup")
 
     assert lookup.span is not None
     assert text[lookup.span.start : lookup.span.end] == 'file "/nonexistent"'
