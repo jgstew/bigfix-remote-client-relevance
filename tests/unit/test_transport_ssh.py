@@ -26,6 +26,7 @@ from bigfix_remote_client_relevance.results import (
 )
 from bigfix_remote_client_relevance.transports.ssh import (
     SSHConnectionError,
+    SSHRunner,
     TransportSSH,
 )
 
@@ -1565,3 +1566,35 @@ async def test_adapter_closes_the_process_when_cancelled():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert connection.process.closed
+
+
+async def test_the_transport_cleans_up_after_the_adapter_times_out():
+    """The adapter bounds itself, so the transport adds no timer of its own
+    over it; its timeout must still drop the connection and stop the qna."""
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    class Closable(FakeConnection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    stuck = Closable(answer=False)
+    fresh = FakeSSHRunner()
+    connections: list[SSHRunner] = [_AsyncsshRunner(stuck), fresh]
+
+    async def factory():
+        return connections.pop(0)
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    started = time.monotonic()
+    result = await transport.evaluate_client_relevance("true", qna_path="/q", timeout_s=T)
+
+    assert time.monotonic() - started < 2 * T + SLACK
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert stuck.process.closed and stuck.closed
+    assert "pgrep" in fresh.commands()[0]

@@ -20,11 +20,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import re
 import shlex
 import sys
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -318,6 +318,7 @@ class TransportSSH:
             lambda: _connect(host, user, key, port, verify_host_key=verify_host_key)
         )
         self._runner: SSHRunner | None = None
+        self._guarded: _GuardedRunner | None = None
         self._spec: TargetSpec | None = None
         self._connect_lock = asyncio.Lock()
         # What last timed out since qna last answered (its stdin lines), and
@@ -351,7 +352,10 @@ class TransportSSH:
                         # cost timeout_s for every expression left.
                         self._give_up(f"no connection within {timeout_s}s")
                         raise
-        return _GuardedRunner(self, self._runner)
+        guarded = self._guarded
+        if guarded is None or guarded._inner is not self._runner:
+            guarded = self._guarded = _GuardedRunner(self, self._runner)
+        return guarded
 
     async def aclose(self) -> None:
         runner, self._runner = self._runner, None
@@ -821,7 +825,8 @@ class TransportSSH:
 
 
 def _new_marker() -> str:
-    return f"bfrcr-run-{uuid.uuid4().hex}"
+    # Unique, not secret: os.urandom is a quarter of uuid4's cost per command.
+    return f"bfrcr-run-{os.urandom(16).hex()}"
 
 
 def _marker_in(command: str) -> str | None:
@@ -848,6 +853,9 @@ class _GuardedRunner:
     def __init__(self, transport: TransportSSH, inner: SSHRunner) -> None:
         self._transport = transport
         self._inner = inner
+        # The asyncssh adapter bounds its own commands (and closes their
+        # process); a second timer per command would only cost.
+        self._bounds_itself = isinstance(inner, _AsyncsshRunner)
 
     async def run(
         self, command: str, *, input: str | None = None, timeout: float | None = None
@@ -856,8 +864,11 @@ class _GuardedRunner:
         if transport._unresponsive is not None:
             raise _Unresponsive(transport._unresponsive)
         try:
-            async with asyncio.timeout(timeout):
+            if self._bounds_itself:
                 result = await self._inner.run(command, input=input, timeout=timeout)
+            else:
+                async with asyncio.timeout(timeout):
+                    result = await self._inner.run(command, input=input, timeout=timeout)
         except (TimeoutError, asyncio.CancelledError) as exc:
             if timeout is not None:
                 await transport._after_hang(
