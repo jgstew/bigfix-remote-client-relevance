@@ -76,6 +76,33 @@ def outcome(record: dict) -> str:  # type: ignore[type-arg]
     return "one"
 
 
+# Operators that answer one boolean from singular operands.
+_BOOLEAN_OPS = frozenset(
+    {"=", "!=", "<", ">", "<=", ">=", "and", "or", "contains", "starts with", "ends with"}
+    | {"does not contain", "does not start with", "does not end with", "is", "is not"}
+    | {"is equal to", "is not equal to", "is greater than", "is less than"}
+)
+
+
+def _boolean_shape(text: str) -> bool:
+    """The shape rule alone: the root is `exists`, `not exists`, `number of`,
+    a comparison or `and` / `or` / `not` -- what applicability relevance
+    usually is -- with no type checking at all."""
+    from bigfix_relevance_analyzer.analyzer import analyze
+    from bigfix_relevance_analyzer.nodes import Binary, Exists, NumberOf, Unary
+
+    node = analyze(text).node
+    match node:
+        case Exists() | NumberOf():
+            return True
+        case Unary(op=op):
+            return op.lower() == "not"
+        case Binary(op=op):
+            return op.lower() in _BOOLEAN_OPS
+        case _:
+            return False
+
+
 def precision(tp: int, fp: int) -> str:
     return f"{tp / (tp + fp):.1%}" if tp + fp else "n/a"
 
@@ -89,6 +116,9 @@ def main(corpus_path: str, *result_paths: str) -> None:
         ),
         "plurality == SINGULAR only": lambda text, platform: (
             batchability(text).plurality.value == "singular"
+        ),
+        "shape only (exists / number of / comparison / and-or-not at the root)": (
+            lambda text, platform: _boolean_shape(text)
         ),
     }
     verdict_cache: dict[tuple[str, str | None], object] = {}

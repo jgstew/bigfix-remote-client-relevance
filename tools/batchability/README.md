@@ -70,7 +70,22 @@ agent's client context ("No inspector context." under qna, and under Fast
 Query without `UseClientContext`), and 3 inspectors the tables list for a
 platform whose qna lacks them. Without the platform, precision drops to
 76.4%, almost all from Windows-only inspectors on other platforms. The
-analyzer's plurality alone (`SINGULAR`) is 65.4%.
+analyzer's plurality alone (`SINGULAR`) is 65.4%, and the root's shape alone
+(`exists` / `number of` / a comparison / `and` `or` `not`) 73.8%.
+
+### Caveats
+
+- The counts are (statement, host) pairs: each statement counts once per
+  host, so the 578 "safe" verdicts cover 263 distinct statements.
+- Ground truth is qna (its stdin batch path), tupled with **one** sentinel
+  in last position. It does not exercise Fast Query itself, ten-item tuples,
+  or an item that is not last; that the client's split check holds for
+  those rests on the display rule above, which REST Fast Query matched in a
+  handful of live queries.
+- qna's context is the one Fast Query uses without `UseClientContext`; with
+  it, the 14 "No inspector context." misses would most likely answer.
+- An evaluation that timed out counts as `error`, which can only lower the
+  number of truly batchable statements (none did in these runs).
 
 ## Run it
 

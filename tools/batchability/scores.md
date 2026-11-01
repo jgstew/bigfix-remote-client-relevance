@@ -50,6 +50,18 @@ Container environment errors (no SMBIOS, Rocky's RPM symlink) are left out of ev
 | plurality == SINGULAR only | all | Rocky Linux 9.3 arm64 (container) | 286 | 169 | 59.1% | 96.0% |
 | plurality == SINGULAR only | all | Ubuntu 26.04 arm64 (container) | 300 | 192 | 64.0% | 97.0% |
 | plurality == SINGULAR only | all | all hosts | 972 | 636 | 65.4% | 95.6% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | macOS 15.7 x86_64 (SSH, installed agent) | 142 | 115 | 81.0% | 78.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | Rocky Linux 9.3 arm64 (container) | 93 | 62 | 66.7% | 70.5% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | Ubuntu 26.04 arm64 (container) | 99 | 72 | 72.7% | 74.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | dev | all hosts | 334 | 249 | 74.6% | 75.0% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | macOS 15.7 x86_64 (SSH, installed agent) | 148 | 114 | 77.0% | 79.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | Rocky Linux 9.3 arm64 (container) | 98 | 65 | 66.3% | 73.9% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | Ubuntu 26.04 arm64 (container) | 106 | 78 | 73.6% | 77.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | holdout | all hosts | 352 | 257 | 73.0% | 77.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | macOS 15.7 x86_64 (SSH, installed agent) | 290 | 229 | 79.0% | 78.7% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | Rocky Linux 9.3 arm64 (container) | 191 | 127 | 66.5% | 72.2% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | Ubuntu 26.04 arm64 (container) | 205 | 150 | 73.2% | 75.8% |
+| shape only (exists / number of / comparison / and-or-not at the root) | all | all hosts | 686 | 506 | 73.8% | 76.1% |
 
 ## Classifier verdicts against actual outcomes (all hosts)
 
