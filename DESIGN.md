@@ -948,6 +948,27 @@ local, ssh and container implement it, through the helpers in
   12.8 s → 5.6 s.
   Online evaluator does not batch: the endpoint is undocumented, and it
   should not be hammered.
+- *Fast Query tuples* (#78) are the other way to batch it: with
+  `tuple_batchable` hints, `FANOUT_TUPLE_SIZE` (10) hinted expressions go
+  as one ClientQuery, `((e1), (e2), ...)`
+  (`TransportFastQuery.evaluate_client_relevance_tuple`, the optional
+  `TupleFanOutTransport` protocol). A tuple fails as a whole when one item
+  errors, empties it when one is empty, and repeats when one is plural, so
+  only the caller's hints decide what goes in; this package cannot tell
+  statically and must not depend on bigfix-relevance-analyzer, which
+  depends on it. An answer is split on `", "` and trusted only as exactly
+  one row of exactly N parts, none holding `,`, `(` or `)`: qna 11.0.7 and
+  REST Fast Query both display an item holding any of those wrapped, as
+  `( a, b )`, and every other item exactly as it displays alone. Anything
+  else -- a failed submit or poll, an error row, an empty or plural answer,
+  a part that does not split -- hands the whole tuple back, and its
+  expressions run one at a time; so does every later tuple for that target
+  (one failed tuple per group, as for a qna chunk). The first tuple runs
+  alone for that reason; the rest share the five lanes, one each. A
+  computer that never answers is unanswered for every expression, without
+  falling back, as it would be for each alone. Split results are built from
+  synthetic one-item rows, so `raw_qna_output` matches the single path;
+  they also carry `qna_batch_size`.
 - `batch=False` restores one expression at a time for everything.
 
 **Multi-version eval on the same target:** `qna_version` fans out —
