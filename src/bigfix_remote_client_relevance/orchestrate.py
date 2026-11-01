@@ -1006,59 +1006,12 @@ async def _evaluate_stream_indexed(
                     for sub, result in enumerate(cell):
                         emit(index, result, sub)
 
-                chunks: list[list[int]] = []
-                tupler = (
-                    transport
-                    if batch
-                    and tuple_batchable is not None
-                    and capabilities.tuple_fan_out(transport)
-                    else None
-                )
-                if tupler is not None and tuple_batchable is not None:
-                    hinted = [i for i, hint in enumerate(tuple_batchable) if hint]
-                    chunks = [
-                        hinted[start : start + FANOUT_TUPLE_SIZE]
-                        for start in range(0, len(hinted), FANOUT_TUPLE_SIZE)
-                    ]
-                    # One alone is not a tuple: it goes the usual way.
-                    chunks = [chunk for chunk in chunks if len(chunk) > 1]
-                tupled = {index for chunk in chunks for index in chunk}
-                tupling = True
-
-                async def _tuple_cell(chunk: list[int]) -> None:
-                    nonlocal tupling
-                    cells = None
-                    async with lanes:
-                        # Asked once a lane is free, not before: a tuple
-                        # queued behind one that failed is not sent. Those
-                        # already in flight (at most the lanes) still go.
-                        if tupling and tupler is not None:
-                            cells = await _evaluate_fanout_tuple(
-                                tupler, target, [expressions[i] for i in chunk]
-                            )
-                    if cells is None:
-                        # Whatever stopped this tuple -- an item that errors
-                        # or does not split, an agent formatting answers its
-                        # own way -- would most likely stop the next one
-                        # too, so no more are sent for this group.
-                        tupling = False
-                        await asyncio.gather(*(_cell(i, expressions[i]) for i in chunk))
-                        return
-                    for index, cell in zip(chunk, cells, strict=True):
-                        for sub, result in enumerate(cell):
-                            emit(index, result, sub)
-
-                async def _tuples() -> None:
-                    # The first tuple runs alone, as the first qna expression
-                    # does: it finds out whether tuples work here at all.
-                    if chunks:
-                        await _tuple_cell(chunks[0])
-                        await asyncio.gather(*(_tuple_cell(chunk) for chunk in chunks[1:]))
-
-                await asyncio.gather(
-                    _tuples(),
-                    *(_cell(i, e) for i, e in enumerate(expressions) if i not in tupled),
-                )
+                if batch and tuple_batchable is not None and capabilities.tuple_fan_out(transport):
+                    await _fanout_tuples(transport, target, tuple_batchable, lanes, _cell, emit)
+                    return
+                # Without hints, exactly the pre-tuple path: no extra task or
+                # bookkeeping per target (500 targets measured it).
+                await asyncio.gather(*(_cell(i, e) for i, e in enumerate(expressions)))
                 return
 
             # A build already known to be too new here is skipped outright, so
@@ -1211,6 +1164,61 @@ async def _evaluate_stream_indexed(
             if not result.elapsed_ms:
                 result.elapsed_ms = elapsed_ms
         return results
+
+    async def _fanout_tuples(
+        transport: TupleFanOutTransport,
+        target: Target,
+        hints: Sequence[bool],
+        lanes: asyncio.Semaphore,
+        cell: Callable[[int, str], Coroutine[Any, Any, None]],
+        emit: Callable[..., None],
+    ) -> None:
+        """A fan-out group's expressions, hinted ones as tuples of up to
+        :data:`FANOUT_TUPLE_SIZE`; the rest, and any tuple handed back, by
+        ``cell`` one at a time."""
+        hinted = [i for i, hint in enumerate(hints) if hint]
+        chunks = [
+            hinted[start : start + FANOUT_TUPLE_SIZE]
+            for start in range(0, len(hinted), FANOUT_TUPLE_SIZE)
+        ]
+        # One alone is not a tuple: it goes the usual way.
+        chunks = [chunk for chunk in chunks if len(chunk) > 1]
+        tupled = {index for chunk in chunks for index in chunk}
+        tupling = True
+
+        async def _tuple_cell(chunk: list[int]) -> None:
+            nonlocal tupling
+            cells = None
+            async with lanes:
+                # Asked once a lane is free, not before: a tuple queued
+                # behind one that failed is not sent. Those already in
+                # flight (at most the lanes) still go.
+                if tupling:
+                    cells = await _evaluate_fanout_tuple(
+                        transport, target, [expressions[i] for i in chunk]
+                    )
+            if cells is None:
+                # Whatever stopped this tuple -- an item that errors or does
+                # not split, an agent formatting answers its own way -- would
+                # most likely stop the next one too, so no more are sent for
+                # this group.
+                tupling = False
+                await asyncio.gather(*(cell(i, expressions[i]) for i in chunk))
+                return
+            for index, results in zip(chunk, cells, strict=True):
+                for sub, result in enumerate(results):
+                    emit(index, result, sub)
+
+        async def _tuples() -> None:
+            # The first tuple runs before the others, as the first qna
+            # expression does: it finds out whether tuples work here at all.
+            if chunks:
+                await _tuple_cell(chunks[0])
+                await asyncio.gather(*(_tuple_cell(chunk) for chunk in chunks[1:]))
+
+        await asyncio.gather(
+            _tuples(), *(cell(i, e) for i, e in enumerate(expressions) if i not in tupled)
+        )
 
     async def _evaluate_fanout_tuple(
         transport: TupleFanOutTransport, target: Target, chunk: list[str]
