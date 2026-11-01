@@ -69,6 +69,15 @@ CLEANUP_TIMEOUT_S = 10.0
 never longer than the run's own ``timeout_s``: cleanup must not outlast the
 work it cleans up after."""
 
+WINDOWS_STDIN_MAX_BYTES = 4 * 1024
+"""Most stdin one qna run on Windows is sent (#101). Win32-OpenSSH (sshd 9.5,
+Windows Server 2022) stops draining a child's stdout while its write into
+the child's stdin pipe is blocked: past ~8 KiB of stdin (8195 bytes hung,
+8190 answered), qna fills stdout answering the first lines, blocks, and
+never reads the rest. Linux and macOS sshd keep reading, so this is
+Windows-only. Half the measured pipe, which is also the usual default size
+of a Windows anonymous pipe, should another build size its own differently."""
+
 _RUN_MARKER = re.compile(r"bfrcr-run-[0-9a-f]{32}")
 
 # The tail of a PowerShell -EncodedCommand that encodes nothing but the
@@ -566,17 +575,19 @@ class TransportSSH:
     ) -> list[ClientRelevanceResult] | None:
         """Every expression on one qna's stdin over the connection; ``None`` to go singly.
 
-        Anything wrong with the run as a whole is ``None``: the single path
-        reports it in its own words and learns from it (an old qna without
-        ``-showtypes``, a sudo problem, macOS needing root).
+        On Windows, on as many qna runs as keep each stdin within
+        :data:`WINDOWS_STDIN_MAX_BYTES`. Anything wrong with a run as a whole
+        is ``None``: the single path reports it in its own words and learns
+        from it (an old qna without ``-showtypes``, a sudo problem, macOS
+        needing root).
         """
         from bigfix_remote_client_relevance.transports import batch
 
         started = time.monotonic()
         # Windows included: PowerShell's `&` hands a native qna multi-line
         # UTF-8 stdin intact (verified live, Windows Server 2022), and the
-        # CRLF it answers in splits like LF. Intermittently it never answers
-        # at all (#99), which the runner bounds and cleans up after.
+        # CRLF it answers in splits like LF. A run that never answers anyway
+        # (#99) is bounded and cleaned up after by the runner.
         try:
             runner, spec, qna_path = await self._qna_to_run(None, qna, timeout_s)
             if qna_path is None:
@@ -584,6 +595,36 @@ class TransportSSH:
         except Exception as exc:  # noqa: BLE001 - the single path will report it
             logger.debug("qna batch on %s could not start: %s", self.host, exc)
             return None
+        runs = [list(expressions)]
+        if spec.family == "windows":
+            # Over WINDOWS_STDIN_MAX_BYTES, qna and sshd deadlock (#101).
+            # An expression too big alone still goes alone, and is safe: qna
+            # reads the whole line before it answers.
+            runs = batch.chunk_expressions(
+                expressions, max_count=len(expressions), max_bytes=WINDOWS_STDIN_MAX_BYTES
+            )
+        results: list[ClientRelevanceResult] = []
+        for run in runs:
+            answered = await self._batch_run(runner, spec, qna_path, run, qna, timeout_s, started)
+            if answered is None:
+                return None
+            results.extend(answered)
+            started = time.monotonic()
+        return results
+
+    async def _batch_run(
+        self,
+        runner: SSHRunner,
+        spec: TargetSpec,
+        qna_path: str,
+        expressions: Sequence[str],
+        qna: ResolvedQna | None,
+        timeout_s: float,
+        started: float,
+    ) -> list[ClientRelevanceResult] | None:
+        """One qna process answering ``expressions``; ``None`` to go singly."""
+        from bigfix_remote_client_relevance.transports import batch
+
         try:
             sentinel = batch.new_sentinel()
             with_types = self._showtypes_supported.get(qna_path, True)

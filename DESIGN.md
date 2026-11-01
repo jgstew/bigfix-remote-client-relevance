@@ -946,8 +946,24 @@ local, ssh and container implement it, through the helpers in
   (the batch, then two of its expressions), not one per expression. SFTP
   uploads during provisioning are not bounded by `timeout_s`: an artifact
   can take longer than one evaluation.
+- *At most 4 KiB of stdin per qna on Windows over SSH (#101).* The hangs
+  behind #99 were deterministic per chunk, and the cause was size rather
+  than relevance: the stock `ssh` client piping 1639 lines of `true`
+  (8195 bytes) to qna under `cmd.exe` never answers, while 1638 lines
+  (8190 bytes) do. Win32-OpenSSH (sshd 9.5) stops draining the child's
+  stdout while its write into the child's ~8 KiB stdin pipe is blocked.
+  qna fills stdout answering the first lines and then blocks, so it never
+  reads the rest. It takes both conditions: 14 KB in with 0.5 KB out
+  answers, and 22 B in with 17 KB out answers. The same 8.5 KB fed 1 KB
+  at a time answers too. So the SSH transport splits a Windows chunk
+  into qna runs of at most `WINDOWS_STDIN_MAX_BYTES` (4 KiB: half the
+  measured pipe, and the usual Windows default pipe size). A single
+  expression longer than that still runs alone, which is safe, because
+  qna reads the whole line before it answers. Linux and macOS sshd keep
+  reading stdout, so their chunks stay one run.
 - *One concurrency slot* (`max_parallel`) per chunk: it is one process.
-- *Result fields.* `qna_batch_size` (schema 1.4) is the chunk size, and
+- *Result fields.* `qna_batch_size` (schema 1.4) is how many expressions
+  shared the qna process (the chunk size, or a Windows run's size), and
   `None` when the expression ran alone. `elapsed_ms` is the whole qna
   run's. `qna_time` and `raw_qna_output` are the expression's own block.
 - *Measured* (`evaluate_many`, `batch=False` vs `True`, same answers both

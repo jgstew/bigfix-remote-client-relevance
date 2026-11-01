@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,7 +42,11 @@ class RunCall:
 class FakeSSHRunner:
     """Scripted SSH runner: matches commands by regex, records everything."""
 
-    responses: list[tuple[str, tuple[str, str, int]]] = field(default_factory=list)
+    # A response is fixed, or a function of the run's stdin when the answer
+    # must follow what was sent (a batch split over several runs).
+    responses: list[
+        tuple[str, tuple[str, str, int] | Callable[[str | None], tuple[str, str, int]]]
+    ] = field(default_factory=list)
     calls: list[RunCall] = field(default_factory=list)
     pushed: list[tuple[Path, str]] = field(default_factory=list)
     closed: bool = False
@@ -57,7 +62,7 @@ class FakeSSHRunner:
         subject = decode_ps(command) if "-EncodedCommand " in command else command
         for pattern, response in self.responses:
             if re.search(pattern, subject):
-                return response
+                return response(input) if callable(response) else response
         return self.default
 
     async def put_file(self, local: Path, remote: str) -> None:
@@ -1134,7 +1139,67 @@ async def test_a_batch_on_windows_runs_through_powershell(qna_output, fixed_sent
     assert eval_call.input == "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)
 
 
-# --- a channel that never answers (#99) ---------------------------------------
+def _echo_qna(stdin: str | None) -> tuple[str, str, int]:
+    """Windows qna answering each stdin line that is a string literal with itself."""
+    blocks = [
+        f"Q: A: {line.strip(chr(34))}\r\nI: singular string\r\nT: 1\r\n\r\n"
+        for line in (stdin or "").splitlines()
+    ]
+    return "".join(blocks) + "Q: ", "", 0
+
+
+# 40 expressions of ~230 bytes with their sentinels: over 9 KB of stdin, the
+# size of the spike corpus chunks that hung every time on Windows (#101).
+LONG_STRINGS = [f'"{i:03d}{"x" * 200}"' for i in range(40)]
+
+
+async def test_a_windows_batch_keeps_each_qna_stdin_within_the_pipe_buffer(fixed_sentinel):
+    """Win32-OpenSSH deadlocks once a qna run's stdin outgrows its ~8 KiB
+    pipe while qna's answers fill stdout (#101), so a bigger batch is split
+    over several qna runs, each well under that."""
+    from bigfix_remote_client_relevance.transports.ssh import WINDOWS_STDIN_MAX_BYTES
+
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND, (r"-showtypes", _echo_qna)])
+
+    results = await make_windows_transport(runner).evaluate_client_relevance_batch(LONG_STRINGS)
+
+    eval_calls = [c for c in runner.calls if "-showtypes" in decode_ps(c.command)]
+    assert len(eval_calls) > 1
+    assert all(len((c.input or "").encode()) <= WINDOWS_STDIN_MAX_BYTES for c in eval_calls)
+    assert results is not None
+    assert [r.answers for r in results] == [[e.strip('"')] for e in LONG_STRINGS]
+    # Each result says how many shared *its* qna process.
+    run_sizes = [len((c.input or "").splitlines()) // 2 for c in eval_calls]
+    assert [r.qna_batch_size for r in results] == [n for n in run_sizes for _ in range(n)]
+
+
+async def test_a_split_windows_batch_is_refused_when_any_run_fails(fixed_sentinel):
+    """The caller goes singly for the whole batch, as for an unsplit one."""
+    calls = 0
+
+    def second_run_fails(stdin: str | None) -> tuple[str, str, int]:
+        nonlocal calls
+        calls += 1
+        return _echo_qna(stdin) if calls == 1 else ("", "boom", 1)
+
+    runner = FakeSSHRunner(responses=[WINDOWS_FOUND, (r"-showtypes", second_run_fails)])
+
+    results = await make_windows_transport(runner).evaluate_client_relevance_batch(LONG_STRINGS)
+
+    assert results is None
+
+
+async def test_a_posix_batch_stays_one_qna_run(fixed_sentinel):
+    """Linux and macOS sshd keep draining stdout while feeding stdin."""
+    runner = FakeSSHRunner(responses=[FOUND_QNA, (r"-showtypes", _echo_qna)])
+
+    results = await make_transport(runner).evaluate_client_relevance_batch(LONG_STRINGS)
+
+    assert results is not None
+    assert len([c for c in runner.calls if "-showtypes" in c.command]) == 1
+
+
+# --- a channel that never answers (#99)---------------------------------------
 #
 # Live, a qna stdin batch to Windows Server 2022 over SSH sometimes never got
 # an exit status; the single-expression fallback's new session was never
