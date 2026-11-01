@@ -9,7 +9,7 @@ responses. The clock and sleep are injected, so no test ever waits.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -946,7 +946,9 @@ class FakeAgents(FakeClientQueryBackend):
     fallback sends are told apart. A computer with no entry never answers.
     """
 
-    def __init__(self, answers: dict[str, dict[int, Sequence[ClientQueryRow]]], **kwargs) -> None:
+    def __init__(
+        self, answers: Mapping[str, Mapping[int, Sequence[ClientQueryRow]]], **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._answers = answers
         self._queries: dict[int, tuple[str, list[int]]] = {}
@@ -1197,3 +1199,75 @@ def test_the_fast_query_transport_offers_tuple_batches():
     from bigfix_remote_client_relevance.transports import TupleFanOutTransport
 
     assert isinstance(make(FakeClientQueryBackend(), computer_ids=[1]), TupleFanOutTransport)
+
+
+@pytest.mark.parametrize(
+    "unbalanced",
+    [
+        pytest.param('"a") & ("b"', id="closes-then-opens"),
+        pytest.param("(1", id="unclosed"),
+        pytest.param("1)", id="extra-close"),
+        pytest.param('"unterminated', id="open-string"),
+    ],
+)
+async def test_an_expression_that_could_change_meaning_in_the_tuple_is_handed_back(unbalanced):
+    """`"a") & ("b"` is a parse error alone but `(("a") & ("b"), (1))` parses:
+    batching must never turn an error into an answer."""
+    backend = FakeClientQueryBackend()
+
+    cells = await make(backend, computer_ids=[11]).evaluate_client_relevance_tuple(
+        [unbalanced, "1"], timeout_s=30
+    )
+
+    assert cells is None
+    assert backend.submitted == []
+
+
+async def test_parentheses_inside_strings_are_not_counted():
+    backend = FakeAgents({'(("(a"), (")"))': {11: [row(11, "x, y")]}})
+
+    cells = await make(backend, computer_ids=[11]).evaluate_client_relevance_tuple(
+        ['"(a"', '")"'], timeout_s=30
+    )
+
+    assert backend.submitted == [('(("(a"), (")"))', [11])]
+    assert cells is not None
+
+
+async def test_one_target_silent_computer_is_unanswered_not_a_failed_tuple():
+    backend = FakeOneTargetBackend(answers={11: [row(11, "a, 1", name="alpha")]})
+
+    cells = await make_one_target(backend, computer_ids=[11, 12]).evaluate_client_relevance_tuple(
+        ["x", "y"], timeout_s=20
+    )
+
+    assert cells is not None
+    for cell in cells:
+        assert [r.host for r in cell] == ["alpha", "12"]
+        assert (cell[1].error or "").startswith("no answer within 20 s")
+
+
+async def test_one_target_computer_never_submitted_in_time_hands_the_batch_back(monkeypatch):
+    """On SaaS a computer left unsent at the deadline is not silence: alone,
+    each expression would get its own timeout to reach it."""
+    backend = FakeOneTargetBackend(answers={11: [row(11, "a, 1", name="alpha")]})
+    clock = VirtualClock()
+    transport = make_one_target(backend, clock, computer_ids=[11, 12])
+    real_call = transport._call
+    calls = 0
+
+    async def slow_first_submit(what, call, deadline):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            clock.now = deadline  # the first submit uses up the whole timeout
+        return await real_call(what, call, deadline)
+
+    monkeypatch.setattr(transport, "_call", slow_first_submit)
+    import asyncio
+
+    transport._calls = asyncio.Semaphore(1)  # computer 12 queues behind 11's submit
+
+    cells = await transport.evaluate_client_relevance_tuple(["x", "y"], timeout_s=20)
+
+    assert cells is None

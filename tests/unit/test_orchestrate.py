@@ -3395,3 +3395,102 @@ async def test_tuple_hints_stream_too():
 
     assert transport.tuples == [EXPRESSIONS]
     assert sorted(r.client_relevance for r in results) == sorted(EXPRESSIONS)
+
+
+async def test_a_later_tuple_handed_back_stops_the_tuples_still_waiting_for_a_lane():
+    """The first tuple splits; the next five go out together and all fail.
+    The two still queued for a lane must not be tried as tuples."""
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    class FailsAfterFirst(FakeTupleFanOutTransport):
+        async def evaluate_client_relevance_tuple(self, expressions, *, timeout_s=30.0):
+            if not self.tuples:
+                return await super().evaluate_client_relevance_tuple(expressions)
+            self.tuples.append(list(expressions))
+            await asyncio.sleep(0.01)  # in flight together, as real queries are
+            return None
+
+    transport = FailsAfterFirst(["alpha"])
+    expressions = [f"e{i}" for i in range(80)]
+
+    results = await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        max_parallel=50,
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * 80,
+    )
+
+    assert len(transport.tuples) == 1 + 5, "the probe, then only those already in a lane"
+    assert _answers(results) == [(e, "alpha", [f"{e}@alpha"], None) for e in expressions]
+
+
+async def test_tuples_alone_never_take_more_than_the_five_lanes():
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    tracker = {"live": 0, "peak": 0}
+    expressions = [f"e{i}" for i in range(70)]
+    transport = FakeTupleFanOutTransport(["alpha"], tracker=tracker)
+
+    await evaluate_many(
+        expressions,
+        [Target(kind="fastquery", name="lab")],
+        max_parallel=50,
+        transport_factory=lambda t: transport,
+        tuple_batchable=[True] * 70,
+    )
+
+    assert len(transport.tuples) == 7
+    assert transport.singles == []
+    assert tracker["peak"] == 5
+
+
+async def test_real_fast_query_results_match_with_hints_and_without():
+    """End to end through TransportFastQuery: the payloads, sub-index order
+    and raw output included, are the same either way."""
+    from test_transport_fastquery import FakeAgents, FakeClock, make, row
+
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+    from bigfix_remote_client_relevance.transports.fastquery import tuple_relevance
+
+    expressions = ["a", "b", "c"]
+    alone = {
+        "a": {11: [row(11, "1", name="zulu")], 12: [row(12, "2", name="alpha")]},
+        "b": {11: [row(11, "x", name="zulu")], 12: [row(12, "y", name="alpha")]},
+        "c": {11: [row(11, "True", name="zulu")], 12: [row(12, "False", name="alpha")]},
+    }
+    answers = {
+        **alone,
+        tuple_relevance(expressions): {
+            11: [row(11, "1, x, True", name="zulu")],
+            12: [row(12, "2, y, False", name="alpha")],
+        },
+    }
+
+    async def run(hints):
+        backend = FakeAgents(answers)
+        clock = FakeClock()
+
+        def factory(target):
+            return make(backend, clock, computer_ids=[11, 12, 99])
+
+        results = await evaluate_many(
+            expressions,
+            [Target(kind="fastquery", name="lab")],
+            transport_factory=factory,
+            tuple_batchable=hints,
+        )
+        return results, backend.submitted
+
+    hinted, hinted_submits = await run([True] * 3)
+    plain, plain_submits = await run(None)
+
+    assert len(hinted_submits) == 1 and len(plain_submits) == 3
+
+    def payload(results):
+        return [
+            (r.client_relevance, r.host, r.answers, r.error, r.error_kind, r.raw_qna_output)
+            for r in results
+        ]
+
+    assert payload(hinted) == payload(plain)

@@ -134,6 +134,32 @@ def split_tuple_answer(rows: Sequence[ClientQueryRow], count: int) -> list[str] 
     return parts
 
 
+def _self_contained(expression: str) -> bool:
+    """Whether ``(expression)`` is certain to mean the expression itself.
+
+    Its parentheses must balance outside string literals, never closing more
+    than are open, and its strings must close: `"a") & ("b"` is a parse error
+    alone but parses as a tuple item. Comments are not parsed, so a
+    parenthesis inside one counts; that only ever refuses a tuple, and a
+    comment left open swallows the wrapper's ``)``, which fails the tuple
+    and falls back.
+    """
+    depth = 0
+    in_string = False
+    for char in expression:
+        if char == '"':
+            in_string = not in_string  # relevance escapes a quote as %22
+        elif in_string:
+            continue
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
 def _silence(timeout_s: float) -> str:
     return f"no answer within {timeout_s:g} s ({NO_ANSWER_CAUSES})"
 
@@ -283,13 +309,15 @@ class TransportFastQuery:
         a failed submit or poll, or an answer that is not exactly one row
         splitting into one clean part per expression (see
         :func:`split_tuple_answer`). A tuple says nothing about *which* item
-        failed, so the single queries are what report it.
+        failed, so the single queries are what report it. Nothing is sent
+        when an expression's parentheses or strings do not balance: wrapped
+        in ``( )``, it could parse where it alone would not.
 
         A computer that never answers is reported unanswered for every
         expression, as it would have been for each one alone: falling back
         would only wait out the timeout again per expression.
         """
-        if len(expressions) < 2:
+        if len(expressions) < 2 or not all(map(_self_contained, expressions)):
             return None
         started = self._clock()
         try:

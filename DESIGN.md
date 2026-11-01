@@ -962,9 +962,12 @@ local, ssh and container implement it, through the helpers in
   `( a, b )`, and every other item exactly as it displays alone. Anything
   else -- a failed submit or poll, an error row, an empty or plural answer,
   a part that does not split -- hands the whole tuple back, and its
-  expressions run one at a time; so does every later tuple for that target
-  (one failed tuple per group, as for a qna chunk). The first tuple runs
-  alone for that reason; the rest share the five lanes, one each. A
+  expressions run one at a time, and no later tuple for that target is sent
+  (as for a qna chunk; tuples already in a lane, at most five, still
+  finish). The first tuple runs before any other tuple for that reason,
+  alongside the unhinted expressions; the rest share the five lanes, one
+  each. An expression whose parentheses or strings do not balance is never
+  tupled: wrapped in `( )` it could parse where alone it does not. A
   computer that never answers is unanswered for every expression, without
   falling back, as it would be for each alone. Split results are built from
   synthetic one-item rows, so `raw_qna_output` matches the single path;

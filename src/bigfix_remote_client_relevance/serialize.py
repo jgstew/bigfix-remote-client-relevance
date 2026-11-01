@@ -259,8 +259,9 @@ RESULT_JSON_SCHEMA: dict[str, Any] = {
         "qna_batch_size": {
             "type": ["integer", "null"],
             "description": (
-                "How many expressions shared the one qna process that answered this one; "
-                "null when it ran alone. A batched result's elapsed_ms is that whole run's."
+                "How many expressions shared the one qna process, or the one Fast Query "
+                "tuple, that answered this one; null when it ran alone. A batched "
+                "result's elapsed_ms is that whole run's."
             ),
         },
         "elapsed_ms": {

@@ -441,8 +441,8 @@ Hinted expressions go ten to a tuple. A tuple is only trusted when every
 computer that answers gives exactly one answer that splits back into one
 clean part per expression, none holding `,`, `(` or `)` (an item holding one
 is shown wrapped, as `( a, b )`). Anything else sends that tuple's
-expressions again one at a time, and stops tupling for that target, so
-results are the same with hints and without. Tupled results carry
+expressions again one at a time, and no more tuples go to that target (any
+already sent still finish), so results are the same with hints and without. Tupled results carry
 `qna_batch_size`.
 
 `evaluate_many_stream` is the completion-order form, the same way

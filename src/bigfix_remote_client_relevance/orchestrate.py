@@ -1028,8 +1028,11 @@ async def _evaluate_stream_indexed(
                 async def _tuple_cell(chunk: list[int]) -> None:
                     nonlocal tupling
                     cells = None
-                    if tupling and tupler is not None:
-                        async with lanes:
+                    async with lanes:
+                        # Asked once a lane is free, not before: a tuple
+                        # queued behind one that failed is not sent. Those
+                        # already in flight (at most the lanes) still go.
+                        if tupling and tupler is not None:
                             cells = await _evaluate_fanout_tuple(
                                 tupler, target, [expressions[i] for i in chunk]
                             )
@@ -1037,8 +1040,7 @@ async def _evaluate_stream_indexed(
                         # Whatever stopped this tuple -- an item that errors
                         # or does not split, an agent formatting answers its
                         # own way -- would most likely stop the next one
-                        # too: one failed tuple per group is the most
-                        # batching may cost.
+                        # too, so no more are sent for this group.
                         tupling = False
                         await asyncio.gather(*(_cell(i, expressions[i]) for i in chunk))
                         return
@@ -1496,7 +1498,8 @@ async def evaluate_many_stream(
     """Evaluate every expression on every target, for every version.
 
     Yields each ``ClientRelevanceResult`` as soon as its cell finishes, in
-    completion order. See :func:`evaluate_many` for what a batch buys.
+    completion order. See :func:`evaluate_many` for what a batch buys and
+    for ``tuple_batchable``.
     """
     async for _index, result in _evaluate_stream_indexed(
         expressions,
@@ -1559,8 +1562,18 @@ async def evaluate_many(
     batching changes how fast results arrive, never what they say. Batched results carry ``qna_batch_size``, and their
     ``elapsed_ms`` is the whole qna run's. A fan-out target (Fast Query)
     instead runs up to :data:`FANOUT_PARALLEL_EXPRESSIONS` expressions at
-    once, each still its own query. ``batch=False`` evaluates everything one
-    expression at a time, as before.
+    once, each its own query unless ``tuple_batchable`` says otherwise.
+    ``batch=False`` evaluates everything one expression at a time, as before.
+
+    ``tuple_batchable`` -- one ``bool`` per expression, from a caller that
+    can tell (bigfix-relevance-analyzer can; this package cannot) -- lets a
+    fan-out target that supports it (:class:`~.transports.TupleFanOutTransport`,
+    Fast Query) send up to :data:`FANOUT_TUPLE_SIZE` hinted expressions as one
+    tuple query and split the answer back out. A tuple that does not split
+    cleanly is evaluated again one expression at a time, and no further
+    tuples are sent for that target (those already in flight still finish),
+    so results are the same with hints and without. Tupled results carry
+    ``qna_batch_size``. ``None``, the default, tuples nothing.
 
     Every failure mode is reported inside a result rather than raised, and a
     group that dies before evaluating anything still answers once per
