@@ -915,13 +915,32 @@ local, ssh and container implement it, through the helpers in
   for one `timeout_s`, or a qna that cannot start. Without this, each
   chunk would cost another timeout on every run, so one failed chunk per
   group is the most batching can cost. Logged at DEBUG, since it can repeat
-  every run. So batching changes how fast results arrive, never what they
-  say.
+  every run; an SSH batch that raises (a timeout, a lost connection) is a
+  WARNING naming the host and the chunk size, because from outside a
+  timed-out batch looks like a hang. So batching changes how fast results
+  arrive, never what they say.
 - *Timeout.* `timeout_s` bounds the whole chunk. A hang is noticed within
   one timeout, and a chunk that is merely slow costs one timeout before it
   is re-run singly. In a kept-alive container a timed-out exec's qna keeps
   running until the container is stopped at the end of the batch, as a
   timed-out single exec's already did.
+- *A hung SSH command (#99).* Over SSH to Windows Server 2022 a batch
+  intermittently never got an exit status, the fallback's new session on
+  the same connection was never answered, and each hung run left an idle
+  `qna.exe` behind. So every SSH step is bounded by `timeout_s` whatever the
+  runner does with it: opening the connection, opening the session, the
+  command, and closing (`CLEANUP_TIMEOUT_S`, 10 s, at most). On a timeout or
+  a cancel the channel is closed, the connection dropped, and the command's
+  qna stopped over a fresh connection, under `min(timeout_s, 10 s)`. Every
+  qna command carries a random marker to find it by: on Windows a trailing
+  comment, so the tail of the `-EncodedCommand`, and the kill is
+  `taskkill /T /F` on the `powershell.exe` whose command line holds it; on
+  POSIX `; exit $? # marker`, which keeps the marker in the remote shell's
+  argv, and the kill is `pkill -TERM -P` on that shell. A host that cannot
+  take that kill, or that times out twice in a row with no qna answer in
+  between, gets nothing more for the rest of the run: its remaining
+  expressions fail at once with a transport error. A stuck target costs
+  about two `timeout_s`, not one per expression.
 - *One concurrency slot* (`max_parallel`) per chunk: it is one process.
 - *Result fields.* `qna_batch_size` (schema 1.4) is the chunk size, and
   `None` when the expression ran alone. `elapsed_ms` is the whole qna
