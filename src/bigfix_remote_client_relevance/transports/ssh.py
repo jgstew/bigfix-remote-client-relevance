@@ -17,8 +17,11 @@ to a host that cannot unpack it wastes the slowest step in the sequence.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import os
+import re
 import shlex
 import sys
 import time
@@ -61,8 +64,26 @@ logger = logging.getLogger(__name__)
 TRANSPORT_NAME = "ssh"
 
 
+CLEANUP_TIMEOUT_S = 10.0
+"""Most that stopping a hung qna, or closing a connection, may take. It is
+never longer than the run's own ``timeout_s``: cleanup must not outlast the
+work it cleans up after."""
+
+_RUN_MARKER = re.compile(r"bfrcr-run-[0-9a-f]{32}")
+
+# The tail of a PowerShell -EncodedCommand that encodes nothing but the
+# marker's random hex. The tail starts on a 4-character boundary, so its 60
+# base64 characters are 45 whole bytes: the last 22.5 UTF-16LE characters,
+# all within the marker's 32 hex digits.
+_WINDOWS_TOKEN_CHARS = 60
+
+
 class SSHConnectionError(BigFixRelevanceError):
     """Connecting to or authenticating with the target failed."""
+
+
+class _Unresponsive(TimeoutError):
+    """The target already stopped answering earlier in this run."""
 
 
 def powershell_command(source: str) -> str:
@@ -137,9 +158,25 @@ class _AsyncsshRunner:
     async def run(
         self, command: str, *, input: str | None = None, timeout: float | None = None
     ) -> RunResult:
-        result = await self._connection.run(  # type: ignore[attr-defined]
-            command, input=input, timeout=timeout, check=False
-        )
+        # Not connection.run(): its timeout covers only the wait for an exit
+        # status, not opening the session (#99 saw a session request never
+        # answered), and on expiry asyncssh 2.24.1 raises without closing the
+        # channel, leaving it open on a connection that is reused.
+        process = None
+        try:
+            async with asyncio.timeout(timeout):
+                process = await self._connection.create_process(  # type: ignore[attr-defined]
+                    command, input=input
+                )
+                result = await process.wait(check=False)
+        except BaseException:
+            # A timeout or a cancel: close the channel rather than leave it
+            # waiting. This does not stop the remote process everywhere
+            # (Windows OpenSSH leaves qna.exe running), which is the
+            # transport's job, over a fresh connection.
+            if process is not None:
+                process.close()
+            raise
         stdout = result.stdout if isinstance(result.stdout, str) else ""
         stderr = result.stderr if isinstance(result.stderr, str) else ""
         return stdout, stderr, int(result.exit_status or 0)
@@ -281,22 +318,162 @@ class TransportSSH:
             lambda: _connect(host, user, key, port, verify_host_key=verify_host_key)
         )
         self._runner: SSHRunner | None = None
+        self._guarded: _GuardedRunner | None = None
         self._spec: TargetSpec | None = None
+        self._connect_lock = asyncio.Lock()
+        # What last timed out since qna last answered (its stdin lines), and
+        # why the target was given up on for the rest of this run (#98; see
+        # _after_hang).
+        self._last_timed_out: frozenset[str] | None = None
+        self._unresponsive: str | None = None
         # -showtypes support is per remote qna binary; probe at most once.
         self._showtypes_supported: dict[str, bool] = {}
 
     # -- connection ---------------------------------------------------------
 
-    async def _connection(self) -> SSHRunner:
-        """One connection per host, multiplexed across evaluations."""
+    async def _connection(self, timeout_s: float | None = None) -> SSHRunner:
+        """One connection per host, multiplexed across evaluations.
+
+        Every command goes through a :class:`_GuardedRunner`, which bounds it
+        by its timeout and cleans up after one that does not answer.
+        """
+        if self._unresponsive is not None:
+            raise _Unresponsive(self._unresponsive)
         if self._runner is None:
-            self._runner = await self._connection_factory()
-        return self._runner
+            # The lock is taken only to connect, so concurrent first calls
+            # share one connection; a connected transport never waits on it.
+            async with self._connect_lock:
+                if self._runner is None:
+                    try:
+                        async with asyncio.timeout(timeout_s):
+                            self._runner = await self._connection_factory()
+                    except TimeoutError:
+                        # A host that silently drops packets would otherwise
+                        # cost timeout_s for every expression left.
+                        self._give_up(f"no connection within {timeout_s}s")
+                        raise
+        guarded = self._guarded
+        if guarded is None or guarded._inner is not self._runner:
+            guarded = self._guarded = _GuardedRunner(self, self._runner)
+        return guarded
 
     async def aclose(self) -> None:
-        if self._runner is not None:
-            await self._runner.close()
+        runner, self._runner = self._runner, None
+        if runner is not None:
+            await self._close_quietly(runner, CLEANUP_TIMEOUT_S)
+
+    async def _close_quietly(self, runner: SSHRunner, timeout_s: float) -> None:
+        try:
+            async with asyncio.timeout(min(timeout_s, CLEANUP_TIMEOUT_S)):
+                await runner.close()
+        except Exception as exc:  # noqa: BLE001 - a connection being dropped anyway
+            logger.debug("closing the connection to %s: %r", self.host, exc)
+
+    # -- hung commands (#99) -------------------------------------------------
+
+    def _answered(self) -> None:
+        # Only a qna answer counts: a probe that answers says nothing about
+        # whether the next qna will.
+        self._last_timed_out = None
+
+    async def _after_hang(
+        self,
+        stuck: SSHRunner,
+        command: str,
+        input: str | None,
+        timeout_s: float,
+        *,
+        cancelled: bool,
+    ) -> None:
+        """Clean up after a command that did not answer on ``stuck``: drop
+        that connection, then stop the command's qna, if it was one, over a
+        fresh connection.
+
+        The connection goes because #99's stuck one never answered another
+        session request either. Closing the channel does not stop the remote
+        qna everywhere (Windows OpenSSH leaves qna.exe running), so it is
+        stopped by the marker its command carries. Best effort, under its own
+        short timeout; a host that cannot take even that gets nothing more
+        this run.
+
+        Neither does one where two different expressions time out in a row
+        with no qna answer between (#98): each further expression would cost
+        another timeout_s to find that out. "Different" because one slow
+        expression heading a chunk times out twice, in its batch and then
+        alone, without saying anything about the rest.
+        """
+        if not cancelled:
+            lines = frozenset((input or command).splitlines())
+            if self._last_timed_out is not None and not lines <= self._last_timed_out:
+                self._give_up(f"two expressions in a row did not answer within {timeout_s}s")
+            self._last_timed_out = lines
+        if self._runner is stuck:
             self._runner = None
+        await self._close_quietly(stuck, timeout_s)
+        marker = _marker_in(command)
+        if marker is None or self._spec is None:
+            return
+        kill_timeout = min(timeout_s, CLEANUP_TIMEOUT_S)
+        fresh: SSHRunner | None = None
+        try:
+            async with asyncio.timeout(kill_timeout):
+                fresh = await self._connection_factory()
+                runner = _PowerShellRunner(fresh) if self._spec.family == "windows" else fresh
+                stdout, _stderr, _code = await runner.run(
+                    self._kill_command(self._spec, command, marker), timeout=kill_timeout
+                )
+        except BaseException as exc:
+            if fresh is not None:
+                await self._close_quietly(fresh, kill_timeout)
+            if not isinstance(exc, Exception):
+                raise  # a second cancel: cleanup is best effort, the cancel is not
+            logger.warning(
+                "%s: could not stop a qna that did not answer within %ss; it may "
+                "still be running there (%r)",
+                self.host,
+                timeout_s,
+                exc,
+            )
+            if not cancelled:
+                self._give_up(f"did not answer within {kill_timeout}s to stop a hung qna")
+            return
+        logger.debug("stopped qna on %s: %s", self.host, stdout.split() or "none left")
+        if self._runner is None and self._unresponsive is None:
+            # The next command reuses the connection that just answered.
+            self._runner = fresh
+        else:
+            await self._close_quietly(fresh, kill_timeout)
+
+    def _give_up(self, reason: str) -> None:
+        if self._unresponsive is None:
+            reason = f"{reason}; nothing more is sent to it this run"
+            logger.warning("%s: %s", self.host, reason)
+            self._unresponsive = reason
+
+    def _kill_command(self, spec: TargetSpec, command: str, marker: str) -> str:
+        if spec.family == "windows":
+            # The marker is inside -EncodedCommand, so the only form of it a
+            # process list shows is the tail of that encoding. Stopping that
+            # powershell.exe's tree takes the qna.exe under it.
+            token = command[-_WINDOWS_TOKEN_CHARS:]
+            return (
+                "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
+                f"Where-Object {{ $_.CommandLine -like '*{token}*' }} | "
+                "ForEach-Object { taskkill /T /F /PID $_.ProcessId 2>&1 | Out-Null; "
+                "Write-Output $_.ProcessId }"
+            )
+        # The marker is in the argv of the shell sshd started for the command
+        # (see _eval_command); qna is that shell's child, or sudo's, which
+        # passes TERM on. [b] keeps pgrep from matching this command's shell.
+        # Under --become the plain pkill comes first: the sudoers rule this
+        # package advises allows qna, not necessarily pkill.
+        kill = 'pkill -TERM -P "$p"'
+        if self._become:
+            kill = f"{kill}; sudo -n {kill}"
+        return (
+            f"for p in $(pgrep -f '[b]{marker[1:]}'); do "
+            f'{kill}; echo "$p"; done 2>/dev/null; true'
+        )
 
     # -- public API ---------------------------------------------------------
 
@@ -338,7 +515,9 @@ class TransportSSH:
         except BootstrapFailure as exc:
             return _result(error=str(exc), error_kind=ERROR_KIND_BOOTSTRAP, qna_path=qna_path or "")
         except (SSHConnectionError, OSError, TimeoutError) as exc:
-            return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
+            # A bare TimeoutError (asyncio.timeout's) has no message of its own.
+            reason = str(exc) or f"no answer within {timeout_s}s"
+            return _result(error=f"{self.host}: {reason}", error_kind=ERROR_KIND_TRANSPORT)
         except Exception as exc:
             logger.exception("unexpected failure evaluating on %s", self.host)
             return _result(error=f"{self.host}: {exc}", error_kind=ERROR_KIND_TRANSPORT)
@@ -396,20 +575,35 @@ class TransportSSH:
         started = time.monotonic()
         # Windows included: PowerShell's `&` hands a native qna multi-line
         # UTF-8 stdin intact (verified live, Windows Server 2022), and the
-        # CRLF it answers in splits like LF.
+        # CRLF it answers in splits like LF. Intermittently it never answers
+        # at all (#99), which the runner bounds and cleans up after.
         try:
             runner, spec, qna_path = await self._qna_to_run(None, qna, timeout_s)
             if qna_path is None:
                 return None
+        except Exception as exc:  # noqa: BLE001 - the single path will report it
+            logger.debug("qna batch on %s could not start: %s", self.host, exc)
+            return None
+        try:
             sentinel = batch.new_sentinel()
             with_types = self._showtypes_supported.get(qna_path, True)
             stdout, _stderr, code = await runner.run(
-                self._eval_command(spec, qna_path, with_types=with_types),
+                self._eval_command(spec, qna_path, with_types=with_types, marker=_new_marker()),
                 input=batch.build_batch_payload(expressions, sentinel),
                 timeout=timeout_s,
             )
+            self._answered()
         except Exception as exc:  # noqa: BLE001 - the single path will report it
-            logger.debug("qna batch on %s failed: %s", self.host, exc)
+            # WARNING for a timeout: from outside, it looks like a hang (#99).
+            # Anything else (a host refusing extra sessions) repeats every run.
+            timed_out = isinstance(exc, TimeoutError)
+            logger.log(
+                logging.WARNING if timed_out else logging.DEBUG,
+                "%s: a qna batch of %d expression(s) failed (%s); evaluating them one at a time",
+                self.host,
+                len(expressions),
+                f"no answer within {timeout_s}s" if timed_out else repr(exc),
+            )
             return None
         if code != 0:
             return None
@@ -432,7 +626,7 @@ class TransportSSH:
 
         Raises what connecting and provisioning raise; callers map it.
         """
-        runner = await self._connection()
+        runner = await self._connection(timeout_s)
         spec = await self._resolve_spec(runner, timeout_s)
 
         if spec.family == "windows":
@@ -475,7 +669,7 @@ class TransportSSH:
         :class:`~...transports.container.TransportContainer` -- instead of
         guessing a platform and finding out the truth only once connected.
         """
-        runner = await self._connection()
+        runner = await self._connection(timeout_s)
         spec = await self._resolve_spec(runner, timeout_s)
         return spec.name
 
@@ -514,7 +708,7 @@ class TransportSSH:
         nothing else ever re-checks. This bypasses that trust deliberately,
         reusing the live connection rather than opening a second one.
         """
-        runner = await self._connection()
+        runner = await self._connection(timeout_s)
         return await self._classify_platform(runner, timeout_s)
 
     # -- arch -----------------------------------------------------------------
@@ -532,7 +726,7 @@ class TransportSSH:
         """
         if self._arch is not None:
             return self._arch
-        runner = await self._connection()
+        runner = await self._connection(timeout_s)
         stdout, _stderr, _code = await runner.run("uname -m", timeout=timeout_s)
         self._arch = normalize_arch(stdout)
         logger.debug("%s arch classified as %s", self.host, self._arch)
@@ -584,10 +778,11 @@ class TransportSSH:
         supports_types = self._showtypes_supported.get(qna_path, True)
 
         stdout, stderr, code = await runner.run(
-            self._eval_command(spec, qna_path, with_types=supports_types),
+            self._eval_command(spec, qna_path, with_types=supports_types, marker=_new_marker()),
             input=payload,
             timeout=timeout_s,
         )
+        self._answered()
 
         # 9.2/9.5-era qna predates -showtypes. Degrade rather than fail, and
         # remember the answer so the retry is paid once per binary.
@@ -599,7 +794,7 @@ class TransportSSH:
             )
             self._showtypes_supported[qna_path] = False
             stdout, stderr, code = await runner.run(
-                self._eval_command(spec, qna_path, with_types=False),
+                self._eval_command(spec, qna_path, with_types=False, marker=_new_marker()),
                 input=payload,
                 timeout=timeout_s,
             )
@@ -607,17 +802,90 @@ class TransportSSH:
 
         return stdout, stderr, code, supports_types
 
-    def _eval_command(self, spec: TargetSpec, qna_path: str, *, with_types: bool) -> str:
+    def _eval_command(
+        self, spec: TargetSpec, qna_path: str, *, with_types: bool, marker: str | None = None
+    ) -> str:
+        """The qna command line; ``marker`` makes this run findable to stop it.
+
+        On Windows the marker is a trailing comment in the PowerShell source,
+        and so the tail of its -EncodedCommand. On POSIX it is a comment after
+        ``exit $?``, which keeps it in the argv of the shell sshd starts:
+        a lone command would be exec'd in place of that shell, marker and all.
+        """
         # API boundary: qna's CLI vocabulary uses "relevance"; internal name
         # stays `client_relevance`.
         flags: Sequence[str] = QNA_EVAL_FLAGS if with_types else ("-t",)
         if spec.family == "windows":
             command = f"& '{qna_path}' {' '.join(flags)}"
-        else:
-            command = " ".join([shlex.quote(qna_path), *flags])
-            if self._become:
-                command = f"sudo -n {command}"
-        return command
+            return f"{command} # {marker}" if marker else command
+        command = " ".join([shlex.quote(qna_path), *flags])
+        if self._become:
+            command = f"sudo -n {command}"
+        return f"{command}; exit $? # {marker}" if marker else command
+
+
+def _new_marker() -> str:
+    # Unique, not secret: os.urandom is a quarter of uuid4's cost per command.
+    return f"bfrcr-run-{os.urandom(16).hex()}"
+
+
+def _marker_in(command: str) -> str | None:
+    """The run marker in ``command``, looking inside a PowerShell wrapper."""
+    source = command
+    if " -EncodedCommand " in command:
+        try:
+            source = base64.b64decode(command.rsplit(" ", 1)[1]).decode("utf-16-le")
+        except ValueError:
+            return None
+    found = _RUN_MARKER.search(source)
+    return found.group() if found else None
+
+
+class _GuardedRunner:
+    """Bounds every command by its timeout and cleans up after a hang (#99).
+
+    Whatever the runner underneath does with ``timeout`` -- a caller's own
+    runner may ignore it -- the transport's guarantee holds here: a command
+    comes back within its timeout, and one that does not is cleaned up after
+    (see :meth:`TransportSSH._after_hang`).
+    """
+
+    def __init__(self, transport: TransportSSH, inner: SSHRunner) -> None:
+        self._transport = transport
+        self._inner = inner
+        # The asyncssh adapter bounds its own commands (and closes their
+        # process); a second timer per command would only cost.
+        self._bounds_itself = isinstance(inner, _AsyncsshRunner)
+
+    async def run(
+        self, command: str, *, input: str | None = None, timeout: float | None = None
+    ) -> RunResult:
+        transport = self._transport
+        if transport._unresponsive is not None:
+            raise _Unresponsive(transport._unresponsive)
+        try:
+            if self._bounds_itself:
+                result = await self._inner.run(command, input=input, timeout=timeout)
+            else:
+                async with asyncio.timeout(timeout):
+                    result = await self._inner.run(command, input=input, timeout=timeout)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            if timeout is not None:
+                await transport._after_hang(
+                    self._inner,
+                    command,
+                    input,
+                    timeout,
+                    cancelled=isinstance(exc, asyncio.CancelledError),
+                )
+            raise
+        return result
+
+    async def put_file(self, local: Path, remote: str) -> None:
+        await self._inner.put_file(local, remote)
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 __all__ = [

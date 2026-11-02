@@ -7,13 +7,16 @@ adapter over asyncssh itself is covered by the ssh_localhost integration tests.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from bigfix_remote_client_relevance.bootstrap.targets import spec_for
 from bigfix_remote_client_relevance.results import (
     ERROR_KIND_BOOTSTRAP,
     ERROR_KIND_QNA,
@@ -23,6 +26,7 @@ from bigfix_remote_client_relevance.results import (
 )
 from bigfix_remote_client_relevance.transports.ssh import (
     SSHConnectionError,
+    SSHRunner,
     TransportSSH,
 )
 
@@ -1096,13 +1100,13 @@ async def test_a_batch_uses_sudo_with_become(qna_output, fixed_sentinel):
     results = await make_transport(runner, become=True).evaluate_client_relevance_batch(BATCH_MIXED)
 
     assert results is not None
-    assert runner.ran(r"^sudo -n /opt/BESClient/bin/qna -t -showtypes$")
+    assert runner.ran(r"^sudo -n /opt/BESClient/bin/qna -t -showtypes; exit \$\? # bfrcr-run-")
 
 
 async def test_a_batch_without_showtypes_support_runs_plain_t(fixed_sentinel):
     """Once the single path has learned this binary predates -showtypes."""
     stdout = f"Q: A: 9.5.13.79\nT: 1\n\nQ: A: {BATCH_SENTINEL}\nT: 1\n\nQ: A: 2\nT: 1\n\nQ: A: {BATCH_SENTINEL}\nT: 1\n\nQ: "
-    runner = FakeSSHRunner(responses=[FOUND_QNA, (r"qna -t$", (stdout, "", 0))])
+    runner = FakeSSHRunner(responses=[FOUND_QNA, (r"qna -t;", (stdout, "", 0))])
     transport = make_transport(runner)
     transport._showtypes_supported["/opt/BESClient/bin/qna"] = False
 
@@ -1123,5 +1127,475 @@ async def test_a_batch_on_windows_runs_through_powershell(qna_output, fixed_sent
     assert results is not None
     assert [r.answers for r in results][:2] == [["11.0.7.61"], ["1", "2"]]
     eval_call = next(c for c in runner.calls if "-showtypes" in decode_ps(c.command))
-    assert decode_ps(eval_call.command).endswith(f"& '{WINDOWS_QNA}' -t -showtypes")
+    assert re.search(
+        rf"& '{re.escape(WINDOWS_QNA)}' -t -showtypes # bfrcr-run-[0-9a-f]{{32}}$",
+        decode_ps(eval_call.command),
+    )
     assert eval_call.input == "".join(f'{e}\n"{BATCH_SENTINEL}"\n' for e in BATCH_MIXED)
+
+
+# --- a channel that never answers (#99) ---------------------------------------
+#
+# Live, a qna stdin batch to Windows Server 2022 over SSH sometimes never got
+# an exit status; the single-expression fallback's new session was never
+# answered either, and every hung run left an idle qna.exe on the host. These
+# fakes never answer, and ignore the timeout they are handed, so only the
+# transport itself can bound them.
+
+MARKER = re.compile(r"bfrcr-run-[0-9a-f]{32}")
+T = 0.2  # timeout_s for every hang test: small, but well above scheduler noise
+SLACK = 0.6  # for a loaded `-n auto` runner; still far below N x T in every test
+
+
+async def _forever() -> None:
+    await asyncio.Event().wait()
+
+
+@dataclass
+class HangingRunner(FakeSSHRunner):
+    """Never answers a command matching ``hang``; answers the rest as scripted.
+
+    ``hang_times`` limits how many matching commands hang (``None``: all).
+    """
+
+    hang: str = r"-showtypes"
+    hang_times: int | None = None
+    cancelled: int = 0
+    hang_close: bool = False
+
+    async def run(self, command, *, input=None, timeout=None):
+        subject = decode_ps(command) if "-EncodedCommand " in command else command
+        if re.search(self.hang, subject) and (self.hang_times is None or self.hang_times > 0):
+            if self.hang_times is not None:
+                self.hang_times -= 1
+            self.calls.append(RunCall(command=command, input=input))
+            try:
+                await _forever()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        return await super().run(command, input=input, timeout=timeout)
+
+    async def close(self) -> None:
+        self.closed = True
+        if self.hang_close:
+            await _forever()
+
+
+def make_reconnecting_transport(*runners: FakeSSHRunner, **kwargs) -> tuple[TransportSSH, list]:
+    """A transport whose n-th connection is ``runners[n]`` (the last one repeats)."""
+    opened: list[FakeSSHRunner] = []
+
+    async def factory():
+        runner = runners[min(len(opened), len(runners) - 1)]
+        opened.append(runner)
+        return runner
+
+    kwargs.setdefault("platform", "ubuntu")
+    return TransportSSH("test-host", connection_factory=factory, **kwargs), opened
+
+
+def eval_commands(runner: FakeSSHRunner) -> list[str]:
+    def source(c: str) -> str:
+        return decode_ps(c) if "-EncodedCommand " in c else c
+
+    return [c.command for c in runner.calls if "-showtypes" in source(c.command)]
+
+
+async def test_a_run_that_never_answers_comes_back_within_timeout_s():
+    hung = HangingRunner()
+    transport, _ = make_reconnecting_transport(hung, FakeSSHRunner())
+
+    started = time.monotonic()
+    result = await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
+
+    assert time.monotonic() - started < 2 * T + SLACK
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert result.error == f"test-host: no answer within {T}s"
+    assert hung.cancelled == 1, "the hung run itself is cancelled, not left pending"
+
+
+async def test_a_connection_that_never_opens_comes_back_within_timeout_s():
+    async def factory() -> FakeSSHRunner:
+        await _forever()
+        raise AssertionError("unreachable")
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    started = time.monotonic()
+    result = await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
+
+    assert time.monotonic() - started < T + SLACK
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+
+
+async def test_a_connection_that_never_opens_ends_the_target_for_the_run():
+    """A silently dropping host would otherwise cost timeout_s per expression."""
+    opened = 0
+
+    async def factory() -> FakeSSHRunner:
+        nonlocal opened
+        opened += 1
+        await _forever()
+        raise AssertionError("unreachable")
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    results = [
+        await transport.evaluate_client_relevance(e, qna_path="/q", timeout_s=T) for e in "abcd"
+    ]
+
+    assert opened == 1
+    assert {r.error_kind for r in results} == {ERROR_KIND_TRANSPORT}
+
+
+async def test_a_hung_eval_drops_the_connection_and_kills_its_qna_on_a_fresh_one():
+    """#99: the stuck connection never answered a new session, so the kill
+    goes over a new connection, and names only this run's qna."""
+    hung = HangingRunner()
+    fresh = FakeSSHRunner()
+    transport, opened = make_reconnecting_transport(hung, fresh)
+
+    await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
+
+    assert hung.closed, "the stuck connection is dropped"
+    assert opened == [hung, fresh]
+    marker = MARKER.search(eval_commands(hung)[0])
+    assert marker is not None, "every qna run carries a marker the kill can find it by"
+    (kill,) = fresh.commands()
+    # [b]frcr: the pattern must not match the kill command's own shell.
+    assert f"pgrep -f '[b]{marker.group()[1:]}'" in kill
+    assert "pkill -TERM -P" in kill
+
+
+async def test_the_kill_runs_under_sudo_with_become():
+    hung = HangingRunner()
+    fresh = FakeSSHRunner()
+    transport, _ = make_reconnecting_transport(hung, fresh, become=True)
+
+    await transport.evaluate_client_relevance("true", qna_path="/opt/qna", timeout_s=T)
+
+    assert 'pkill -TERM -P "$p"; sudo -n pkill -TERM -P "$p"' in fresh.commands()[0]
+
+
+async def test_a_hung_eval_on_windows_stops_the_process_tree_by_its_marker():
+    """Closing the channel leaves qna.exe running on Windows OpenSSH: stop the
+    powershell.exe whose (encoded) command line is this run's, and its tree."""
+    hung = HangingRunner()
+    fresh = FakeSSHRunner()
+    transport, _ = make_reconnecting_transport(hung, fresh, platform="windows")
+
+    await transport.evaluate_client_relevance("true", qna_path="C:/q/qna.exe", timeout_s=T)
+
+    (eval_command,) = eval_commands(hung)
+    assert MARKER.search(decode_ps(eval_command)), "the marker rides in the encoded source"
+    (kill,) = fresh.commands()
+    kill_source = decode_ps(kill)
+    assert "taskkill /T /F /PID" in kill_source
+    assert "Win32_Process" in kill_source
+    # The only form of the marker visible in a process list is its encoding.
+    token = re.search(r"-like '\*([A-Za-z0-9+/=]+)\*'", kill_source)
+    assert token is not None
+    token = token.group(1)
+    assert eval_command.endswith(token)
+    assert len(token) >= 40
+
+
+async def test_every_run_gets_its_own_marker():
+    runner = FakeSSHRunner(responses=[(r"-showtypes", qna_ok())])
+    transport = make_transport(runner)
+
+    await transport.evaluate_client_relevance("true", qna_path="/opt/qna")
+    await transport.evaluate_client_relevance("true", qna_path="/opt/qna")
+
+    markers = {m.group() for c in eval_commands(runner) if (m := MARKER.search(c))}
+    assert len(markers) == 2
+
+
+@pytest.mark.skipif(not Path("/bin/sh").exists(), reason="needs a POSIX /bin/sh")
+def test_the_posix_marker_keeps_qna_exit_status(tmp_path):
+    """The marker must survive in the remote shell's argv (so no exec of the
+    last command) without the shell's own exit status replacing qna's."""
+    import subprocess
+
+    fake_qna = tmp_path / "qna"
+    fake_qna.write_text("#!/bin/sh\nexit 3\n")
+    fake_qna.chmod(0o755)
+    command = TransportSSH("h", platform="ubuntu")._eval_command(
+        spec_for("ubuntu"), str(fake_qna), with_types=True, marker="bfrcr-run-" + "0" * 32
+    )
+
+    assert subprocess.run(["/bin/sh", "-c", command], check=False).returncode == 3
+
+
+async def test_a_timed_out_batch_is_a_warning_naming_host_and_size(caplog, fixed_sentinel):
+    hung = HangingRunner(responses=[FOUND_QNA])
+    transport, _ = make_reconnecting_transport(hung, FakeSSHRunner())
+
+    with caplog.at_level(logging.WARNING):
+        assert await transport.evaluate_client_relevance_batch(BATCH_MIXED, timeout_s=T) is None
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("test-host" in m and str(len(BATCH_MIXED)) in m for m in warnings), warnings
+
+
+async def test_two_different_expressions_timing_out_in_a_row_end_the_target():
+    """After a hung batch, two of its expressions hanging on their own says
+    the host is stuck: the rest fails fast instead of costing timeout_s
+    each (#98)."""
+    hung = HangingRunner(responses=[FOUND_QNA])
+    transport, _ = make_reconnecting_transport(hung)
+
+    assert await transport.evaluate_client_relevance_batch(["a", "b", "c"], timeout_s=T) is None
+    first = [await transport.evaluate_client_relevance(e, timeout_s=T) for e in "ab"]
+    runs_so_far = len(hung.calls)
+    started = time.monotonic()
+    rest = [await transport.evaluate_client_relevance(e, timeout_s=T) for e in "cdefgh"]
+
+    assert {r.error_kind for r in first} == {ERROR_KIND_TRANSPORT}
+    assert time.monotonic() - started < SLACK
+    assert len(hung.calls) == runs_so_far, "nothing more is sent to a stuck host"
+    assert {r.error_kind for r in rest} == {ERROR_KIND_TRANSPORT}
+    assert all("did not answer" in (r.error or "") for r in rest)
+
+
+async def test_a_slow_expression_heading_a_chunk_does_not_end_the_target(fixed_sentinel):
+    """Its batch times out, then it times out alone: that is one slow
+    expression twice, not two pieces of evidence that the host is stuck."""
+    hung = HangingRunner(responses=[FOUND_QNA, (r"-showtypes", qna_ok())], hang="-showtypes")
+
+    class SlowOnly(HangingRunner):
+        async def run(self, command, *, input=None, timeout=None):
+            if input is not None and "slow" not in input:
+                return await FakeSSHRunner.run(hung, command, input=input, timeout=timeout)
+            return await hung.run(command, input=input, timeout=timeout)
+
+    transport, _ = make_reconnecting_transport(SlowOnly())
+
+    assert await transport.evaluate_client_relevance_batch(["slow", "a", "b"], timeout_s=T) is None
+    results = [
+        await transport.evaluate_client_relevance(e, timeout_s=T) for e in ("slow", "a", "b")
+    ]
+
+    assert [r.error_kind for r in results] == [ERROR_KIND_TRANSPORT, None, None]
+
+
+async def test_a_batch_that_fails_without_timing_out_stays_at_debug(caplog, fixed_sentinel):
+    """A host that refuses extra sessions would say so on every run."""
+
+    async def refusing(command, *, input=None, timeout=None):
+        if input is not None:
+            raise OSError("channel open refused")
+        return FOUND_QNA[1]
+
+    runner = FakeSSHRunner()
+    runner.run = refusing  # type: ignore[method-assign]
+
+    # The logger by name: a CLI test earlier in this worker may have set its level.
+    with caplog.at_level(logging.DEBUG, logger="bigfix_remote_client_relevance.transports.ssh"):
+        assert await make_transport(runner).evaluate_client_relevance_batch(["a", "b"]) is None
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("batch" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_answer_between_timeouts_keeps_the_target():
+    """One slow expression is that expression's problem, not the host's."""
+    hung = HangingRunner(responses=[(r"-showtypes", qna_ok())], hang_times=1)
+    transport, _ = make_reconnecting_transport(hung)
+
+    timed_out = await transport.evaluate_client_relevance("slow", qna_path="/q", timeout_s=T)
+    answered = await transport.evaluate_client_relevance("fast", qna_path="/q", timeout_s=T)
+    hung.hang_times = 1
+    timed_out_again = await transport.evaluate_client_relevance("slow", qna_path="/q", timeout_s=T)
+    still_tried = await transport.evaluate_client_relevance("fast", qna_path="/q", timeout_s=T)
+
+    assert [r.error_kind for r in (timed_out, answered, timed_out_again, still_tried)] == [
+        ERROR_KIND_TRANSPORT,
+        None,
+        ERROR_KIND_TRANSPORT,
+        None,
+    ]
+
+
+async def test_a_host_that_cannot_take_the_kill_is_ended_at_once():
+    """If even a fresh connection's kill goes unanswered, nothing else will be."""
+    hung = HangingRunner(hang=r"-showtypes|pgrep")
+    transport, _ = make_reconnecting_transport(hung)
+
+    started = time.monotonic()
+    results = [
+        await transport.evaluate_client_relevance(e, qna_path="/q", timeout_s=T) for e in "abcdef"
+    ]
+
+    assert time.monotonic() - started < 2 * T + SLACK
+    assert {r.error_kind for r in results} == {ERROR_KIND_TRANSPORT}
+
+
+async def test_evaluate_many_against_a_stuck_host_takes_about_timeout_s_not_n_times(
+    fixed_sentinel,
+):
+    """The #99 run end to end: the first expression answers, the batch and
+    everything after it hang. The caller hears back in a couple of timeouts."""
+    from bigfix_remote_client_relevance.inventory import Target
+    from bigfix_remote_client_relevance.orchestrate import evaluate_many
+
+    hung = HangingRunner(responses=[FOUND_QNA], hang=r"-showtypes|pgrep")
+    first_answers = FakeSSHRunner(responses=[FOUND_QNA, (r"-showtypes", qna_ok())])
+    expressions = [f"e{i}" for i in range(30)]
+
+    answered_at: list[float] = []
+
+    class FirstThenStuck(HangingRunner):
+        async def run(self, command, *, input=None, timeout=None):
+            if not eval_commands(first_answers):
+                result = await first_answers.run(command, input=input, timeout=timeout)
+                if eval_commands(first_answers):
+                    answered_at.append(time.monotonic())
+                return result
+            return await hung.run(command, input=input, timeout=timeout)
+
+    transport, _ = make_reconnecting_transport(FirstThenStuck())
+
+    results = await evaluate_many(
+        expressions,
+        [Target(kind="ssh", name="test-host", platform="ubuntu", arch="x86_64")],
+        timeout_s=T,
+        transport_factory=lambda target: transport,
+    )
+
+    # From the first answer: what comes before it is the orchestrator's own
+    # first-call setup, not the hang. The batch's timeout_s, the kill's, done.
+    assert time.monotonic() - answered_at[0] < 2 * T + SLACK
+    assert results[0].ok
+    assert [r.client_relevance for r in results] == expressions
+    assert {r.error_kind for r in results[1:]} == {ERROR_KIND_TRANSPORT}
+
+
+async def test_aclose_is_bounded_when_the_connection_will_not_close(monkeypatch):
+    from bigfix_remote_client_relevance.transports import ssh
+
+    monkeypatch.setattr(ssh, "CLEANUP_TIMEOUT_S", T)
+    hung = HangingRunner(responses=[(r"-showtypes", qna_ok())], hang="^$", hang_close=True)
+    transport = make_transport(hung)
+    await transport.evaluate_client_relevance("true", qna_path="/q", timeout_s=T)
+
+    started = time.monotonic()
+    await transport.aclose()
+
+    assert time.monotonic() - started < T + SLACK
+
+
+# --- the asyncssh adapter on a hang --------------------------------------------
+
+
+class FakeProcess:
+    """The slice of asyncssh's SSHClientProcess that _AsyncsshRunner uses."""
+
+    def __init__(self, *, answer: bool) -> None:
+        self._answer = answer
+        self.closed = False
+
+    async def wait(self, check=False, timeout=None):
+        if not self._answer:
+            await _forever()  # asyncssh 2.24.1: a timeout here never closes the channel
+
+        class Completed:
+            stdout = "A: 1\n"
+            stderr = ""
+            exit_status = 0
+
+        return Completed()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeConnection:
+    def __init__(self, *, open_session: bool = True, answer: bool = True) -> None:
+        self._open = open_session
+        self.process = FakeProcess(answer=answer)
+        self.inputs: list[str | None] = []
+
+    async def create_process(self, command, *, input=None, **kwargs):
+        self.inputs.append(input)
+        if not self._open:
+            await _forever()  # #99's chan=4: the session request is never answered
+        return self.process
+
+
+async def test_adapter_runs_a_command_through_a_process():
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    connection = FakeConnection()
+
+    assert await _AsyncsshRunner(connection).run("qna", input="1", timeout=T) == ("A: 1\n", "", 0)
+    assert connection.inputs == ["1"]
+
+
+async def test_adapter_closes_the_process_when_it_times_out():
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    connection = FakeConnection(answer=False)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await _AsyncsshRunner(connection).run("qna", timeout=T)
+
+    assert time.monotonic() - started < T + SLACK
+    assert connection.process.closed
+
+
+async def test_adapter_bounds_a_session_that_never_opens():
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await _AsyncsshRunner(FakeConnection(open_session=False)).run("qna", timeout=T)
+
+    assert time.monotonic() - started < T + SLACK
+
+
+async def test_adapter_closes_the_process_when_cancelled():
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    connection = FakeConnection(answer=False)
+    task = asyncio.create_task(_AsyncsshRunner(connection).run("qna", timeout=None))
+    await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert connection.process.closed
+
+
+async def test_the_transport_cleans_up_after_the_adapter_times_out():
+    """The adapter bounds itself, so the transport adds no timer of its own
+    over it; its timeout must still drop the connection and stop the qna."""
+    from bigfix_remote_client_relevance.transports.ssh import _AsyncsshRunner
+
+    class Closable(FakeConnection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            pass
+
+    stuck = Closable(answer=False)
+    fresh = FakeSSHRunner()
+    connections: list[SSHRunner] = [_AsyncsshRunner(stuck), fresh]
+
+    async def factory():
+        return connections.pop(0)
+
+    transport = TransportSSH("test-host", connection_factory=factory, platform="ubuntu")
+
+    started = time.monotonic()
+    result = await transport.evaluate_client_relevance("true", qna_path="/q", timeout_s=T)
+
+    assert time.monotonic() - started < 2 * T + SLACK
+    assert result.error_kind == ERROR_KIND_TRANSPORT
+    assert stuck.process.closed and stuck.closed
+    assert "pgrep" in fresh.commands()[0]
